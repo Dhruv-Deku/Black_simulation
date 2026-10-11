@@ -1,0 +1,34 @@
+#version 460 core
+
+// When the spin changes, keeps every particle's position and locally measured
+// velocity and recomputes its constants of motion (GPU twin of
+// BodySystem::respin: kerr::zamoVelocity followed by kerr::launchFromZamo).
+
+layout(local_size_x = 256) in;
+
+#include "particle_common.glsl"
+
+uniform int uCount;
+uniform float uOldSpin;
+uniform float uSpin;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(uCount)) return;
+    Particle p = particles[index];
+    if (p.state.w <= 0.0) return;
+    float r = p.state.x, th = p.state.y;
+
+    float newHorizon = 1.0 + sqrt(max(1.0 - uSpin * uSpin, 0.0));
+    float oldHorizon = 1.0 + sqrt(max(1.0 - uOldSpin * uOldSpin, 0.0));
+    if (r < max(newHorizon, oldHorizon) + 0.1) {
+        // No ZAMO to measure against at or inside the horizon.
+        particles[index].state.w = 0.0;
+        return;
+    }
+    vec3 v = zamoVelocity(zamoAt(uOldSpin, r, th), p.constants.x, p.constants.y, p.velocity.x, p.velocity.y);
+    float E, L, Q, vr, vth;
+    launchMassive(uSpin, zamoAt(uSpin, r, th), th, v, E, L, Q, vr, vth);
+    particles[index].velocity.xy = vec2(vr, vth);
+    particles[index].constants.xyz = vec3(E, L, Q);
+}
