@@ -1,0 +1,73 @@
+#version 460 core
+
+// Turns the accumulated fixed-point sums into textures that can be filtered: density
+// rho (particles per unit volume) and rho times the mean temperature and motion of
+// the gas in each voxel. Storing rho-weighted values means trilinear filtering
+// followed by a division by filtered rho gives a proper average even at the edge of
+// the debris, where neighbours are empty. Two layouts (uPhysics):
+//   drawing (particles_deposit.comp): rho, rho T / 1e4 K, rho u^t, rho u^r | rho u^theta, rho u^phi
+//   physics (particles_update.comp):  rho, rho T / 1e4 K, rho v_r, rho v_theta | rho v_phi,
+//                                     with v the ZAMO-frame velocity
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+layout(std430, binding = 2) readonly buffer Grid {
+    int cells[];
+};
+layout(binding = 0) writeonly uniform image3D uDensity;
+layout(binding = 1) writeonly uniform image3D uVelocity;
+// One cell per 8x8x8 block of voxels, nonzero where there is any debris nearby,
+// so the ray tracer can skip empty space.
+layout(r32ui, binding = 2) uniform uimage3D uOccupancy;
+uniform ivec3 uOccupancyDims;
+uniform int uMarkOccupancy;  // for the grid the ray tracer draws
+uniform int uPhysics;
+
+uniform ivec3 uGridDims;
+uniform vec2 uGridLogR;
+uniform float uDensityScale;
+
+const float PI = 3.14159265358979;
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(c, uGridDims))) return;
+    int base = 6 * ((c.z * uGridDims.y + c.y) * uGridDims.x + c.x);
+    int weight = cells[base];
+    if (weight <= 0) {
+        imageStore(uDensity, c, vec4(0.0));
+        imageStore(uVelocity, c, vec4(0.0));
+        return;
+    }
+
+    // Coordinate volume of the voxel: r^2 sin(theta) dr dtheta dphi, dr = r dlog r.
+    float dLogR = (uGridLogR.y - uGridLogR.x) / float(uGridDims.x);
+    float r = exp(uGridLogR.x + (float(c.x) + 0.5) * dLogR);
+    float th = (float(c.y) + 0.5) / float(uGridDims.y) * PI;
+    float volume = r * r * r * dLogR * max(sin(th), 1e-3) * (PI / float(uGridDims.y)) * (2.0 * PI / float(uGridDims.z));
+
+    float inv = 1.0 / float(weight);
+    float density = float(weight) / 256.0 / volume * uDensityScale;
+    if (uPhysics == 1) {
+        float temperature = float(cells[base + 1]) * inv * 100.0;
+        vec3 v = vec3(float(cells[base + 2]), float(cells[base + 3]), float(cells[base + 4])) * (inv * 256.0 / 16384.0);
+        imageStore(uDensity, c, density * vec4(1.0, temperature * 1e-4, v.x, v.y));
+        imageStore(uVelocity, c, density * vec4(v.z, 0.0, 0.0, 0.0));
+        return;
+    }
+    float temperature = float(cells[base + 5]) * inv * 100.0;
+    vec4 u = vec4(float(cells[base + 1]), float(cells[base + 2]) / 16.0, float(cells[base + 3]) / 256.0,
+                  float(cells[base + 4]) / 256.0) * inv;
+    imageStore(uDensity, c, density * vec4(1.0, temperature * 1e-4, u.x, u.y));
+    imageStore(uVelocity, c, density * vec4(u.z, u.w, 0.0, 0.0));
+
+    if (uMarkOccupancy == 0) return;
+    // Mark this block and the blocks of neighbouring voxels: filtering reaches one
+    // voxel across block borders.
+    for (int corner = 0; corner < 8; ++corner) {
+        ivec3 n = c + ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1) * 2 - 1;
+        ivec3 cell = ivec3(clamp(n.x, 0, uGridDims.x - 1), clamp(n.y, 0, uGridDims.y - 1),
+                           (n.z + uGridDims.z) % uGridDims.z) / 8;
+        imageAtomicMax(uOccupancy, min(cell, uOccupancyDims - 1), 1u);
+    }
+}

@@ -1,0 +1,325 @@
+#version 460 core
+
+// Advances every debris particle by uDt of coordinate time, then deposits it into the
+// (log r, theta, phi) grid the gas physics reads back next frame.
+//
+// Each particle is a parcel of gas. Between frames it follows its own Kerr geodesic;
+// once a frame it also feels the rest of the gas, through last frame's grid, and the
+// pull of the orbiting bodies, all applied as a kick to its velocity in the local
+// ZAMO frame (a particle-mesh method):
+//   pressure      P = (gamma - 1) rho u pushes gas from dense, hot regions;
+//   collisions    parcels in the same place relax toward the local mean velocity at
+//                 a rate proportional to density. Smooth flows are untouched; where
+//                 streams cross, their relative motion is dissipated and turned into
+//                 heat: shocks. This is what circularizes tidal debris into a disk;
+//   compression   heats and expansion cools the gas adiabatically: each parcel carries
+//                 its entropy, s = T / rho^(gamma-1), and its temperature follows the
+//                 local density (noise in the density estimate cannot pile up);
+//   radiation     cools it, faster the hotter it is (rate ~ T^3, as for a glowing
+//                 surface: radiated ~ T^4, stored ~ T), down to a floor temperature
+//                 set by the light around it (gas near an accreting black hole is kept
+//                 ionized, near 10^4 K, however much it expands).
+//
+// With light delay on, each parcel also carries the copy of itself that the camera
+// sees: where it was when the light now arriving left it, t_seen = t - delay(x_seen),
+// found by following the same geodesic a light-travel time behind. Those copies are
+// deposited into the grid the ray tracer draws (particles_deposit.comp). The delay
+// is the straight-line distance plus the Shapiro delay, 2 ln((r + r_cam + d) /
+// (r + r_cam - d)), shifted to Kerr-Schild time: the direct image's delay.
+
+layout(local_size_x = 256) in;
+
+#include "particle_common.glsl"
+
+// Per voxel: weight, then weighted sums of temperature and of the ZAMO-frame velocity
+// (r, theta, phi), as fixed-point integers so they can be accumulated with atomicAdd.
+layout(std430, binding = 2) buffer Grid {
+    int cells[];
+};
+layout(std430, binding = 3) buffer Stats {
+    int alive;
+};
+// Last frame's gas (see grid_resolve.comp, physics layout).
+layout(binding = 0) uniform sampler3D uDensity;   // rho, rho T / 1e4 K, rho v_r, rho v_theta
+layout(binding = 1) uniform sampler3D uVelocity;  // rho v_phi (ZAMO frame)
+
+uniform int uCount;
+uniform float uSpin;
+uniform float uDt;
+uniform ivec3 uGridDims;  // r, theta, phi
+uniform vec2 uGridLogR;   // log of the grid's inner and outer radius
+
+uniform int uGasPhysics;         // pressure, collisions, heating and cooling
+uniform float uCollisionRate;    // per M of local time, per unit of grid density
+uniform float uCoolingTime;      // M, at 10,000 K
+uniform float uFloorTemperature; // K: the gas never gets colder (it is lit by its surroundings)
+uniform int uBodyCount;
+uniform vec4 uBodies[32];        // Kerr-Schild Cartesian position, mass (units of M)
+
+uniform int uLightDelay;   // also follow the copy of each parcel that the camera sees
+uniform vec3 uCameraPos;   // Kerr-Schild Cartesian
+uniform float uCameraR;
+uniform float uTime;       // coordinate time at the end of this update
+
+// Temperature of gas with specific internal energy u = 1 (in c^2). Real gas would be
+// ~1e12 K; this scale keeps stellar gas (u ~ 5e-4 for the simulated star) near 7000 K
+// so that what the gas does shows up in visible colors.
+const float kKelvinPerC2 = 1.3e7;
+const float kGamma = 5.0 / 3.0;
+
+// Fixed-point scales (see grid_resolve.comp).
+const float kWeightScale = 256.0;
+const float kTemperatureScale = 256.0 / 100.0;
+const float kZamoVelocityScale = 16384.0;
+
+float gA, gE, gL, gQ;
+
+// Coordinate-time derivatives of (r, theta, phi, vr, vtheta).
+void deriv(float r, float th, float vr, float vth, out float dr, out float dth, out float dph, out float dvr,
+           out float dvth) {
+    float tDot, phiDot, accR, accTh;
+    massiveRhs(gA, gE, gL, gQ, r, th, vr, tDot, phiDot, accR, accTh);
+    float inv = 1.0 / tDot;
+    dr = vr * inv;
+    dth = vth * inv;
+    dph = phiDot * inv;
+    dvr = accR * inv;
+    dvth = accTh * inv;
+}
+
+void deposit(int x, int y, int z, float w, vec3 v, float temperature) {
+    if (x < 0 || x >= uGridDims.x || y < 0 || y >= uGridDims.y || w <= 0.0) return;
+    z = (z % uGridDims.z + uGridDims.z) % uGridDims.z;
+    int base = 6 * ((z * uGridDims.y + y) * uGridDims.x + x);
+    atomicAdd(cells[base + 0], int(round(w * kWeightScale)));
+    atomicAdd(cells[base + 1], int(round(w * temperature * kTemperatureScale)));
+    atomicAdd(cells[base + 2], int(round(w * v.x * kZamoVelocityScale)));
+    atomicAdd(cells[base + 3], int(round(w * v.y * kZamoVelocityScale)));
+    atomicAdd(cells[base + 4], int(round(w * v.z * kZamoVelocityScale)));
+}
+
+vec3 gridCoord(float r, float th, float ph) {
+    return vec3((log(r) - uGridLogR.x) / (uGridLogR.y - uGridLogR.x), th / PI, ph / (2.0 * PI));
+}
+
+// One frame's kick from the gas and the bodies, applied in the local ZAMO frame.
+void interact(float r, float th, float ph, inout float vr, inout float vth, inout float temperature,
+              inout float entropy) {
+    float horizon = 1.0 + sqrt(max(1.0 - gA * gA, 0.0));
+    if (r < horizon + 0.3 || uDt <= 0.0) return;
+    Zamo z = zamoAt(gA, r, th);
+    float dtau = z.alpha * uDt;
+    vec3 v = zamoVelocity(z, gE, gL, vr, vth);
+    vec3 dv = vec3(0.0);
+    float heat = 0.0;  // per unit mass, c^2
+
+    vec3 g = gridCoord(r, th, ph);
+    bool inGrid = g.x > 0.0 && g.x < 1.0;
+    float rho = 0.0;
+    if (uGasPhysics == 1 && inGrid) {
+        vec4 d0 = texture(uDensity, g);
+        rho = d0.x;
+        if (rho > 1e-4) {
+            // Adiabatic: the temperature follows the density at fixed entropy.
+            float compression = pow(rho, kGamma - 1.0);
+            if (entropy <= 0.0) entropy = temperature / compression;
+            temperature = entropy * compression;
+
+            // Pressure gradient from central differences of rho T, one voxel each way.
+            vec3 texel = 1.0 / vec3(uGridDims);
+            float dX = texture(uDensity, g + vec3(texel.x, 0.0, 0.0)).y - texture(uDensity, g - vec3(texel.x, 0.0, 0.0)).y;
+            float dY = texture(uDensity, g + vec3(0.0, texel.y, 0.0)).y - texture(uDensity, g - vec3(0.0, texel.y, 0.0)).y;
+            float dZ = texture(uDensity, g + vec3(0.0, 0.0, texel.z)).y - texture(uDensity, g - vec3(0.0, 0.0, texel.z)).y;
+            float dLogR = uGridLogR.y - uGridLogR.x;
+            float dr = dX * 1e4 / (2.0 * texel.x * r * dLogR);  // d(rho T) / dr
+            float dth = dY * 1e4 / (2.0 * texel.y * PI);
+            float dph = dZ * 1e4 / (2.0 * texel.z * 2.0 * PI);
+            // On the ZAMO's axes: e_r = sqrt(Delta / Sigma) (d_r + a / Delta d_phi) in these coordinates.
+            vec3 grad = vec3(sqrt(z.delta / z.sigma) * (dr + gA / z.delta * dph), dth / sqrt(z.sigma), dph / z.varpi);
+            vec3 kick = -(kGamma - 1.0) / kKelvinPerC2 * grad / rho * dtau;
+            // Never more than half the sound speed in one frame (stability).
+            float soundSpeed = sqrt(kGamma * (kGamma - 1.0) * temperature / kKelvinPerC2);
+            float k = length(kick);
+            if (k > 0.5 * soundSpeed) kick *= 0.5 * soundSpeed / k;
+            dv += kick;
+
+            // Collisions: relax toward the gas's mean motion here, turning the lost
+            // relative motion into heat.
+            vec3 mean = vec3(d0.z, d0.w, texture(uVelocity, g).x) / rho;
+            float f = 1.0 - exp(-uCollisionRate * rho * dtau);
+            vec3 rel = v - mean;
+            heat += 0.5 * dot(rel, rel) * (1.0 - (1.0 - f) * (1.0 - f));
+            dv -= f * rel;
+        }
+    }
+
+    // The pull of the orbiting bodies, Newtonian, softened over 0.3 M.
+    if (uBodyCount > 0) {
+        vec3 x = cartesian(gA, r, th, ph);
+        vec3 acc = vec3(0.0);
+        for (int i = 0; i < uBodyCount; ++i) {
+            vec3 d = uBodies[i].xyz - x;
+            float d2 = dot(d, d) + 0.09;
+            acc += uBodies[i].w * d / (d2 * sqrt(d2));
+        }
+        // Onto the spherical axes at the point's Cartesian azimuth (kerr::localAxes).
+        float az = ph + atan(gA, r);
+        float st = sin(th), ct = cos(th), sa = sin(az), ca = cos(az);
+        vec3 er = vec3(st * ca, st * sa, ct), et = vec3(ct * ca, ct * sa, -st), ep = vec3(-sa, ca, 0.0);
+        dv += vec3(dot(acc, er), dot(acc, et), dot(acc, ep)) * dtau;
+    }
+
+    if (dot(dv, dv) > 1e-16) launchMassive(gA, z, th, v + dv, gE, gL, gQ, vr, vth);
+    if (uGasPhysics == 1) {
+        temperature += heat * kKelvinPerC2;
+        // Radiative cooling toward the floor, at a rate ~ T^3.
+        float rate = pow(max(temperature, 1.0) / 1e4, 3.0) / uCoolingTime;
+        temperature = uFloorTemperature + (temperature - uFloorTemperature) * exp(-min(dtau * rate, 30.0));
+        temperature = max(temperature, uFloorTemperature);
+        if (rho > 1e-4) entropy = temperature / pow(rho, kGamma - 1.0);
+    }
+}
+
+// Advances (r, theta, phi, vr, vtheta) by dt of coordinate time (either sign) with
+// adaptive RK4 substeps (the rule of kerr::suggestedTimeStep). False if it fell
+// below rStop.
+bool advance(inout float r, inout float th, inout float ph, inout float vr, inout float vth, float dt, float rStop) {
+    float remaining = abs(dt);
+    float dir = dt < 0.0 ? -1.0 : 1.0;
+    for (int k = 0; k < 48 && remaining > 0.0; ++k) {
+        float dr1, dth1, dph1, dvr1, dvth1;
+        deriv(r, th, vr, vth, dr1, dth1, dph1, dvr1, dvth1);
+        float sn = max(abs(sin(th)), 1e-3);
+        float h = 0.02 / max(abs(dr1) / r + abs(dth1) / sn + abs(dph1), 1e-6);
+        float tDot, phiDot, accR, accTh;
+        massiveRhs(gA, gE, gL, gQ, r, th, vr, tDot, phiDot, accR, accTh);
+        float inv = 1.0 / tDot;
+        h = min(h, sqrt(0.02 / max(abs(accR) * inv * inv / r + abs(accTh) * inv * inv / sn, 1e-12)));
+        h = k == 47 ? remaining : min(h, remaining);
+        remaining -= h;
+        h *= dir;
+
+        float dr2, dth2, dph2, dvr2, dvth2, dr3, dth3, dph3, dvr3, dvth3, dr4, dth4, dph4, dvr4, dvth4;
+        deriv(r + 0.5 * h * dr1, th + 0.5 * h * dth1, vr + 0.5 * h * dvr1, vth + 0.5 * h * dvth1,
+              dr2, dth2, dph2, dvr2, dvth2);
+        deriv(r + 0.5 * h * dr2, th + 0.5 * h * dth2, vr + 0.5 * h * dvr2, vth + 0.5 * h * dvth2,
+              dr3, dth3, dph3, dvr3, dvth3);
+        deriv(r + h * dr3, th + h * dth3, vr + h * dvr3, vth + h * dvth3, dr4, dth4, dph4, dvr4, dvth4);
+        r += h / 6.0 * (dr1 + 2.0 * dr2 + 2.0 * dr3 + dr4);
+        th += h / 6.0 * (dth1 + 2.0 * dth2 + 2.0 * dth3 + dth4);
+        ph += h / 6.0 * (dph1 + 2.0 * dph2 + 2.0 * dph3 + dph4);
+        vr += h / 6.0 * (dvr1 + 2.0 * dvr2 + 2.0 * dvr3 + dvr4);
+        vth += h / 6.0 * (dvth1 + 2.0 * dvth2 + 2.0 * dvth3 + dvth4);
+        if (th < 0.0) {
+            th = -th;
+            ph += PI;
+            vth = -vth;
+        } else if (th > PI) {
+            th = 2.0 * PI - th;
+            ph += PI;
+            vth = -vth;
+        }
+        enforceMassiveConstraints(gA, gE, gL, gQ, r, th, vr, vth);
+        if (r < rStop || isnan(r)) return false;
+    }
+    ph = mod(ph, 2.0 * PI);
+    return true;
+}
+
+// Kerr-Schild time minus Boyer-Lindquist time at radius r (kerr::timeShift).
+float timeShift(float r) {
+    float root = sqrt(max(1.0 - gA * gA, 0.0));
+    float rp = 1.0 + root, rm = 1.0 - root;
+    float inner = rm > 0.0 ? 2.0 * rm * log(max(abs(r - rm), 1e-6)) : 0.0;
+    return (2.0 * rp * log(max(abs(r - rp), 1e-6)) - inner) / max(rp - rm, 1e-3);
+}
+
+// Light-travel time from (r, theta, phi) to the camera along the direct path.
+float lightDelay(float r, float th, float ph) {
+    vec3 x = cartesian(gA, r, th, ph);
+    float d = length(x - uCameraPos);
+    float sum = r + uCameraR;
+    float shapiro = 2.0 * log(max(sum + d, 1e-3) / max(sum - d, 1e-3));
+    return d + shapiro + timeShift(uCameraR) - timeShift(r);
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(uCount)) return;
+    Particle p = particles[index];
+    if (p.state.w <= 0.0) return;
+
+    gA = uSpin;
+    gE = p.constants.x;
+    gL = p.constants.y;
+    gQ = p.constants.z;
+    float horizon = 1.0 + sqrt(max(1.0 - gA * gA, 0.0));
+    float T = p.velocity.z;
+    float entropy = p.constants.w;
+    vec4 seen = p.seen;
+    vec4 seenVelocity = p.seenVelocity;
+    float life = p.state.w;
+
+    // --- The parcel itself -------------------------------------------------------
+    float r = p.state.x, th = p.state.y, ph = p.state.z;
+    float vr = p.velocity.x, vth = p.velocity.y;
+    if (life >= 1.0) {
+        interact(r, th, ph, vr, vth, T, entropy);
+        float rBefore = r;
+        // Followed through the horizon down to r = 1, midway between the two
+        // horizons (and the inner edge of the grid).
+        bool kept = advance(r, th, ph, vr, vth, uDt, 1.0);
+        // Its light stops reaching the outside once it crosses the horizon.
+        if (rBefore >= horizon && r < horizon) seenVelocity.w = min(seenVelocity.w, uTime);
+        if (!kept || r > exp(uGridLogR.y) * 3.0) {
+            seenVelocity.w = min(seenVelocity.w, uTime);
+            life = uLightDelay == 1 ? 0.5 : 0.0;  // gone; with light delay its light is still on the way
+        }
+    }
+
+    // --- The copy the camera sees ---------------------------------------------------
+    if (uLightDelay == 1) {
+        float created = seenVelocity.z, lost = seenVelocity.w;
+        float target = max(min(uTime - lightDelay(seen.x, seen.y, seen.z), lost), created);
+        if (target != seen.w) {
+            float sr = seen.x, sth = seen.y, sph = seen.z, svr = seenVelocity.x, svth = seenVelocity.y;
+            if (advance(sr, sth, sph, svr, svth, target - seen.w, horizon + 0.01)) {
+                seen = vec4(sr, sth, sph, target);
+                seenVelocity.xy = vec2(svr, svth);
+            } else {
+                seen.w = lost;  // reached the horizon: fades out of view
+            }
+        }
+        if (life < 1.0 && seen.w >= lost - 1e-3) life = 0.0;  // its last light has arrived
+    } else {
+        // Keep the seen copy on the parcel, ready for light delay to be switched on.
+        seen = vec4(r, th, ph, uTime);
+        seenVelocity.xy = vec2(vr, vth);
+        if (life < 1.0) life = 0.0;
+    }
+
+    particles[index].state = vec4(r, th, ph, life);
+    particles[index].velocity.xyz = vec3(vr, vth, T);
+    particles[index].constants = vec4(gE, gL, gQ, entropy);
+    particles[index].seen = seen;
+    particles[index].seenVelocity = seenVelocity;
+    if (life <= 0.0) return;
+    atomicAdd(alive, 1);
+    if (life < 1.0) return;
+
+    // Deposit for the physics: only where there is a ZAMO frame to measure in.
+    if (r < horizon + 0.3) return;
+    vec3 v = zamoVelocity(zamoAt(gA, r, th), gE, gL, vr, vth);
+    vec3 g = vec3((log(r) - uGridLogR.x) / (uGridLogR.y - uGridLogR.x) * float(uGridDims.x),
+                  th / PI * float(uGridDims.y),
+                  ph / (2.0 * PI) * float(uGridDims.z)) - 0.5;
+    if (g.x < -1.0 || g.x > float(uGridDims.x)) return;
+    ivec3 b = ivec3(floor(g));
+    vec3 f = g - vec3(b);
+    float w = p.velocity.w;
+    for (int corner = 0; corner < 8; ++corner) {
+        ivec3 o = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+        vec3 wt = mix(1.0 - f, f, vec3(o));
+        deposit(b.x + o.x, b.y + o.y, b.z + o.z, w * wt.x * wt.y * wt.z, v, T);
+    }
+}
