@@ -6,7 +6,7 @@ is lensed, Doppler-shifted and redshifted by the same physics: stars, planets, p
 torn-apart stars, glowing gas, jets, even the orbit lines you draw. You can fly the camera
 straight through the event horizon.
 
-![The simulator](docs/screenshot.jpg)
+![The simulator](docs/screenshot.png)
 
 ## What you can do
 
