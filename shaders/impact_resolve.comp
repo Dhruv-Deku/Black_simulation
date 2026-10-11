@@ -1,0 +1,33 @@
+#version 460 core
+
+// The glow of gas that has struck the surface of a star or planet. Each frame the
+// energy parcels left in the impact cells (particles_update.comp) is added to a map in
+// the surface's rotating frame (colatitude x longitude), which fades as the heat is
+// radiated away: map = map exp(-dt / tau) + new energy. The ray tracer paints it on the
+// surface as hot spots.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 4) buffer Impacts {
+    int impactCells[];
+};
+layout(r32f, binding = 0) uniform image2D uMap;
+
+uniform ivec2 uImpactDims;
+uniform float uDecay;  // exp(-dt / tau) for this frame
+uniform float uGain;   // brightness per unit of deposited energy
+
+const float kImpactScale = 4096.0;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    if (c.x >= uImpactDims.x || c.y >= uImpactDims.y) return;
+    int index = c.y * uImpactDims.x + c.x;
+    float added = float(impactCells[index]) / kImpactScale;
+    impactCells[index] = 0;
+    // The cells near the poles are small: per unit area, the same energy shines brighter.
+    float th = (float(c.x) + 0.5) / float(uImpactDims.x) * 3.14159265;
+    float area = max(sin(th), 0.05);
+    float value = imageLoad(uMap, c).x * uDecay + uGain * added / area;
+    imageStore(uMap, c, vec4(min(value, 1e4), 0.0, 0.0, 0.0));
+}

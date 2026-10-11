@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include "blackbody.h"
+#include "central.h"
 #include "kerr.h"
 #include "renderer.h"
 
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 namespace {
@@ -32,10 +34,33 @@ ImU32 toColor(const glm::vec3& c, float alpha = 1.0f) {
     return ImGui::GetColorU32(ImVec4(c.r, c.g, c.b, alpha));
 }
 
+std::string printf1(const char* fmt, double v) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), fmt, v);
+    return buf;
+}
+
+// A length or time for the readouts: in M, and in physical units when they are on.
+std::string lengthText(const Settings& s, double lengthM) {
+    std::string out = printf1("%.4g M", lengthM);
+    if (s.physicalUnits) out += " (" + central::formatLength(lengthM, s.central.massSolar) + ")";
+    return out;
+}
+
+std::string timeText(const Settings& s, double timeM) {
+    std::string out = printf1("%.4g M", timeM);
+    if (s.physicalUnits) out += " (" + central::formatTime(timeM, s.central.massSolar) + ")";
+    return out;
+}
+
+double surfaceOf(const Settings& s) {
+    return s.central.hasHorizon() ? 0.0 : s.central.radius;
+}
+
 // The custom launch's velocity in the ZAMO frame. False if it is not possible here.
-bool plannedVelocity(const UiState& ui, double spin, double v[3]) {
-    const double r = ui.launchR;
-    if (r < kerr::horizonRadius(spin) + 0.2) return false;
+bool plannedVelocity(const UiState& ui, double spin, double scale, double surface, double v[3]) {
+    const double r = ui.launchR * scale;
+    if (r < central::boundaryRadius(spin, surface) + 0.2 * scale) return false;
     const double vc = r > kerr::photonOrbitRadius(spin, true) * 1.05 ? kerr::circularZamoSpeed(spin, r, true)
                                                                       : 1.0 / std::sqrt(std::max(r - 2.0, 0.5));
     const double speed = std::min(ui.launchSpeed * vc, 0.98);
@@ -51,6 +76,19 @@ bool plannedVelocity(const UiState& ui, double spin, double v[3]) {
     return true;
 }
 
+// A slider for a length kept in M but laid out in scene units: the range is given in
+// scene units, the value shown in M.
+bool sceneSlider(const char* label, float& sceneValue, float lo, float hi, double scale, bool logarithmic) {
+    double value = sceneValue * scale;
+    const double vMin = lo * scale, vMax = hi * scale;
+    if (!ImGui::SliderScalar(label, ImGuiDataType_Double, &value, &vMin, &vMax, "%.4g M",
+                             logarithmic ? ImGuiSliderFlags_Logarithmic : 0)) {
+        return false;
+    }
+    sceneValue = static_cast<float>(value / scale);
+    return true;
+}
+
 // --- Sections ------------------------------------------------------------------
 
 void statsSection(UiContext& ctx) {
@@ -58,18 +96,136 @@ void statsSection(UiContext& ctx) {
     ImGui::Text("%.0f fps   GPU %.1f ms   trace %dx%d", ctx.fps, r.gpuMilliseconds(), r.traceWidth(),
                 r.traceHeight());
     ImGui::TextDisabled("%s", ctx.gpuName);
-    ImGui::Text("t = %.1f M", ctx.bodies.time);
+    ImGui::Text("t = %s", timeText(ctx.settings, ctx.bodies.time).c_str());
     ImGui::SameLine();
     ImGui::TextDisabled("(coordinate time of a distant observer)");
 }
 
-void blackHoleSection(UiContext& ctx) {
-    Settings& s = ctx.settings;
-    ImGui::SliderFloat("Spin a/M", &s.spin, 0.0f, 0.999f, "%.3f");
-    help("Angular momentum per unit mass. 0 is a non-rotating (Schwarzschild) hole; values near 1 "
-         "are extreme Kerr holes whose rotation drags space around them. Most astrophysical black "
-         "holes are thought to spin quickly.");
+// The live numbers for the central object (surface physics, accretion, scales).
+void centralReadouts(UiContext& ctx) {
+    const Settings& s = ctx.settings;
+    const central::Object& o = s.central;
+    const double a = s.spin;
+    if (!ImGui::BeginTable("readouts", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) return;
+    auto row = [](const char* name, const std::string& value, const char* tip) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(name);
+        ImGui::SetItemTooltip("%s", tip);
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(value.c_str());
+    };
+    if (!o.hasHorizon()) {
+        const double R = o.radius;
+        const double z = central::surfaceRedshift(R);
+        const double gSI = central::accelerationSI(central::surfaceGravity(R), o.massSolar);
+        row("Radius", printf1("%.5g M", R) + " = " + central::formatLength(R, o.massSolar),
+            "In units of M = G M / c^2. The Sun is 471,000 M, a white dwarf ~10,000 M, a neutron star ~6 M.");
+        row("Compactness M/R", printf1("%.3g", 1.0 / R) + printf1("   (%.3g x Buchdahl)", R / central::kBuchdahlRadius),
+            "No static star can be smaller than the Buchdahl limit, R = 9/4 M: below it no pressure holds it up.");
+        row("Surface redshift", printf1("1 + z = %.6g", 1.0 + z) + printf1("  (%.3g km/s)", z * central::kSpeedOfLightKmS),
+            "Light climbing out of the surface loses energy: 1 + z = (1 - 2M/R)^(-1/2). Measured for the Sun "
+            "(0.6 km/s) and for white dwarfs such as Sirius B (80 km/s).");
+        row("Surface gravity", printf1("%.3g g", gSI / 9.80665) + printf1("  (%.3g m/s^2)", gSI),
+            "Felt standing on the surface: M / (R^2 sqrt(1 - 2M/R)), which grows without limit near R = 2M.");
+        row("Escape speed", printf1("%.4g c", central::escapeSpeed(R)), "sqrt(2M/R), measured at the surface.");
+        row("Surface clocks", printf1("%.6g x a distant clock", central::surfaceClockRate(R)), "sqrt(1 - 2M/R).");
+        static double cachedR = -1.0, cachedFraction = 0.0;
+        if (R != cachedR) {
+            cachedR = R;
+            cachedFraction = central::visibleFraction(R);
+        }
+        row("Seen at once", printf1("%.1f%% of the surface", 100.0 * cachedFraction),
+            "Light bending lets you see past the limb: below R = 3.52 M the whole surface is visible at once.");
+        row("Photon ring", R < 3.0 ? "outside the surface" : "inside the star (none)",
+            "Light can circle at r = 3M. Only a star smaller than that shows the photon ring.");
+        const double isco = kerr::iscoRadius(a, true);
+        row("ISCO", R < isco ? lengthText(s, isco) + " (outside: disk stops there)" : std::string("inside the star"),
+            "Innermost stable circular orbit. A neutron star (R ~ 5.8 M) is smaller than its ISCO.");
+        const central::SurfaceAccretion acc = central::surfaceEfficiency(a, R, o.surfaceOmega());
+        row("Accretion: disk", printf1("%.4g%% of rest mass", 100.0 * acc.disk),
+            "Energy released by gas spiralling through the disk to its inner edge, max(ISCO, R).");
+        row("Accretion: surface", printf1("%.4g%%", 100.0 * acc.boundaryLayer),
+            "Released when the gas settles onto the surface (the boundary layer). A black hole swallows this.");
+        row("Accretion: total", printf1("%.4g%%", 100.0 * acc.total),
+            "1 - E_surface. For a neutron star more than a black hole of the same spin, because nothing falls "
+            "through a horizon unseen.");
+        const bool magnetic = o.kind == central::Kind::NeutronStar || o.kind == central::Kind::WhiteDwarf;
+        if (magnetic && o.magneticField > 0.0) {
+            const double rA = central::alfvenRadiusKm(o.magneticField, central::lengthKm(R, o.massSolar), o.massSolar,
+                                                      s.accretionRate * central::eddingtonRate(o.massSolar)) /
+                              (central::kKmPerSolarMass * o.massSolar);
+            row("Alfven radius", lengthText(s, rA) + (0.5 * rA > R ? "" : " (below the surface)"),
+                "Where the magnetic field takes over from the disk: r_A = (mu^4 / (2 G M Mdot^2))^(1/7). The disk "
+                "stops near half of it; inside, gas flows along field lines onto the magnetic poles.");
+        }
+    } else {
+        row("Accretion efficiency", printf1("%.4g%% of rest mass", 100.0 * central::blackHoleEfficiency(a)),
+            "1 - E_isco: the energy a thin disk releases before the gas crosses the horizon. 5.7% without spin, "
+            "32% at a = 0.998.");
+        const double rStar = central::kSunRadiusKm / (central::kKmPerSolarMass * o.massSolar);
+        const double rt = central::tidalRadius(rStar, 1.0 / o.massSolar);
+        const double rmb = kerr::marginallyBoundRadius(a, true);
+        row("Sun-like star torn at", rt < rmb ? std::string("(swallowed whole)") : lengthText(s, rt),
+            "Its tidal radius, r_t = R* (M / m*)^(1/3). Holes heavier than the Hills mass (1.1e8 Suns for a Sun-like "
+            "star) swallow such stars before the tides can tear them.");
+    }
+    row("1 M is", central::formatLength(1.0, o.massSolar) + ", " + central::formatTime(1.0, o.massSolar),
+        "The units of length and time, G M / c^2 and G M / c^3, for this mass.");
+    ImGui::EndTable();
+}
 
+void radiiTable(UiContext& ctx) {
+    const Settings& s = ctx.settings;
+    const double a = s.spin;
+    const double surface = surfaceOf(s);
+    if (!ImGui::BeginTable("radii", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) return;
+    ImGui::TableSetupColumn("Radius (M)");
+    ImGui::TableSetupColumn("Prograde");
+    ImGui::TableSetupColumn("Retrograde");
+    ImGui::TableHeadersRow();
+    auto value = [&](double r) {
+        if (r < 0.0) return;
+        if (surface > 0.0 && r < surface) ImGui::TextDisabled("%.3f (inside)", r);
+        else ImGui::Text("%.3f", r);
+    };
+    auto row = [&](const char* name, double pro, double retro, const char* tip) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(name);
+        ImGui::SetItemTooltip("%s", tip);
+        ImGui::TableNextColumn();
+        value(pro);
+        ImGui::TableNextColumn();
+        value(retro);
+    };
+    if (surface > 0.0) {
+        row("Surface", surface, -1, "Rays, bodies, gas and the camera stop here.");
+    } else {
+        row("Event horizon", kerr::horizonRadius(a), -1, "Nothing, not even light, returns from inside.");
+        row("Ergosphere (equator)", kerr::ergosphereRadius(a, 0.5 * kerr::kPi), -1,
+            "Inside, frame dragging is so strong that nothing can stay still relative to the stars.");
+    }
+    row("Photon orbit", kerr::photonOrbitRadius(a, true), kerr::photonOrbitRadius(a, false),
+        "Light can circle the hole here (unstably). It forms the bright photon ring.");
+    row("ISCO", kerr::iscoRadius(a, true), kerr::iscoRadius(a, false),
+        "Innermost stable circular orbit: where the accretion disk ends.");
+    ImGui::EndTable();
+}
+
+void centralSection(UiContext& ctx) {
+    Settings& s = ctx.settings;
+    UiState& ui = ctx.state;
+    central::Object& o = s.central;
+    const auto& list = central::catalog();
+
+    // The catalogue, one click each.
+    const float buttonWidth = (ImGui::GetContentRegionAvail().x - 2.0f * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
+    for (size_t k = 0; k < list.size(); ++k) {
+        if (k % 3 != 0) ImGui::SameLine();
+        if (ImGui::Button(list[k].label, ImVec2(buttonWidth, 0))) ctx.centralRequested = static_cast<int>(k);
+        ImGui::SetItemTooltip("%s", list[k].description);
+    }
     ImGui::TextDisabled("Famous black holes:");
     for (int i = 1; i < SceneCount; ++i) {
         if (i > 1) ImGui::SameLine();
@@ -79,38 +235,178 @@ void blackHoleSection(UiContext& ctx) {
     ImGui::SameLine();
     if (ImGui::SmallButton("Reset")) ctx.sceneRequested = SceneDefault;
 
-    const double a = s.spin;
-    if (ImGui::BeginTable("radii", 3, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
-        ImGui::TableSetupColumn("Radius (M)");
-        ImGui::TableSetupColumn("Prograde");
-        ImGui::TableSetupColumn("Retrograde");
-        ImGui::TableHeadersRow();
-        auto row = [](const char* name, double pro, double retro, const char* tip) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(name);
-            ImGui::SetItemTooltip("%s", tip);
-            ImGui::TableNextColumn();
-            ImGui::Text("%.3f", pro);
-            ImGui::TableNextColumn();
-            if (retro > 0) ImGui::Text("%.3f", retro);
-        };
-        row("Event horizon", kerr::horizonRadius(a), -1, "Nothing, not even light, returns from inside.");
-        row("Ergosphere (equator)", kerr::ergosphereRadius(a, 0.5 * kerr::kPi), -1,
-            "Inside, frame dragging is so strong that nothing can stay still relative to the stars.");
-        row("Photon orbit", kerr::photonOrbitRadius(a, true), kerr::photonOrbitRadius(a, false),
-            "Light can circle the hole here (unstably). It forms the bright photon ring.");
-        row("ISCO", kerr::iscoRadius(a, true), kerr::iscoRadius(a, false),
-            "Innermost stable circular orbit: where the accretion disk ends.");
-        ImGui::EndTable();
+    ImGui::SeparatorText((o.name + "  (" + central::kindName(o.kind) + ")").c_str());
+    const bool neutron = o.kind == central::Kind::NeutronStar, dwarf = o.kind == central::Kind::WhiteDwarf;
+
+    // Mass: for a body, the radius in km stays (or follows the mass-radius relation).
+    {
+        double mass = o.massSolar;
+        const double lo = 1e-7, hi = 3e10;
+        if (ImGui::SliderScalar("Mass", ImGuiDataType_Double, &mass, &lo, &hi, "%.4g Msun", ImGuiSliderFlags_Logarithmic)) {
+            const double km = central::lengthKm(o.radius, o.massSolar);
+            o.massSolar = mass;
+            if (!o.hasHorizon()) {
+                double followed = 0.0;
+                if (s.radiusFollowsMass && dwarf) followed = central::whiteDwarfRadiusKm(mass);
+                if (s.radiusFollowsMass && neutron) followed = central::neutronStarRadiusKm(mass);
+                o.radius = (followed > 0.0 ? followed : km) / (central::kKmPerSolarMass * mass);
+            }
+            ui.compactnessOrigin = -1;
+        }
+        help("For a black hole the mass only sets the units: everything scales with it. A star or planet keeps "
+             "its size in km (or follows the mass-radius relation of white dwarfs and neutron stars), so its R/M "
+             "changes. White dwarfs cannot exceed 1.44 solar masses, neutron stars ~1.64 (this equation of state).");
     }
+    if (!o.hasHorizon()) {
+        if (ui.radiusInKm) {
+            double km = central::lengthKm(o.radius, o.massSolar);
+            const double lo = 1.0, hi = 1e9;
+            if (ImGui::SliderScalar("Radius", ImGuiDataType_Double, &km, &lo, &hi, "%.4g km", ImGuiSliderFlags_Logarithmic)) {
+                o.radius = km / (central::kKmPerSolarMass * o.massSolar);
+                ui.compactnessOrigin = -1;
+            }
+        } else {
+            double R = o.radius;
+            const double lo = 2.0, hi = 2e9;
+            if (ImGui::SliderScalar("Radius", ImGuiDataType_Double, &R, &lo, &hi, "%.5g M", ImGuiSliderFlags_Logarithmic)) {
+                o.radius = R;
+                ui.compactnessOrigin = -1;
+            }
+        }
+        ImGui::Checkbox("Radius in km", &ui.radiusInKm);
+        if (neutron || dwarf) {
+            ImGui::SameLine();
+            ImGui::Checkbox("Radius follows mass", &s.radiusFollowsMass);
+            help("White dwarfs: Nauenberg's relation, R = 0.0112 R_sun sqrt((M/M_Ch)^(-2/3) - (M/M_Ch)^(2/3)): "
+                 "heavier ones are smaller. Neutron stars: the Tolman-Oppenheimer-Volkoff equations for a "
+                 "Gamma = 2 polytrope (14 km at 1.4 solar masses).");
+        }
+    }
+
+    // Spin.
+    {
+        double chi = o.chi;
+        const double lo = 0.0, hi = o.hasHorizon() ? 0.999 : o.maxChi();
+        if (ImGui::SliderScalar(o.hasHorizon() ? "Spin a/M" : "Spin J/M^2", ImGuiDataType_Double, &chi, &lo, &hi, "%.4g",
+                                hi > 5.0 ? ImGuiSliderFlags_Logarithmic : 0)) {
+            o.chi = chi;
+        }
+        if (o.hasHorizon()) {
+            help("Angular momentum per unit mass. 0 is a non-rotating (Schwarzschild) hole; values near 1 are extreme "
+                 "Kerr holes whose rotation drags space around them. Most astrophysical black holes are thought to "
+                 "spin quickly.");
+        } else {
+            help("c J / (G M^2). Above 1 is normal for planets and ordinary stars (the Earth's is ~890); only black "
+                 "holes cannot exceed 1. The slider stops at the mass-shedding limit, where the equator would fly "
+                 "apart (Omega ~ 0.65 sqrt(M / R^3)). Outside, the Kerr metric with a = min(J/M^2, 0.99) is used: "
+                 "right in mass and angular momentum, approximate in the quadrupole.");
+            ImGui::TextDisabled("Turns once every %s; Kerr spin a = %.3f", central::formatTime(2.0 * kerr::kPi /
+                                std::max(o.surfaceOmega(), 1e-300), o.massSolar).c_str(), s.spin);
+            if (o.chi > o.maxChi() * 1.0001) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.65f, 0.3f, 1.0f));
+                ImGui::TextWrapped("Squeezed, it would spin faster than its surface can (mass shedding): the surface "
+                                   "turns at the limit, and J is kept for a collapse.");
+                ImGui::PopStyleColor();
+            }
+        }
+    }
+
+    if (!o.hasHorizon()) {
+        float T = static_cast<float>(o.surfaceTemperature);
+        if (ImGui::SliderFloat("Surface temperature", &T, 100.0f, 1e8f, "%.0f K", ImGuiSliderFlags_Logarithmic)) {
+            o.surfaceTemperature = T;
+        }
+        if (T > 30000.0f) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("Drawn as %.0f K: hotter surfaces shine mostly in UV and X-rays, so their color "
+                               "temperature is compressed.", central::displayTemperature(T));
+            ImGui::PopStyleColor();
+        }
+        if (neutron || dwarf) {
+            double B = std::max(o.magneticField, 1.0);
+            const double lo = 1.0, hi = 1e16;
+            if (ImGui::SliderScalar("Magnetic field", ImGuiDataType_Double, &B, &lo, &hi, "%.3g G",
+                                    ImGuiSliderFlags_Logarithmic)) {
+                o.magneticField = B;
+            }
+            ImGui::SliderFloat("Accretion rate", &s.accretionRate, 1e-4f, 1.0f, "%.3g Eddington", ImGuiSliderFlags_Logarithmic);
+            help("How fast the disk feeds the star, in units of the Eddington rate (where radiation pressure would "
+                 "balance gravity). With the field, it sets where the magnetosphere stops the disk.");
+            ImGui::Checkbox("Magnetosphere", &s.magnetosphere);
+            help("A magnetized star stops the disk near half the Alfven radius; inside, the gas follows the dipole "
+                 "field lines r = L sin^2(theta) down onto the magnetic poles (accretion columns), heating them.");
+            ImGui::SameLine();
+            if (neutron) ImGui::Checkbox("Pulsar beams", &o.pulsar);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(neutron ? "X-ray burst" : "Nova")) ctx.burstRequested = true;
+            ImGui::SetItemTooltip(neutron ? "Helium accreted on a neutron star ignites and burns across the whole surface "
+                                            "in seconds (a Type I X-ray burst)."
+                                          : "Hydrogen accreted on a white dwarf ignites in a thermonuclear runaway.");
+        }
+        ImGui::Checkbox("Surface detail", &s.surfaceDetail);
+        ImGui::SameLine();
+        ImGui::Checkbox("Corona / atmosphere", &s.corona);
+        help("A star's corona and a planet's atmosphere, as a faint glow above the limb. Both are exaggerated so "
+             "they show: a real corona is a millionth as bright as the Sun's surface.");
+        ImGui::SliderFloat("Surface brightness", &s.surfaceBrightness, 0.05f, 20.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+    }
+
+    // Compactness: keep the mass, change the radius.
+    if (!o.hasHorizon()) {
+        double C = 1.0 / o.radius;
+        const double cMin = std::min(2e-6, 1.0 / o.radius), cMax = 0.5;
+        if (ImGui::SliderScalar("Compactness M/R", ImGuiDataType_Double, &C, &cMin, &cMax, "%.3g",
+                                ImGuiSliderFlags_Logarithmic)) {
+            if (ui.compactnessOrigin < 0) {
+                ui.compactnessOrigin = static_cast<int>(o.kind);
+                ui.compactnessTemperature = o.surfaceTemperature;
+            }
+            o.radius = 1.0 / C;
+            if (s.autoStage) {
+                const central::Kind stage =
+                    central::stageForCompactness(o.radius, static_cast<central::Kind>(ui.compactnessOrigin));
+                if (central::becomeStage(o, stage, ui.compactnessTemperature)) {
+                    if (stage == central::Kind::WhiteDwarf) {
+                        ui.centralStatus = "As dense as a white dwarf: a teaspoon weighs tonnes, and degenerate electrons "
+                                           "hold it up (real white dwarfs have R ~ 1,000-30,000 M).";
+                    } else if (stage == central::Kind::NeutronStar) {
+                        ui.centralStatus = "Neutron-star density: electrons are squeezed into the protons, and degenerate "
+                                           "neutrons hold it up. (No stable star exists between ~10 and ~1,000 M: there "
+                                           "a shrinking star collapses.)";
+                    } else {
+                        ui.centralStatus = "Swollen back to an ordinary star.";
+                    }
+                }
+            }
+        }
+        help("Keeps the mass and shrinks (or swells) the radius. Outside the surface nothing changes (Birkhoff's "
+             "theorem): orbits and light bending stay those of a black hole of the same mass. What changes is how "
+             "deep you can go: below R = 6M the disk ends at the ISCO, below 3.5M the whole surface shows, below 3M "
+             "the photon ring appears, and below the Buchdahl limit 9/4 M nothing can stand: it collapses into a "
+             "black hole with the same mass and spin.");
+        ImGui::Checkbox("Becomes a white dwarf, then a neutron star", &s.autoStage);
+    }
+    ImGui::Checkbox("Physical units", &s.physicalUnits);
+    help("Readouts also in km, AU, seconds and hours, for the mass above. With a black hole, the Tidal disruption "
+         "preset then uses a Sun-like star at its true size.");
+
+    if (!ui.centralStatus.empty()) ImGui::TextWrapped("%s", ui.centralStatus.c_str());
+    if (!o.hasHorizon()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
+        ImGui::TextWrapped("Outside the surface, orbits and light bending are exactly those of a black hole of the "
+                           "same mass (Birkhoff's theorem). Only how close you can get is different.");
+        ImGui::PopStyleColor();
+    }
+    centralReadouts(ctx);
+    radiiTable(ctx);
 }
 
 void cameraSection(UiContext& ctx) {
     Camera& cam = ctx.camera;
     Settings& s = ctx.settings;
     UiState& ui = ctx.state;
-    const float minR = static_cast<float>(kerr::horizonRadius(s.spin)) + 0.3f;
+    const double S = ctx.scale;
+    const double minR = cam.minDistance(s.spin);
 
     // Motion
     const CameraMotion motion = cam.motion;
@@ -123,8 +419,8 @@ void cameraSection(UiContext& ctx) {
                           "sky ahead crowds together and turns blue (relativistic aberration).");
     ImGui::SameLine();
     if (ImGui::RadioButton("Free fall", motion == CameraMotion::FreeFall)) ctx.cameraMotionRequested = 2;
-    ImGui::SetItemTooltip("Drop from rest straight toward the hole. Watch the shadow swell as you fall, then "
-                          "cross the horizon and see the outside universe shrink to a bright patch above you.");
+    ImGui::SetItemTooltip("Drop from rest straight toward the center. Toward a black hole: watch the shadow swell, "
+                          "then cross the horizon. Toward a star or planet: you land on its surface.");
 
     // Ride along with a body.
     const char* riding = "nobody";
@@ -152,9 +448,9 @@ void cameraSection(UiContext& ctx) {
         } else {
             glm::vec3 v = cam.velocity(s.spin);
             float speed = glm::length(v);
-            ImGui::Text("Speed %.3f c   gamma %.2f   r = %.2f M", speed,
-                        1.0f / std::sqrt(std::max(1.0f - speed * speed, 1e-6f)), cam.r);
-            ImGui::Text("Your clock: %.1f M (runs at %.0f%% of a distant clock)", cam.properTime,
+            ImGui::Text("Speed %.3f c   gamma %.2f   r = %s", speed, 1.0f / std::sqrt(std::max(1.0f - speed * speed, 1e-6f)),
+                        lengthText(s, cam.r).c_str());
+            ImGui::Text("Your clock: %.4g M (runs at %.0f%% of a distant clock)", cam.properTime,
                         100.0 * cam.clockRate(s.spin));
         }
         if (ctx.slowdown < 0.999) ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Slow motion: x%.2f", ctx.slowdown);
@@ -171,12 +467,17 @@ void cameraSection(UiContext& ctx) {
         }
         ImGui::TextDisabled("Drag to look around. Pause (Space) stops the motion.");
     } else {
-        ImGui::TextDisabled("Clocks here run at %.0f%% of the rate far away.", 100.0 * cam.clockRate(s.spin));
+        ImGui::TextDisabled("Clocks here run at %.4g%% of the rate far away.", 100.0 * cam.clockRate(s.spin));
     }
     if (!ui.cameraStatus.empty()) ImGui::TextWrapped("%s", ui.cameraStatus.c_str());
     if (motion == CameraMotion::Hover) {
-        float r = static_cast<float>(cam.r);
-        if (ImGui::SliderFloat("Distance", &r, minR, 500.0f, "%.2f M", ImGuiSliderFlags_Logarithmic)) cam.r = r;
+        double r = cam.r;
+        const double rMax = 500.0 * S;
+        if (ImGui::SliderScalar("Distance", ImGuiDataType_Double, &r, &minR, &rMax, "%.4g M",
+                                ImGuiSliderFlags_Logarithmic)) {
+            cam.r = r;
+        }
+        if (s.physicalUnits) ImGui::TextDisabled("= %s", central::formatLength(cam.r, s.central.massSolar).c_str());
         float incl = static_cast<float>(cam.theta) / kDeg;
         if (ImGui::SliderFloat("Inclination", &incl, 1.0f, 179.0f, "%.1f deg")) cam.theta = incl * kDeg;
         help("Angle from the spin axis: 0 looks down on the north pole, 90 is edge-on to the disk.");
@@ -192,7 +493,7 @@ void cameraSection(UiContext& ctx) {
 
         auto view = [&](const char* label, double rr, double inclDeg) {
             if (ImGui::Button(label)) {
-                cam.r = std::max<double>(rr, minR);
+                cam.r = std::max(rr * S, minR);
                 cam.theta = inclDeg * kDeg;
                 cam.yaw = cam.pitch = 0.0f;
             }
@@ -211,17 +512,16 @@ void cameraSection(UiContext& ctx) {
 
 void diskSection(UiContext& ctx) {
     Settings& s = ctx.settings;
+    const double S = ctx.scale;
     ImGui::Checkbox("Show disk", &s.diskEnabled);
     ImGui::SameLine();
     if (ImGui::RadioButton("Prograde", s.diskPrograde)) s.diskPrograde = true;
     ImGui::SameLine();
     if (ImGui::RadioButton("Retrograde", !s.diskPrograde)) s.diskPrograde = false;
 
-    ImGui::Checkbox("Inner edge at ISCO", &s.diskInnerAtIsco);
-    if (!s.diskInnerAtIsco) {
-        ImGui::SliderFloat("Inner radius", &s.diskInner, 1.0f, 15.0f, "%.2f M");
-    }
-    ImGui::SliderFloat("Outer radius", &s.diskOuter, 4.0f, 60.0f, "%.1f M");
+    ImGui::Checkbox(s.central.hasHorizon() ? "Inner edge at ISCO" : "Inner edge at ISCO or surface", &s.diskInnerAtIsco);
+    if (!s.diskInnerAtIsco) sceneSlider("Inner radius", s.diskInner, 1.0f, 15.0f, S, false);
+    sceneSlider("Outer radius", s.diskOuter, 4.0f, 60.0f, S, false);
     ImGui::SliderFloat("Peak temperature", &s.diskTemperature, 1500.0f, 40000.0f, "%.0f K", ImGuiSliderFlags_Logarithmic);
     help("Sets the disk's color through the blackbody spectrum. Real disks around stellar black holes "
          "reach millions of kelvin; here it is kept in the visible range so the colors mean something.");
@@ -291,27 +591,31 @@ void presetButtons(UiContext& ctx, bool objects) {
 void updatePlanner(UiContext& ctx) {
     UiState& ui = ctx.state;
     const double a = ctx.settings.spin;
-    char key[256];
-    std::snprintf(key, sizeof(key), "%.6f %.4f %.3f %.3f %.4f %.3f %.4f %d", a, ui.launchR, ui.launchPolarDeg,
-                  ui.launchAzimuthDeg, ui.launchSpeed, ui.launchTiltDeg, ui.launchRadial, ui.launchPrograde ? 1 : 0);
+    const double S = ctx.scale, tS = S * std::sqrt(S);
+    const double surface = surfaceOf(ctx.settings);
+    char key[320];
+    std::snprintf(key, sizeof(key), "%.6f %.4f %.3f %.3f %.4f %.3f %.4f %d %.6g %.6g", a, ui.launchR, ui.launchPolarDeg,
+                  ui.launchAzimuthDeg, ui.launchSpeed, ui.launchTiltDeg, ui.launchRadial, ui.launchPrograde ? 1 : 0, S,
+                  surface);
     if (ui.plannerKey == key) return;
     ui.plannerKey = key;
-    ui.plannerValid = plannedLaunch(ui, a, ui.plannerConstants, ui.plannerState);
+    ui.plannerValid = plannedLaunch(ui, a, S, surface, ui.plannerConstants, ui.plannerState);
     if (!ui.plannerValid) return;
     ui.plannerSpin = a;
-    ui.plannerAnalysis = trajectory::classify(a, ui.plannerConstants, ui.plannerState);
-    ui.plannerPath = trajectory::predict(a, ui.plannerConstants, ui.plannerState, 3000.0, 0.25, 8000);
+    ui.plannerAnalysis = trajectory::classify(a, ui.plannerConstants, ui.plannerState, surface);
+    ui.plannerPath = trajectory::predict(a, ui.plannerConstants, ui.plannerState, 3000.0 * tS, 0.25 * S, 8000, surface,
+                                         2000.0 * S);
 }
 
 // The effective potential V(r): the body can only be where its energy E is above it.
-void potentialPlot(const UiState& ui, double a) {
+void potentialPlot(const UiState& ui, double a, double S, double surface) {
     const kerr::Constants& c = ui.plannerConstants;
     const trajectory::Analysis& an = ui.plannerAnalysis;
-    const double rh = kerr::horizonRadius(a);
+    const double rh = central::boundaryRadius(a, surface);
     const double r0 = ui.plannerState.r;
-    double rMax = std::max(40.0, 1.6 * r0);
+    double rMax = std::max(40.0 * S, 1.6 * r0);
     if (an.hasOuter) rMax = std::max(rMax, 1.3 * an.rOuter);
-    rMax = std::min(rMax, 2000.0);
+    rMax = std::min(rMax, 2000.0 * S);
     const double rMin = rh * 1.001;
 
     const int n = 240;
@@ -324,7 +628,9 @@ void potentialPlot(const UiState& ui, double a) {
         vPeak = std::max(vPeak, vs[i]);
     }
     const double E = c.E;
-    double yHi = std::max(E, std::min(vPeak, E + 0.25)) + 0.03;
+    // Far from a big object the well is shallow: zoom in on it.
+    const double span = std::max(std::min(vPeak, E + 0.25) - vMin, 1e-12);
+    double yHi = std::max(E, std::min(vPeak, E + 0.25)) + 0.12 * span;
     double yLo = std::min(vMin, E);
     yLo -= 0.25 * (yHi - yLo);  // room below the well for the energy line
 
@@ -347,9 +653,9 @@ void potentialPlot(const UiState& ui, double a) {
             dl->AddRectFilled(ImVec2(px(rs[i - 1]), origin.y), ImVec2(px(rs[i]) + 1.0f, corner.y), IM_COL32(90, 25, 30, 120));
         }
     }
-    // ISCO and photon orbit markers.
+    // ISCO marker.
     const double isco = kerr::iscoRadius(a, true);
-    if (isco < rMax) {
+    if (isco < rMax && isco > rMin) {
         dl->AddLine(ImVec2(px(isco), origin.y), ImVec2(px(isco), corner.y), IM_COL32(80, 220, 120, 70));
     }
     // V(r) and E.
@@ -364,8 +670,8 @@ void potentialPlot(const UiState& ui, double a) {
     dl->PopClipRect();
     dl->AddText(ImVec2(origin.x + 4, origin.y + 2), IM_COL32(170, 170, 180, 255), "V(r)");
     dl->AddText(ImVec2(corner.x - 5.0f * em, py(E) + 2.0f), kPlannerColor, "energy E");
-    char label[64];
-    std::snprintf(label, sizeof(label), "horizon ... r (log) ... %.0f M", rMax);
+    char label[96];
+    std::snprintf(label, sizeof(label), "%s ... r (log) ... %.4g M", surface > 0.0 ? "surface" : "horizon", rMax);
     const float labelWidth = ImGui::CalcTextSize(label).x;
     dl->AddText(ImVec2(corner.x - labelWidth - 4, origin.y + 2), IM_COL32(150, 150, 160, 255), label);
 }
@@ -375,12 +681,17 @@ void plannerSection(UiContext& ctx) {
     BodySystem& sys = ctx.bodies;
     UiState& ui = ctx.state;
     const double a = s.spin;
+    const double S = ctx.scale;
+    const float fS = static_cast<float>(S);
+    const double surface = surfaceOf(s);
     ui.plannerOpen = true;
 
     ImGui::TextWrapped("Set a start and a velocity, or drag on the orbit map (top view) from the start "
                        "point in the direction to throw. The verdict and the dashed path update live.");
-    ImGui::Combo("Type", &ui.launchKind, "Star\0Rocky planet\0Gas giant\0Pulsar\0Star (tidally disrupted)\0");
-    ImGui::SliderFloat("Start radius", &ui.launchR, 2.0f, 80.0f, "%.2f M", ImGuiSliderFlags_Logarithmic);
+    ImGui::Combo("Type", &ui.launchKind,
+                 "Star\0Rocky planet\0Gas giant\0Pulsar\0Star (tidally disrupted)\0White dwarf\0Neutron star\0"
+                 "Small black hole\0");
+    sceneSlider("Start radius", ui.launchR, 2.0f, 80.0f, S, true);
     ImGui::SliderFloat("Polar angle", &ui.launchPolarDeg, 1.0f, 179.0f, "%.0f deg");
     ImGui::SliderFloat("Azimuth##launch", &ui.launchAzimuthDeg, 0.0f, 360.0f, "%.0f deg");
     ImGui::SliderFloat("Speed", &ui.launchSpeed, 0.0f, 2.0f, "%.3f x circular");
@@ -392,15 +703,17 @@ void plannerSection(UiContext& ctx) {
     ImGui::Checkbox("Prograde", &ui.launchPrograde);
     const BodyKind kind = static_cast<BodyKind>(ui.launchKind);
     const bool planet = kind == BodyKind::RockyPlanet || kind == BodyKind::GasGiant;
-    if (!planet) {
+    const bool hole = kind == BodyKind::MiniBlackHole;
+    if (!planet && !hole) {
         ImGui::SliderFloat("Temperature", &ui.launchTemperature, 2000.0f, 40000.0f, "%.0f K", ImGuiSliderFlags_Logarithmic);
     }
-    ImGui::SliderFloat("Size", &ui.launchRadius, 0.1f, 2.0f, "%.2f M");
+    if (!hole) sceneSlider("Size", ui.launchRadius, 0.1f, 2.0f, S, false);
     if (kind != BodyKind::TidalStar) {
         ImGui::SliderFloat("Mass", &ui.launchMass, 1e-7f, 0.05f, "%.2g M", ImGuiSliderFlags_Logarithmic);
-        help("In units of the hole's mass. A Sun-like star around a million-Sun hole is 1e-6: its pull "
+        help("In units of the central mass. A Sun-like star around a million-Sun hole is 1e-6: its pull "
              "on anything else is negligible. Raise it (to ~0.01) and, with gravity between bodies on, it "
-             "can hold moons and capture or fling other bodies.");
+             "can hold moons and capture or fling other bodies. A small black hole's mass sets how strongly it "
+             "lenses (4m/b) and the size of its shadow (3 sqrt(3) m).");
     }
 
     // Verdict
@@ -412,21 +725,24 @@ void plannerSection(UiContext& ctx) {
         char verdict[256];
         switch (an.fate) {
             case trajectory::Fate::Plunges:
+            case trajectory::Fate::HitsSurface: {
+                const bool surfaceHit = an.fate == trajectory::Fate::HitsSurface;
+                const char* into = surfaceHit ? "Hits the surface" : "Falls into the black hole";
                 color = ImVec4(1.0f, 0.4f, 0.35f, 1.0f);
-                if (path.fate == trajectory::Fate::Plunges) {
-                    std::snprintf(verdict, sizeof(verdict), "Falls into the black hole after %.0f M.", path.duration);
+                if (path.fate == an.fate) {
+                    std::snprintf(verdict, sizeof(verdict), "%s after %.4g M.", into, path.duration);
+                } else if (an.hasOuter) {
+                    std::snprintf(verdict, sizeof(verdict), "Swings out to r = %.4g M, then %s.", an.rOuter,
+                                  surfaceHit ? "hits the surface" : "falls in");
                 } else {
-                    std::snprintf(verdict, sizeof(verdict), "Falls into the black hole%s.",
-                                  an.hasOuter ? " after swinging out to r = " : "");
-                    if (an.hasOuter) {
-                        std::snprintf(verdict, sizeof(verdict), "Swings out to r = %.1f M, then falls in.", an.rOuter);
-                    }
+                    std::snprintf(verdict, sizeof(verdict), "%s.", into);
                 }
                 break;
+            }
             case trajectory::Fate::Escapes:
                 color = ImVec4(1.0f, 0.85f, 0.3f, 1.0f);
                 std::snprintf(verdict, sizeof(verdict), "Escapes to infinity%s (E = %.4f).",
-                              an.hasInner ? " after swinging past the hole" : "", ui.plannerConstants.E);
+                              an.hasInner ? " after swinging past the center" : "", ui.plannerConstants.E);
                 break;
             case trajectory::Fate::Circular:
                 if (!an.stableCircular) color = ImVec4(1.0f, 0.65f, 0.3f, 1.0f);
@@ -435,74 +751,78 @@ void plannerSection(UiContext& ctx) {
                                   : "Circular, but unstable: the slightest nudge sends it in or out.");
                 break;
             case trajectory::Fate::Bound:
-                std::snprintf(verdict, sizeof(verdict), "Bound orbit between r = %.2f and %.2f M.", an.rInner,
+                std::snprintf(verdict, sizeof(verdict), "Bound orbit between r = %.4g and %.4g M.", an.rInner,
                               an.rOuter);
                 break;
         }
         ImGui::PushStyleColor(ImGuiCol_Text, color);
         ImGui::TextWrapped("%s", verdict);
         ImGui::PopStyleColor();
-        ImGui::TextDisabled("E = %.5f   L = %+.4f   Q = %.4f   tilt %.1f deg", ui.plannerConstants.E,
+        ImGui::TextDisabled("E = %.6f   L = %+.4g   Q = %.4g   tilt %.1f deg", ui.plannerConstants.E,
                             ui.plannerConstants.L, ui.plannerConstants.Q, an.inclinationDeg);
         if (an.fate == trajectory::Fate::Bound && path.periapses >= 2) {
-            ImGui::TextDisabled("The closest point advances %.1f deg every orbit.", path.precessionDeg);
+            ImGui::TextDisabled("The closest point advances %.3g deg every orbit.", path.precessionDeg);
         }
         if (ui.plannerJointValid) {
             const trajectory::Path& joint = ui.plannerJointPath;
             char among[256];
-            if (joint.fate == trajectory::Fate::Plunges) {
-                std::snprintf(among, sizeof(among), "With the other bodies' pull: falls in after %.0f M.", joint.duration);
+            if (joint.fate == trajectory::Fate::Plunges || joint.fate == trajectory::Fate::HitsSurface) {
+                std::snprintf(among, sizeof(among), "With the other bodies' pull: %s after %.4g M.",
+                              joint.fate == trajectory::Fate::Plunges ? "falls in" : "hits the surface", joint.duration);
             } else if (joint.fate == trajectory::Fate::Escapes) {
-                std::snprintf(among, sizeof(among), "With the other bodies' pull: escapes (gone after %.0f M).",
+                std::snprintf(among, sizeof(among), "With the other bodies' pull: escapes (gone after %.4g M).",
                               joint.duration);
             } else {
                 std::snprintf(among, sizeof(among),
-                              "With the other bodies' pull: still in orbit after %.0f M, between r = %.1f and %.1f M.",
+                              "With the other bodies' pull: still in orbit after %.4g M, between r = %.4g and %.4g M.",
                               joint.duration, joint.rMin, joint.rMax);
             }
             ImGui::TextWrapped("%s", among);
-            help("The verdict above is exact for a body that only feels the hole. This line comes from "
+            help("The verdict above is exact for a body that only feels the central mass. This line comes from "
                  "simulating it together with the other bodies (gravity between bodies is on), which can "
                  "change its fate. The dashed path shows this simulation.");
         }
-        potentialPlot(ui, a);
+        potentialPlot(ui, a, S, surface);
         help("Effective potential: the least energy a body with this angular momentum needs to be at each "
              "radius. It can only go where its energy line (blue) is above the curve; the dots are the turning "
              "points. A hump the line clears means nothing stops it falling in.");
     } else {
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.35f, 1.0f), "Cannot start there: too close to the horizon.");
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.35f, 1.0f), surface > 0.0 ? "Cannot start there: inside the surface."
+                                                                          : "Cannot start there: too close to the horizon.");
     }
 
     auto finish = [&]() {
         Body& b = sys.bodies.back();
-        b.temperature = planet ? 0.0f : ui.launchTemperature;
-        b.radius = ui.launchRadius;
-        if (kind == BodyKind::RockyPlanet) b.spinRate = 0.06f;
-        if (kind == BodyKind::GasGiant) b.spinRate = 0.1f;
-        if (kind == BodyKind::Pulsar) b.spinRate = 2.0f;
+        b.temperature = planet || hole ? 0.0f : ui.launchTemperature;
+        b.radius = ui.launchRadius * fS;
+        const float spinScale = 1.0f / (fS * std::sqrt(fS));
+        if (kind == BodyKind::RockyPlanet) b.spinRate = 0.06f * spinScale;
+        if (kind == BodyKind::GasGiant) b.spinRate = 0.1f * spinScale;
+        if (kind == BodyKind::Pulsar) b.spinRate = 2.0f * spinScale;
         b.mass = ui.launchMass;
+        if (hole) b.radius = static_cast<float>(3.0 * std::sqrt(3.0) * ui.launchMass);
         if (kind == BodyKind::TidalStar) {
-            b.tidalRadius = static_cast<float>(std::max(15.0, 0.6 * ui.launchR));
+            b.tidalRadius = static_cast<float>(std::max(15.0, 0.6 * ui.launchR) * S);
             b.mass = std::pow(b.radius / b.tidalRadius, 3.0);  // r_t = R (M / m)^(1/3)
         }
     };
     const bool enter = !ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Enter, false);
     if (ImGui::Button("Launch (Enter)") || enter) {
         double v[3];
-        if (plannedVelocity(ui, a, v) &&
-            sys.addFromZamo(a, ui.launchR, ui.launchPolarDeg * kDeg, ui.launchAzimuthDeg * kDeg, v, kind)) {
+        if (plannedVelocity(ui, a, S, surface, v) &&
+            sys.addFromZamo(a, ui.launchR * S, ui.launchPolarDeg * kDeg, ui.launchAzimuthDeg * kDeg, v, kind)) {
             finish();
         }
     }
     if (kind == BodyKind::TidalStar) {
         ImGui::SameLine();
-        ImGui::TextDisabled("Tidal radius %.0f M: torn apart well inside it.", std::max(15.0, 0.6 * ui.launchR));
+        ImGui::TextDisabled("Tidal radius %.4g M: torn apart well inside it.", std::max(15.0, 0.6 * ui.launchR) * S);
     }
     ImGui::SeparatorText("Or by turning points (equatorial)");
-    ImGui::SliderFloat("Periapsis", &ui.launchRp, 1.0f, 40.0f, "%.2f M");
-    ImGui::SliderFloat("Apoapsis", &ui.launchRa, 2.0f, 80.0f, "%.2f M");
+    sceneSlider("Periapsis", ui.launchRp, 1.0f, 40.0f, S, false);
+    sceneSlider("Apoapsis", ui.launchRa, 2.0f, 80.0f, S, false);
     if (ImGui::Button("Launch bound orbit")) {
-        if (sys.addEquatorial(a, ui.launchRp, ui.launchRa, ui.launchPrograde, ui.launchAzimuthDeg * kDeg, kind)) {
+        if (sys.addEquatorial(a, ui.launchRp * S, ui.launchRa * S, ui.launchPrograde, ui.launchAzimuthDeg * kDeg, kind)) {
             finish();
         }
     }
@@ -511,19 +831,25 @@ void plannerSection(UiContext& ctx) {
 void objectsSection(UiContext& ctx) {
     Settings& s = ctx.settings;
     BodySystem& sys = ctx.bodies;
+    const double S = ctx.scale, tS = S * std::sqrt(S);
 
     ImGui::Checkbox("Paused", &s.paused);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1);
-    ImGui::SliderFloat("##timescale", &s.timeScale, 0.1f, 500.0f, "%.1f M per second", ImGuiSliderFlags_Logarithmic);
+    char speed[96];
+    std::snprintf(speed, sizeof(speed), "%%.4g x   (%.3g M per second)", s.timeScale * tS);
+    ImGui::SliderFloat("##timescale", &s.timeScale, 0.1f, 500.0f, speed, ImGuiSliderFlags_Logarithmic);
+    if (s.physicalUnits) {
+        ImGui::TextDisabled("Each second shows %s.", central::formatTime(s.timeScale * tS, s.central.massSolar).c_str());
+    }
     ImGui::Checkbox("Light travel time", &s.lightDelay);
     help("Light takes time to reach you, so everything is seen where it was when its light set out: "
          "fast stars lag behind and stretch, lensed images of the same star show it at different "
          "moments, and a pulsar's lensed images flash out of step.");
     ImGui::Checkbox("Gravity between bodies", &s.bodyGravity);
     help("Bodies pull on each other (and on debris gas), each feeling the others' Newtonian pull in its "
-         "own rest frame on top of the hole's exact gravity. Most bodies are far too light to matter; the "
-         "binary star and planet-with-moon presets are heavy enough to show it.");
+         "own rest frame on top of the central mass's exact gravity. Most bodies are far too light to matter; "
+         "the binary star, planet-with-moon and small black hole presets are heavy enough to show it.");
     ImGui::Checkbox("Paths in view", &s.showPaths);
     help("Draws each body's trail, and its predicted future (dashed), into the scene. They are ray "
          "traced like everything else, so a path behind the hole appears bent around it.");
@@ -531,7 +857,8 @@ void objectsSection(UiContext& ctx) {
         ImGui::SameLine();
         ImGui::Checkbox("Predicted", &s.showPredictions);
         if (s.showPredictions) {
-            ImGui::SliderFloat("Predict ahead", &s.predictionTime, 50.0f, 3000.0f, "%.0f M", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Predict ahead", &s.predictionTime, 50.0f, 3000.0f, "%.0f x", ImGuiSliderFlags_Logarithmic);
+            help("How far ahead, in units of the scene's dynamical time (M for a black hole).");
         }
         ImGui::SliderFloat("Line width", &s.pathWidth, 0.5f, 4.0f, "%.1f px");
     }
@@ -565,7 +892,8 @@ void objectsSection(UiContext& ctx) {
             help("How readily gas parcels in the same place collide: 0 lets crossing streams pass through each "
                  "other.");
             ImGui::SliderFloat("Cooling time", &s.gasCoolingTime, 5.0f, 1000.0f, "%.0f M", ImGuiSliderFlags_Logarithmic);
-            help("How long gas at 10,000 K takes to radiate its heat away; hotter gas cools faster (~T^-3).");
+            help("How long gas at 10,000 K takes to radiate its heat away; hotter gas cools faster (~T^-3). In units "
+                 "of the scene's dynamical time around a big object.");
             ImGui::SliderFloat("Coolest", &s.gasFloorTemperature, 1000.0f, 15000.0f, "%.0f K", ImGuiSliderFlags_Logarithmic);
             help("The light around the hole keeps the gas from cooling below this.");
         }
@@ -596,15 +924,15 @@ void objectsSection(UiContext& ctx) {
                 ImGui::SetItemTooltip("%s, mass %.2g M%s", kindName(b.kind), b.mass,
                                       b.inside ? " (inside the horizon)" : "");
                 ImGui::TableNextColumn();
-                ImGui::Text("%.2f", b.state.r);
+                ImGui::Text("%.4g", b.state.r);
                 ImGui::TableNextColumn();
-                ImGui::Text("%.4f", b.constants.E);
+                ImGui::Text("%.6f", b.constants.E);
                 ImGui::SetItemTooltip("Energy per unit rest mass, conserved. Below 1 means bound.");
                 ImGui::TableNextColumn();
-                ImGui::Text("%.3f", b.constants.L);
+                ImGui::Text("%.4g", b.constants.L);
                 ImGui::SetItemTooltip("Angular momentum about the spin axis, conserved.");
                 ImGui::TableNextColumn();
-                ImGui::Text("%.3f", b.constants.Q);
+                ImGui::Text("%.4g", b.constants.Q);
                 ImGui::SetItemTooltip("Carter constant, conserved. Zero for equatorial orbits.");
                 ImGui::TableNextColumn();
                 if (ImGui::SmallButton("ride")) ctx.rideRequested = b.slot;
@@ -677,6 +1005,10 @@ void orbitMap(UiContext& ctx) {
     UiState& ui = ctx.state;
     const Settings& s = ctx.settings;
     const double a = s.spin;
+    // The map is drawn in scene units: around a big star everything is divided by S.
+    const double S = ctx.scale;
+    const float inv = static_cast<float>(1.0 / S);
+    const double surface = surfaceOf(s);
 
     ImGui::SetNextWindowSize(ImVec2(360, 400), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 380, 20), ImGuiCond_FirstUseEver);
@@ -708,9 +1040,9 @@ void orbitMap(UiContext& ctx) {
     const ImVec2 center(origin.x + size.x * 0.5f, origin.y + size.y * 0.5f);
     const float scale = 0.5f * std::min(size.x, size.y) / ui.mapExtent;
     const bool side = ui.mapView == 1;
-    // Project a Cartesian point (z = spin axis) onto the map.
+    // Project a Cartesian point in M (z = spin axis) onto the map.
     auto project = [&](float x, float y, float z) {
-        float u = x, v = side ? z : y;
+        float u = x * inv, v = (side ? z : y) * inv;
         return ImVec2(center.x + u * scale, center.y - v * scale);
     };
     auto projectPoint = [&](const trajectory::Point& p) {
@@ -728,12 +1060,12 @@ void orbitMap(UiContext& ctx) {
     // Aiming a launch: press on the top view to set the start, drag to set the velocity.
     if (ui.plannerOpen && !side) {
         const ImVec2 mouse = ImGui::GetIO().MousePos;
-        const float mx = (mouse.x - center.x) / scale, my = -(mouse.y - center.y) / scale;
+        const float mx = (mouse.x - center.x) / scale, my = -(mouse.y - center.y) / scale;  // scene units
         if (ImGui::IsItemActivated()) {
-            auto [r, theta, phi] = kerr::fromCartesian(a, mx, my, 0.0);
-            if (r > kerr::horizonRadius(a) + 0.3) {
+            auto [r, theta, phi] = kerr::fromCartesian(a, mx * S, my * S, 0.0);
+            if (r > central::boundaryRadius(a, surface) + 0.3 * S) {
                 ui.mapAiming = true;
-                ui.launchR = static_cast<float>(r);
+                ui.launchR = static_cast<float>(r / S);
                 ui.launchPolarDeg = 90.0f;
                 ui.launchAzimuthDeg = static_cast<float>(std::fmod(phi / kDeg + 360.0, 360.0));
                 ui.launchTiltDeg = 0.0f;
@@ -742,8 +1074,9 @@ void orbitMap(UiContext& ctx) {
         if (ui.mapAiming && ImGui::IsItemActive()) {
             const double phi = ui.launchAzimuthDeg * kDeg;
             const double sx = ui.launchR * std::cos(phi), sy = ui.launchR * std::sin(phi);
-            // 0.03 c of speed per M of drag.
-            double vx = (mx - sx) * 0.03, vy = (my - sy) * 0.03;
+            // 0.03 c of speed per scene unit of drag (scaled like orbital speeds).
+            const double perUnit = 0.03 / std::sqrt(S);
+            double vx = (mx - sx) * perUnit, vy = (my - sy) * perUnit;
             double speed = std::hypot(vx, vy);
             if (speed > 0.95) {
                 vx *= 0.95 / speed;
@@ -751,7 +1084,7 @@ void orbitMap(UiContext& ctx) {
             }
             const double vr = vx * std::cos(phi) + vy * std::sin(phi);
             const double vphi = -vx * std::sin(phi) + vy * std::cos(phi);
-            const double r = ui.launchR;
+            const double r = ui.launchR * S;
             const double vc = r > kerr::photonOrbitRadius(a, true) * 1.05 ? kerr::circularZamoSpeed(a, r, true)
                                                                           : 1.0 / std::sqrt(std::max(r - 2.0, 0.5));
             ui.launchRadial = static_cast<float>(vr);
@@ -763,16 +1096,18 @@ void orbitMap(UiContext& ctx) {
 
     // Accretion disk
     if (s.diskEnabled) {
-        double inner = s.diskInnerAtIsco ? kerr::iscoRadius(a, s.diskPrograde) : s.diskInner;
+        double inner = s.diskInnerAtIsco ? kerr::iscoRadius(a, s.diskPrograde) : s.diskInner * S;
+        if (surface > 0.0) inner = std::max(inner, surface);
+        const double outer = std::max<double>(s.diskOuter * S, inner * 1.2);
         ImU32 diskCol = IM_COL32(255, 150, 60, 50);
         if (side) {
             float x0 = static_cast<float>(std::sqrt(inner * inner + a * a));
-            float x1 = static_cast<float>(std::sqrt(s.diskOuter * s.diskOuter + a * a));
+            float x1 = static_cast<float>(std::sqrt(outer * outer + a * a));
             dl->AddLine(project(x0, 0, 0), project(x1, 0, 0), IM_COL32(255, 150, 60, 140), 3.0f);
             dl->AddLine(project(-x0, 0, 0), project(-x1, 0, 0), IM_COL32(255, 150, 60, 140), 3.0f);
         } else {
-            float rIn = static_cast<float>(std::sqrt(inner * inner + a * a)) * scale;
-            float rOut = static_cast<float>(std::sqrt(s.diskOuter * s.diskOuter + a * a)) * scale;
+            float rIn = static_cast<float>(std::sqrt(inner * inner + a * a)) * inv * scale;
+            float rOut = static_cast<float>(std::sqrt(outer * outer + a * a)) * inv * scale;
             dl->AddCircle(center, 0.5f * (rIn + rOut), diskCol, 128, rOut - rIn);
         }
     }
@@ -796,23 +1131,34 @@ void orbitMap(UiContext& ctx) {
         if (filled) dl->AddConvexPolyFilled(pts.data(), n, col);
         else dl->AddPolyline(pts.data(), n, col, ImDrawFlags_Closed, thickness);
     };
-    const double rh = kerr::horizonRadius(a);
-    shell([&](double th) { return kerr::ergosphereRadius(a, th); }, IM_COL32(120, 90, 200, 200), 1.5f, false);
-    shell([&](double) { return rh; }, IM_COL32(0, 0, 0, 255), 0.0f, true);
-    shell([&](double) { return rh; }, IM_COL32(200, 200, 220, 255), 1.5f, false);
+    const double rh = central::boundaryRadius(a, surface);
+    if (surface <= 0.0) {
+        shell([&](double th) { return kerr::ergosphereRadius(a, th); }, IM_COL32(120, 90, 200, 200), 1.5f, false);
+        shell([&](double) { return rh; }, IM_COL32(0, 0, 0, 255), 0.0f, true);
+        shell([&](double) { return rh; }, IM_COL32(200, 200, 220, 255), 1.5f, false);
+    } else {
+        // The star or planet itself, in its own color.
+        const glm::vec3 hue = s.central.kind == central::Kind::RockyPlanet ? glm::vec3(0.3f, 0.55f, 0.9f)
+                            : s.central.kind == central::Kind::GasGiant    ? glm::vec3(0.85f, 0.7f, 0.5f)
+                                                                            : blackbody::hue(central::displayTemperature(
+                                                                                  s.central.surfaceTemperature));
+        shell([&](double) { return rh; }, toColor(hue, 0.55f), 0.0f, true);
+        shell([&](double) { return rh; }, toColor(hue, 1.0f), 1.5f, false);
+    }
     if (!side) {
-        float isco = static_cast<float>(std::sqrt(std::pow(kerr::iscoRadius(a, true), 2) + a * a)) * scale;
-        float iscoR = static_cast<float>(std::sqrt(std::pow(kerr::iscoRadius(a, false), 2) + a * a)) * scale;
-        float photon = static_cast<float>(std::sqrt(std::pow(kerr::photonOrbitRadius(a, true), 2) + a * a)) * scale;
-        dl->AddCircle(center, isco, IM_COL32(80, 220, 120, 160), 96, 1.0f);
-        dl->AddCircle(center, iscoR, IM_COL32(220, 140, 80, 110), 96, 1.0f);
-        dl->AddCircle(center, photon, IM_COL32(255, 255, 140, 120), 96, 1.0f);
-        // Rotation direction of the hole.
-        float rr = static_cast<float>(rh) * scale + 10.0f;
+        auto circle = [&](double r, ImU32 col) {
+            if (surface > 0.0 && r < surface) return;
+            dl->AddCircle(center, static_cast<float>(std::sqrt(r * r + a * a)) * inv * scale, col, 96, 1.0f);
+        };
+        circle(kerr::iscoRadius(a, true), IM_COL32(80, 220, 120, 160));
+        circle(kerr::iscoRadius(a, false), IM_COL32(220, 140, 80, 110));
+        circle(kerr::photonOrbitRadius(a, true), IM_COL32(255, 255, 140, 120));
+        // Rotation direction.
+        float rr = static_cast<float>(rh) * inv * scale + 10.0f;
         dl->PathArcTo(center, rr, -0.5f, 0.9f, 16);
         dl->PathStroke(IM_COL32(200, 200, 220, 120), 0, 1.5f);
     } else {
-        float tip = static_cast<float>(rh) * scale + 16.0f;
+        float tip = static_cast<float>(rh) * inv * scale + 16.0f;
         dl->AddLine(ImVec2(center.x, center.y - tip + 12.0f), ImVec2(center.x, center.y - tip - 6.0f),
                     IM_COL32(200, 200, 220, 160), 1.5f);
         dl->AddTriangleFilled(ImVec2(center.x - 4, center.y - tip - 4), ImVec2(center.x + 4, center.y - tip - 4),
@@ -840,7 +1186,7 @@ void orbitMap(UiContext& ctx) {
         }
         auto p = kerr::toCartesian(a, b.state.r, b.state.theta, b.state.phi);
         ImVec2 q = project(static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]));
-        dl->AddCircleFilled(q, std::max(3.0f, b.radius * scale), toColor(hue));
+        dl->AddCircleFilled(q, std::max(3.0f, b.radius * inv * scale), toColor(hue));
         float d2 = (q.x - mouse.x) * (q.x - mouse.x) + (q.y - mouse.y) * (q.y - mouse.y);
         if (hovered && d2 < nearestDist2) {
             nearestDist2 = d2;
@@ -876,7 +1222,7 @@ void orbitMap(UiContext& ctx) {
 
     if (nearest) {
         char label[96];
-        std::snprintf(label, sizeof(label), "%s  r = %.2f M", nearest->name.c_str(), nearest->state.r);
+        std::snprintf(label, sizeof(label), "%s  r = %.4g M", nearest->name.c_str(), nearest->state.r);
         dl->AddText(ImVec2(nearestPos.x + 8, nearestPos.y - 8), IM_COL32(230, 230, 240, 255), label);
     }
 
@@ -888,9 +1234,11 @@ void orbitMap(UiContext& ctx) {
     dl->AddText(ImVec2(c.x + 7, c.y - 7), IM_COL32(120, 200, 255, 255), "camera");
 
     dl->PopClipRect();
-    const char* caption = side ? "side view: spin axis up"
-                        : ui.plannerOpen ? "top view: drag from a point to throw a body"
-                                         : "top view: spin axis toward you";
+    char caption[128];
+    std::snprintf(caption, sizeof(caption), "%s%s",
+                  side ? "side view: spin axis up" : ui.plannerOpen ? "top view: drag from a point to throw a body"
+                                                                    : "top view: spin axis toward you",
+                  S > 1.0 ? printf1("   (1 square unit = %.3g M)", S).c_str() : "");
     dl->AddText(ImVec2(origin.x + 6, maxCorner.y - ImGui::GetFontSize() - 4), IM_COL32(150, 150, 160, 255), caption);
     ImGui::End();
 }
@@ -920,12 +1268,19 @@ void inspectorWindow(UiContext& ctx) {
         ImGui::TextWrapped("The light reaching this pixel came from %s.", trajectory::rayEndName(r.end));
         switch (r.end) {
             case trajectory::RayEnd::Disk:
-            case trajectory::RayEnd::Body: {
+            case trajectory::RayEnd::Body:
+            case trajectory::RayEnd::Surface: {
                 const char* what = r.end == trajectory::RayEnd::Disk ? "disk gas" : ui.inspectBody.c_str();
-                ImGui::TextWrapped("Emitted by %s at r = %.2f M. Frequency shift g = %.3f: it arrives %s (%s).",
+                ImGui::TextWrapped("Emitted by %s at r = %.4g M. Frequency shift g = %.4g: it arrives %s (%s).",
                                    what, r.rEnd, r.g, r.g >= 1.0 ? "bluer and brighter" : "redder and dimmer",
                                    r.g >= 1.0 ? "moving toward you outweighs gravity"
                                               : "gravity and/or receding motion");
+                if (r.end == trajectory::RayEnd::Surface) {
+                    ImGui::TextWrapped("It left %.1f degrees from the vertical, measured on the surface. Light bending "
+                                       "lets light that leaves sideways (even backward-looking parts of the star) reach "
+                                       "you.",
+                                       std::acos(std::clamp(r.emissionCos, -1.0, 1.0)) * 180.0 / kerr::kPi);
+                }
                 break;
             }
             case trajectory::RayEnd::Horizon:
@@ -937,6 +1292,10 @@ void inspectorWindow(UiContext& ctx) {
                                        "This pixel is part of the shadow.");
                 }
                 break;
+            case trajectory::RayEnd::Lens:
+                ImGui::TextWrapped("Traced backwards it fell into %s: this pixel is part of its shadow.",
+                                   ui.inspectBody.c_str());
+                break;
             case trajectory::RayEnd::Sky: {
                 double lon = std::atan2(r.skyDirection[1], r.skyDirection[0]) / kDeg;
                 double lat = std::asin(std::clamp(r.skyDirection[2], -1.0, 1.0)) / kDeg;
@@ -947,11 +1306,12 @@ void inspectorWindow(UiContext& ctx) {
                 break;
         }
         ImGui::Separator();
-        ImGui::Text("Went around the hole %.2f times", r.turns);
-        ImGui::Text("Closest approach  r = %.3f M", r.rMin);
-        ImGui::Text("Travel time       %.1f M", r.delay);
-        ImGui::Text("Impact parameter  b = %.3f M", r.b);
-        ImGui::Text("Carter constant   q = %.3f M^2", r.q);
+        ImGui::Text("Went around the center %.2f times", r.turns);
+        if (r.lensings > 0) ImGui::Text("Bent by %d small black hole%s", r.lensings, r.lensings > 1 ? "s" : "");
+        ImGui::Text("Closest approach  r = %.4g M", r.rMin);
+        ImGui::Text("Travel time       %s", timeText(ctx.settings, r.delay).c_str());
+        ImGui::Text("Impact parameter  b = %.4g M", r.b);
+        ImGui::Text("Carter constant   q = %.4g M^2", r.q);
         ImGui::TextDisabled("Its path is drawn in yellow on the orbit map.");
         ImGui::TextDisabled("Ctrl+click or middle-click another pixel to inspect it.");
     }
@@ -963,7 +1323,7 @@ void helpWindow(UiState& ui) {
     ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Controls", &ui.showHelp)) {
         ImGui::TextUnformatted(
-            "Left drag      orbit the camera around the hole\n"
+            "Left drag      orbit the camera around the center\n"
             "Right drag     look around\n"
             "Scroll         move closer / farther\n"
             "W / S          move closer / farther\n"
@@ -980,10 +1340,11 @@ void helpWindow(UiState& ui) {
             "H              this window");
         ImGui::Separator();
         ImGui::TextWrapped(
-            "Every pixel follows a light ray backwards through the curved spacetime of a rotating "
-            "(Kerr) black hole. The dark region is the shadow: rays that end up in the horizon. "
-            "The thin bright ring around it is light that circled the hole before escaping. The "
-            "disk on the far side of the hole appears above and below it, bent over the top by "
+            "Every pixel follows a light ray backwards through curved spacetime: around a rotating (Kerr) "
+            "black hole, or outside a neutron star, white dwarf, star or planet, which has the same "
+            "spacetime outside its surface. For a black hole, the dark region is the shadow: rays that end "
+            "up in the horizon. The thin bright ring around it is light that circled the hole before "
+            "escaping. The disk on the far side appears above and below it, bent over the top by "
             "gravitational lensing.");
     }
     ImGui::End();
@@ -991,10 +1352,10 @@ void helpWindow(UiState& ui) {
 
 }  // namespace
 
-bool plannedLaunch(const UiState& ui, double spin, kerr::Constants& c, kerr::State& s) {
+bool plannedLaunch(const UiState& ui, double spin, double scale, double surface, kerr::Constants& c, kerr::State& s) {
     double v[3];
-    if (!plannedVelocity(ui, spin, v)) return false;
-    kerr::launchFromZamo(spin, ui.launchR, ui.launchPolarDeg * kDeg, ui.launchAzimuthDeg * kDeg, v, 1.0, c, s);
+    if (!plannedVelocity(ui, spin, scale, surface, v)) return false;
+    kerr::launchFromZamo(spin, ui.launchR * scale, ui.launchPolarDeg * kDeg, ui.launchAzimuthDeg * kDeg, v, 1.0, c, s);
     return true;
 }
 
@@ -1014,7 +1375,7 @@ void drawUi(UiContext& ctx) {
     if (ImGui::Begin("Black Hole Simulator")) {
         ImGui::PushItemWidth(-9.5f * em);  // leave room for labels
         statsSection(ctx);
-        if (ImGui::CollapsingHeader("Black hole", ImGuiTreeNodeFlags_DefaultOpen)) blackHoleSection(ctx);
+        if (ImGui::CollapsingHeader("Central object", ImGuiTreeNodeFlags_DefaultOpen)) centralSection(ctx);
         if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) cameraSection(ctx);
         if (ImGui::CollapsingHeader("Accretion disk and jets", ImGuiTreeNodeFlags_DefaultOpen)) diskSection(ctx);
         ui.plannerOpen = false;

@@ -16,7 +16,10 @@ enum class BodyKind {
     RockyPlanet,
     GasGiant,
     Pulsar,
-    TidalStar,  // a star whose shape responds to tides, and is torn apart by them
+    TidalStar,      // a star whose shape responds to tides, and is torn apart by them
+    WhiteDwarf,
+    NeutronStar,
+    MiniBlackHole,  // lenses light passing it (thin-lens approximation) and swallows what comes too close
 };
 const char* kindName(BodyKind kind);
 
@@ -44,7 +47,7 @@ struct Body {
     std::deque<glm::vec3> trail;  // recent Cartesian positions, for the orbit map
 };
 
-// Past positions, 4-velocities and shapes of every body, sampled every kStep of
+// Past positions, 4-velocities and shapes of every body, sampled every `step` of
 // coordinate time, so the ray tracer can draw each body where (and as) it was when
 // the light now arriving at the camera left it. A ring buffer of kColumns samples
 // per body, mirrored in a GPU texture with kRows rows per slot:
@@ -55,16 +58,18 @@ struct History {
     static constexpr int kSlots = 32;
     static constexpr int kRows = 4;
     static constexpr int kColumns = 4096;
-    static constexpr double kStep = 0.5;  // 2048 M of history
+    // 0.5 M (2048 M of history), times the scene scale: big scenes need longer memories.
+    double step = 0.5;
 
     struct Sample {
         glm::vec4 position, u, shapeA, shapeB;
     };
 
     std::vector<glm::vec4> image = std::vector<glm::vec4>(static_cast<size_t>(kColumns) * kRows * kSlots);
-    long long newest = 0;       // index of the newest sample; its time is newest * kStep
+    long long newest = 0;       // index of the newest sample; its time is newest * step
     int length[kSlots] = {};    // valid samples per slot
     std::vector<int> dirtyRows; // slots whose whole row must be re-uploaded
+    int generation = 0;         // bumped when the step changes: everything must be re-uploaded
 
     void record(int slot, long long k, const Sample& sample);
 };
@@ -108,6 +113,8 @@ enum class Preset {
     PlanetWithMoon,
     GasCloud,
     DebrisRing,
+    MiniBlackHole,
+    WhiteDwarfCompanion,
 };
 
 struct PresetInfo {
@@ -118,10 +125,26 @@ struct PresetInfo {
 };
 const std::vector<PresetInfo>& presetList();
 
+// A body that struck the surface of the central star or planet.
+struct Impact {
+    double theta, phi;  // where (Kerr-Schild angles)
+    double time;        // when (coordinate time)
+    double energy;      // released per unit rest mass, (gamma - 1) in the surface's frame
+    double mass;        // in units of M
+};
+
 class BodySystem {
 public:
     double time = 0.0;  // coordinate time t, in M
     std::vector<Body> bodies;
+    // The central object, as the bodies need it (kept up to date by the app):
+    double surface = 0.0;       // surface radius in M; 0 for a black hole (bodies stop at the horizon)
+    double surfaceOmega = 0.0;  // its angular velocity
+    double scale = 1.0;         // scene scale (see Settings): sizes in presets are multiples of it
+    double massSolar = 0.0;     // physical mass of the hole when physical units are on (true-scale presets)
+    std::vector<Impact> impacts;  // recent impacts on the surface, oldest first (the app trims them)
+    double accreted = 0.0;        // mass that has hit the surface so far, in M
+    int impactCount = 0;          // bodies that have hit the surface so far
     // Bodies that are gone (torn apart, swallowed, escaped) but whose last light may
     // still be on its way: drawn from their history until it has all arrived.
     struct Departed {
@@ -140,6 +163,9 @@ public:
     std::vector<DebrisBatch> pendingDebris;
 
     void clear();
+    // Sets the scene scale. If it changed a lot, the history's time step follows it and
+    // every body's past is laid down again.
+    void setScale(double newScale, double spin);
     // Advances everything by dt. With gravity on, bodies also pull on each other.
     void update(double spin, double dt, bool gravity);
     // Keeps every body's position and locally measured velocity when the spin changes.
@@ -157,11 +183,17 @@ public:
     void remove(size_t index);
     void logEvent(std::string text);
 
-    // cameraR sets how far back in time the light-delay culling range must reach.
+    // cameraR sets how far back in time the light-delay culling range must reach. Lengths
+    // and times go out in render units (scale M; see Renderer).
     void fillGpu(double spin, bool lightDelay, double cameraR, GpuBodies& out) const;
+
+    // Where bodies stop: the horizon, or the surface.
+    double boundary(double spin) const;
 
 private:
     bool push(Body body, double spin);
+    // Small black holes swallow bodies that come within their horizon (plus the body's size).
+    void swallowByMiniHoles(double spin);
     void backfill(Body& body, double spin);
     void recordTrail(Body& body, double spin);
     // Moves every body along its geodesic to coordinate time `target`.

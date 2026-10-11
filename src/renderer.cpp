@@ -30,7 +30,7 @@ struct GpuPathSegment {
 };
 static_assert(sizeof(GpuPathSegment) == 64, "std430 layout");
 
-// The path cell containing a Cartesian point, or -1 outside the grid.
+// The path cell containing a Cartesian point (render units), or -1 outside the grid.
 int pathCell(const glm::vec3& p, double spin) {
     auto [r, theta, phi] = kerr::fromCartesian(spin, p.x, p.y, p.z);
     const double lr = (std::log(r) - std::log(ParticleSystem::kGridRMin)) /
@@ -45,8 +45,21 @@ int pathCell(const glm::vec3& p, double spin) {
 }
 }  // namespace
 
+ShaderProgram& Renderer::traceProgram(bool centralBody, bool lenses) {
+    const int index = (centralBody ? 1 : 0) + (lenses ? 2 : 0);
+    ShaderProgram& program = m_trace[index];
+    if (!program.valid() && program.error().empty()) {
+        std::string defines;
+        if (centralBody) defines += "#define CENTRAL_BODY 1\n";
+        if (lenses) defines += "#define LENSES 1\n";
+        program.build(m_shaderDir, "fullscreen.vert", "trace.frag", defines);
+    }
+    return program;
+}
+
 bool Renderer::init(const std::filesystem::path& shaderDir, std::string& error) {
-    bool ok = m_trace.build(shaderDir, "fullscreen.vert", "trace.frag");
+    m_shaderDir = shaderDir;
+    bool ok = traceProgram(false, false).valid();
     ok &= m_bloomDown.build(shaderDir, "fullscreen.vert", "bloom_down.frag");
     ok &= m_bloomUp.build(shaderDir, "fullscreen.vert", "bloom_up.frag");
     ok &= m_tonemap.build(shaderDir, "fullscreen.vert", "tonemap.frag");
@@ -102,26 +115,28 @@ bool Renderer::init(const std::filesystem::path& shaderDir, std::string& error) 
     glTextureStorage3D(m_pathOccupancy, 1, GL_R8UI, kPathR, kPathTheta, kPathPhi);
     glTextureParameteri(m_pathOccupancy, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTextureParameteri(m_pathOccupancy, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    setPaths({}, 0.0);
+    setPaths({}, 0.0, 1.0);
     return ok;
 }
 
-void Renderer::setPaths(const std::vector<PathLine>& lines, double spin) {
+void Renderer::setPaths(const std::vector<PathLine>& lines, double spin, double scale) {
     std::vector<GpuPathSegment> segments;
     std::vector<std::vector<uint32_t>> cells(kPathCells);
+    const float inv = static_cast<float>(1.0 / scale);
+    const double spinRender = spin / scale;
     for (const PathLine& line : lines) {
         const size_t n = line.points.size();
         if (n < 2) continue;
         float along = 0.0f;
-        int prevCell = pathCell(line.points[0], spin);
+        int prevCell = pathCell(line.points[0] * inv, spinRender);
         for (size_t i = 1; i < n; ++i) {
-            const glm::vec3& a = line.points[i - 1];
-            const glm::vec3& b = line.points[i];
+            const glm::vec3 a = line.points[i - 1] * inv;
+            const glm::vec3 b = line.points[i] * inv;
             const float len = glm::length(b - a);
             const float fa = static_cast<float>(i - 1) / static_cast<float>(n - 1);
             const float fb = static_cast<float>(i) / static_cast<float>(n - 1);
-            const int cell = pathCell(b, spin);
-            const int mid = pathCell(0.5f * (a + b), spin);
+            const int cell = pathCell(b, spinRender);
+            const int mid = pathCell(0.5f * (a + b), spinRender);
             const uint32_t index = static_cast<uint32_t>(segments.size());
             segments.push_back({glm::vec4(a, glm::mix(line.startOpacity, line.endOpacity, fa)),
                                 glm::vec4(b, glm::mix(line.startOpacity, line.endOpacity, fb)),
@@ -177,6 +192,16 @@ void Renderer::uploadHistory(History& history) {
     constexpr int N = History::kColumns;
     constexpr int rows = History::kRows * History::kSlots;
     glPixelStorei(GL_UNPACK_ROW_LENGTH, N);
+
+    // A new time step (the scene scale changed): everything was laid down again.
+    if (history.generation != m_historyGeneration) {
+        glTextureSubImage2D(m_historyTexture, 0, 0, 0, N, rows, GL_RGBA, GL_FLOAT, history.image.data());
+        history.dirtyRows.clear();
+        m_historyUploaded = history.newest;
+        m_historyGeneration = history.generation;
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        return;
+    }
 
     // Whole rows for bodies whose past was just filled in.
     for (int slot : history.dirtyRows) {
@@ -235,82 +260,135 @@ void Renderer::render(const FrameInputs& in) {
     glBeginQuery(GL_TIME_ELAPSED, m_queries[m_queryFrame % kQueries]);
 
     // --- 1. Ray trace ---------------------------------------------------------
+    // Render units: lengths and times over the scene scale, mass 1 / scale.
     const double spin = in.spin;
+    const double unit = in.scale;  // the render unit, in M
+    const double inv = 1.0 / unit;
     const bool prograde = s.diskPrograde;
     const double rh = kerr::horizonRadius(spin);
-    const double diskInner = s.diskInnerAtIsco ? kerr::iscoRadius(spin, prograde)
-                                               : std::max<double>(s.diskInner, rh + 0.05);
+    const CentralView fallback;
+    const CentralView& cv = in.central ? *in.central : fallback;
+    double diskInner = s.diskInnerAtIsco ? kerr::iscoRadius(spin, prograde) : std::max<double>(s.diskInner, rh + 0.05);
+    double diskOuter = std::max(s.diskOuter, static_cast<float>(diskInner) + 0.5f);
+    if (in.central) {
+        diskInner = cv.diskInner;
+        diskOuter = std::max(cv.diskOuter, cv.diskInner * 1.05);
+    }
     const float tanHalfFov = std::tan(0.5f * glm::radians(cam.fovDeg));
     const float pixelAngle = 2.0f * tanHalfFov / static_cast<float>(th);
 
+    bool lenses = false;
+    for (int i = 0; i < in.bodies->info.x; ++i) lenses = lenses || in.bodies->bodies[i].params.z > 6.5f;
+    ShaderProgram& trace = traceProgram(cv.surface > 0.0, lenses);
     glBindFramebuffer(GL_FRAMEBUFFER, m_hdr.fbo);
     glViewport(0, 0, tw, th);
-    m_trace.use();
-    m_trace.set("uResolution", glm::vec2(tw, th));
-    m_trace.set("uSpin", static_cast<float>(spin));
-    m_trace.set("uCamPos", glm::vec3(static_cast<float>(cam.r), static_cast<float>(cam.theta),
+    trace.use();
+    trace.set("uResolution", glm::vec2(tw, th));
+    trace.set("uSpin", static_cast<float>(spin * inv));
+    trace.set("uMass", static_cast<float>(inv));
+    trace.set("uCamPos", glm::vec3(static_cast<float>(cam.r * inv), static_cast<float>(cam.theta),
                                      static_cast<float>(cam.phi)));
-    m_trace.set("uCamBasis", cam.basis());
+    trace.set("uCamBasis", cam.basis());
     {
         // Each frame vector as (u_t, u_phi, u_theta, u^r); see uCamPhoton in trace.frag.
+        // Computed in M (double precision), then u_phi and u_theta, which carry a length,
+        // go to render units; u_t and u^r are dimensionless.
         const kerr::Frame f = cam.frame(spin);
         const kerr::MetricTensor g = kerr::metricTensor(spin, cam.r, cam.theta);
         glm::mat4 m(0.0f);
         for (int j = 0; j < 4; ++j) {
             const kerr::Vec4 low = kerr::lower(g, f.e[j]);
-            m[j] = glm::vec4(static_cast<float>(low[0]), static_cast<float>(low[3]), static_cast<float>(low[2]),
-                             static_cast<float>(f.e[j][1]));
+            m[j] = glm::vec4(static_cast<float>(low[0]), static_cast<float>(low[3] * inv),
+                             static_cast<float>(low[2] * inv), static_cast<float>(f.e[j][1]));
         }
-        m_trace.set("uCamPhoton", m);
+        trace.set("uCamPhoton", m);
     }
-    m_trace.set("uTanHalfFov", tanHalfFov);
-    m_trace.set("uPixelAngle", pixelAngle);
-    m_trace.set("uMaxSteps", s.maxSteps);
-    m_trace.set("uStepSize", s.stepSize);
-    m_trace.set("uEscapeRadius", std::max(s.escapeRadius, static_cast<float>(cam.r) * 1.5f));
+    trace.set("uTanHalfFov", tanHalfFov);
+    trace.set("uPixelAngle", pixelAngle);
+    trace.set("uMaxSteps", s.maxSteps);
+    trace.set("uStepSize", s.stepSize);
+    trace.set("uEscapeRadius", std::max(s.escapeRadius, static_cast<float>(cam.r * inv) * 1.5f));
 
-    m_trace.set("uDiskEnabled", s.diskEnabled ? 1 : 0);
-    m_trace.set("uDiskInner", static_cast<float>(diskInner));
-    m_trace.set("uDiskOuter", std::max(s.diskOuter, static_cast<float>(diskInner) + 0.5f));
-    m_trace.set("uDiskTemp", s.diskTemperature);
-    m_trace.set("uDiskBrightness", s.diskBrightness);
-    m_trace.set("uDiskOpacity", s.diskOpacity);
-    m_trace.set("uDiskTurbulence", s.diskTurbulence);
-    m_trace.set("uDiskDirection", prograde ? 1.0f : -1.0f);
-    m_trace.set("uFlowTime", static_cast<float>(std::fmod(in.time, kFlowPeriod)));
-    m_trace.set("uFlowPeriod", static_cast<float>(kFlowPeriod));
-    m_trace.set("uRelativity", s.relativity);
+    trace.set("uDiskEnabled", s.diskEnabled ? 1 : 0);
+    trace.set("uDiskInner", static_cast<float>(diskInner * inv));
+    trace.set("uDiskOuter", static_cast<float>(diskOuter * inv));
+    trace.set("uDiskTemp", s.diskTemperature);
+    trace.set("uDiskBrightness", s.diskBrightness);
+    trace.set("uDiskOpacity", s.diskOpacity);
+    trace.set("uDiskTurbulence", s.diskTurbulence);
+    trace.set("uDiskDirection", prograde ? 1.0f : -1.0f);
+    // The disk's pattern is renewed every few dynamical times: kFlowPeriod M around a
+    // hole, sqrt(scale) times that in render units around a bigger object.
+    const double flowPeriod = kFlowPeriod * std::sqrt(unit);
+    trace.set("uFlowTime", static_cast<float>(std::fmod(in.time * inv, flowPeriod)));
+    trace.set("uFlowPeriod", static_cast<float>(flowPeriod));
+    trace.set("uRelativity", s.relativity);
 
     const bool debris = in.particles && in.particles->active();
-    m_trace.set("uDebrisEnabled", debris ? 1 : 0);
-    m_trace.set("uGridLogR", glm::vec2(std::log(ParticleSystem::kGridRMin), std::log(ParticleSystem::kGridRMax)));
-    m_trace.set("uDebrisBrightness", s.debrisBrightness);
-    m_trace.set("uDebrisOpacity", s.debrisOpacity);
+    trace.set("uDebrisEnabled", debris ? 1 : 0);
+    trace.set("uGridLogR", glm::vec2(std::log(ParticleSystem::kGridRMin), std::log(ParticleSystem::kGridRMax)));
+    trace.set("uDebrisBrightness", s.debrisBrightness);
+    trace.set("uDebrisOpacity", s.debrisOpacity);
 
-    m_trace.set("uPathsEnabled", m_pathSegmentCount > 0 ? 1 : 0);
-    m_trace.set("uPathGridDims", glm::ivec3(kPathR, kPathTheta, kPathPhi));
-    m_trace.set("uPathWidth", s.pathWidth);
-    m_trace.set("uSkipBody", in.skipBody);
-    m_trace.set("uJetsEnabled", s.jetsEnabled ? 1 : 0);
-    m_trace.set("uJetPower", s.jetPower);
-    m_trace.set("uJetSpeed", std::clamp(s.jetSpeed, 0.0f, 0.995f));
-    m_trace.set("uJetOpening", std::tan(glm::radians(s.jetOpeningDeg)));
-    m_trace.set("uTime", static_cast<float>(std::fmod(in.time, 10000.0)));
+    trace.set("uPathsEnabled", m_pathSegmentCount > 0 ? 1 : 0);
+    trace.set("uPathGridDims", glm::ivec3(kPathR, kPathTheta, kPathPhi));
+    trace.set("uPathWidth", s.pathWidth);
+    trace.set("uSkipBody", in.skipBody);
+    trace.set("uHistoryScale", static_cast<float>(inv));
+    trace.set("uJetsEnabled", s.jetsEnabled ? 1 : 0);
+    trace.set("uJetPower", s.jetPower);
+    trace.set("uJetSpeed", std::clamp(s.jetSpeed, 0.0f, 0.995f));
+    trace.set("uJetOpening", std::tan(glm::radians(s.jetOpeningDeg)));
+    trace.set("uTime", static_cast<float>(std::fmod(in.time * inv, 10000.0)));
+
+    // The central object.
+    trace.set("uCentralKind", cv.kind);
+    trace.set("uSurfaceR", static_cast<float>(cv.surface * inv));
+    trace.set("uSurfaceOmega", static_cast<float>(cv.omega * unit));
+    trace.set("uSurfacePhase", static_cast<float>(std::fmod(cv.phase, 2.0 * kerr::kPi)));
+    trace.set("uSurfaceShift", static_cast<float>(cv.azimuthShift));
+    trace.set("uSurfaceTemp", cv.temperature);
+    trace.set("uHotSpotTemp", cv.hotSpotTemperature);
+    trace.set("uSurfaceBrightness", cv.brightness);
+    trace.set("uSurfaceDetail", cv.detail ? 1 : 0);
+    trace.set("uMagneticAxis", cv.magneticAxis);
+    trace.set("uPulsar", cv.pulsar ? 1 : 0);
+    trace.set("uMagnetar", cv.magnetar ? 1 : 0);
+    trace.set("uCoronaHeight", static_cast<float>(cv.coronaHeight * inv));
+    trace.set("uCoronaColor", cv.coronaColor * static_cast<float>(unit));  // per unit render length
+    trace.set("uFunnelRadius", static_cast<float>(cv.funnelRadius * inv));
+    trace.set("uSunDirection", glm::normalize(cv.sunDirection));
+    {
+        const int count = static_cast<int>(std::min<size_t>(cv.impacts.size(), 8));
+        glm::vec4 impacts[8] = {};
+        float ages[8] = {};
+        for (int k = 0; k < count; ++k) {
+            impacts[k] = cv.impacts[k];
+            ages[k] = static_cast<float>(std::min(cv.impactAges[k] * inv, 1e30));
+        }
+        trace.set("uImpactCount", count);
+        glProgramUniform4fv(trace.id(), trace.location("uImpacts"), 8, &impacts[0].x);
+        glProgramUniform1fv(trace.id(), trace.location("uImpactAges"), 8, ages);
+        trace.set("uImpactFade", static_cast<float>(cv.impactFade * inv));
+        trace.set("uFlash", glm::vec3(static_cast<float>(std::min(cv.flashAge * inv, 1e30)),
+                                        static_cast<float>(cv.flashStrength),
+                                        static_cast<float>(std::max(cv.flashFade * inv, 1e-6))));
+    }
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_pathSegments);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, m_pathCells);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, m_pathIndex);
 
     const int skyMode = (s.skyMode == 2 && !hasSkyImage()) ? 0 : s.skyMode;
-    m_trace.set("uSkyMode", skyMode);
-    m_trace.set("uStarBrightness", s.starBrightness);
-    m_trace.set("uGalaxyBrightness", s.galaxyBrightness);
-    m_trace.set("uSkyImageBrightness", s.skyImageBrightness);
-    m_trace.set("uSkyLod", m_skyWidth > 0
+    trace.set("uSkyMode", skyMode);
+    trace.set("uStarBrightness", s.starBrightness);
+    trace.set("uGalaxyBrightness", s.galaxyBrightness);
+    trace.set("uSkyImageBrightness", s.skyImageBrightness);
+    trace.set("uSkyLod", m_skyWidth > 0
                                ? std::max(0.0f, std::log2(pixelAngle * m_skyWidth / 6.2831853f))
                                : 0.0f);
-    m_trace.set("uBlackbodyRange", glm::vec2(static_cast<float>(blackbody::kLogTMin),
+    trace.set("uBlackbodyRange", glm::vec2(static_cast<float>(blackbody::kLogTMin),
                                              static_cast<float>(blackbody::kLogTMax)));
-    m_trace.set("uDebugView", s.debugView);
+    trace.set("uDebugView", s.debugView);
 
     glNamedBufferSubData(m_bodyUbo, 0, sizeof(GpuBodies), in.bodies);
     glBindBufferBase(GL_UNIFORM_BUFFER, 0, m_bodyUbo);
@@ -321,6 +399,8 @@ void Renderer::render(const FrameInputs& in) {
     glBindTextureUnit(4, debris ? in.particles->velocityTexture() : m_placeholderVolume);
     glBindTextureUnit(5, debris ? in.particles->occupancyTexture() : m_placeholderOccupancy);
     glBindTextureUnit(6, m_pathOccupancy);
+    const GLuint impactMap = in.particles ? in.particles->impactTexture() : 0;
+    glBindTextureUnit(7, impactMap ? impactMap : m_placeholderTexture);
     drawFullscreen();
 
     // --- 2. Bloom: progressive downsample, then tent-filtered upsample --------
@@ -359,7 +439,7 @@ void Renderer::render(const FrameInputs& in) {
     glBindFramebuffer(GL_FRAMEBUFFER, m_ldr.fbo);
     glViewport(0, 0, in.width, in.height);
     m_tonemap.use();
-    m_tonemap.set("uExposure", debugView ? 1.0f : s.exposure);
+    m_tonemap.set("uExposure", debugView ? 1.0f : s.exposure * in.exposureBoost);
     m_tonemap.set("uBloomStrength", bloom ? s.bloomStrength : 0.0f);
     m_tonemap.set("uBloomLevels", static_cast<float>(std::max(m_bloomCount, 1)));
     m_tonemap.set("uTonemapper", debugView ? 2 : s.tonemapper);
@@ -460,7 +540,7 @@ bool Renderer::loadSkyImage(const std::string& path, std::string& error) {
 }
 
 void Renderer::hotReload() {
-    m_trace.reloadIfChanged();
+    for (ShaderProgram& p : m_trace) p.reloadIfChanged();
     m_bloomDown.reloadIfChanged();
     m_bloomUp.reloadIfChanged();
     m_tonemap.reloadIfChanged();
@@ -468,7 +548,10 @@ void Renderer::hotReload() {
 
 std::string Renderer::shaderErrors() const {
     std::string all;
-    for (const ShaderProgram* p : {&m_trace, &m_bloomDown, &m_bloomUp, &m_tonemap}) {
+    for (const ShaderProgram& p : m_trace) {
+        if (!p.error().empty()) all += p.error();
+    }
+    for (const ShaderProgram* p : {&m_bloomDown, &m_bloomUp, &m_tonemap}) {
         if (!p->error().empty()) all += p->error();
     }
     return all;

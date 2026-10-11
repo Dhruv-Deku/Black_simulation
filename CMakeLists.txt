@@ -71,6 +71,7 @@ endif()
 # Kerr physics: no graphics dependencies, shared by the app and the tests.
 add_library(bh_physics STATIC
     src/kerr.cpp src/kerr.h
+    src/central.cpp src/central.h
     src/debris.cpp src/debris.h
     src/trajectory.cpp src/trajectory.h
     src/tidal.cpp src/tidal.h

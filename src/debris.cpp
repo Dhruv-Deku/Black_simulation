@@ -1,5 +1,7 @@
 #include "debris.h"
 
+#include "central.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -28,12 +30,12 @@ kerr::LocalAxes blAxes(double theta, double phiBL) {
 
 // Launches one particle at Boyer-Lindquist Cartesian position p with Cartesian
 // velocity vel, given as components along the local axes. Returns false if it would
-// start inside or at the horizon, or faster than light.
-bool launch(double a, const Vec3& p, const Vec3& vel, float temperature, ParticleInit& out) {
+// start inside or at the horizon (or the surface, if nonzero), or faster than light.
+bool launch(double a, const Vec3& p, const Vec3& vel, float temperature, double surface, ParticleInit& out) {
     // Same r and theta as the Kerr-Schild mapping; only the azimuth differs.
     const double w = p[0] * p[0] + p[1] * p[1] + p[2] * p[2] - a * a;
     const double r = std::sqrt(0.5 * (w + std::sqrt(w * w + 4.0 * a * a * p[2] * p[2])));
-    if (r < kerr::horizonRadius(a) + 0.1) return false;
+    if (r < central::boundaryRadius(a, surface) + 0.1) return false;
     const double theta = std::acos(std::clamp(p[2] / r, -1.0, 1.0));
     const double phiBL = std::atan2(p[1], p[0]);
     const kerr::LocalAxes ax = blAxes(theta, phiBL);
@@ -52,7 +54,7 @@ bool launch(double a, const Vec3& p, const Vec3& vel, float temperature, Particl
 }  // namespace
 
 std::vector<ParticleInit> cloud(double a, double r, double theta, double phi, const double v[3], double radius,
-                                bool gaussian, int count, float temperature, std::mt19937& rng) {
+                                bool gaussian, int count, float temperature, std::mt19937& rng, double surface) {
     const double phiBL = phi - kerr::azimuthShift(a, r);
     const Vec3 center = blCartesian(a, r, theta, phiBL);
     const kerr::LocalAxes ax = blAxes(theta, phiBL);
@@ -76,14 +78,14 @@ std::vector<ParticleInit> cloud(double a, double r, double theta, double phi, co
         }
         const Vec3 p = {center[0] + offset[0], center[1] + offset[1], center[2] + offset[2]};
         ParticleInit init;
-        if (launch(a, p, vel, temperature * warmth(rng), init)) out.push_back(init);
+        if (launch(a, p, vel, temperature * warmth(rng), surface, init)) out.push_back(init);
     }
     return out;
 }
 
 std::vector<ParticleInit> deformedStar(double a, double r, double theta, double phi, const double v[3],
                                        double radius, const tidal::Mat3& F, const tidal::Mat3& Fdot, int count,
-                                       float temperature, std::mt19937& rng) {
+                                       float temperature, std::mt19937& rng, double surface) {
     const double phiBL = phi - kerr::azimuthShift(a, r);
     const Vec3 center = blCartesian(a, r, theta, phiBL);
     const kerr::LocalAxes ax = blAxes(theta, phiBL);
@@ -106,13 +108,13 @@ std::vector<ParticleInit> deformedStar(double a, double r, double theta, double 
             u[i] = vel[i] + Fdot[i][0] * X[0] + Fdot[i][1] * X[1] + Fdot[i][2] * X[2];
         }
         ParticleInit init;
-        if (launch(a, p, u, temperature * warmth(rng), init)) out.push_back(init);
+        if (launch(a, p, u, temperature * warmth(rng), surface, init)) out.push_back(init);
     }
     return out;
 }
 
 std::vector<ParticleInit> ring(double a, double rInner, double rOuter, double tiltDeg, int count,
-                               float temperature, std::mt19937& rng) {
+                               float temperature, std::mt19937& rng, double surface) {
     std::uniform_real_distribution<double> uni(0.0, 1.0);
     std::normal_distribution<double> jitter(0.0, 1.0);
     std::uniform_real_distribution<float> warmth(0.8f, 1.2f);
@@ -133,7 +135,7 @@ std::vector<ParticleInit> ring(double a, double rInner, double rOuter, double ti
         const double speed = std::abs(kerr::circularZamoSpeed(a, R, prograde)) * (1.0 + 0.003 * jitter(rng));
         const Vec3 vel = {-s * speed, c * ct * speed, c * st * speed};
         ParticleInit init;
-        if (launch(a, p, vel, temperature * warmth(rng), init)) out.push_back(init);
+        if (launch(a, p, vel, temperature * warmth(rng), surface, init)) out.push_back(init);
     }
     return out;
 }
