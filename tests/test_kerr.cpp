@@ -1,5 +1,6 @@
 // Physics tests for the Kerr geodesic code, checked against closed-form results.
 
+#include "central.h"
 #include "debris.h"
 #include "gravity.h"
 #include "kerr.h"
@@ -7,9 +8,11 @@
 #include "trajectory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <string>
 
 using namespace kerr;
 
@@ -916,26 +919,304 @@ static void testMutualGravity() {
 }
 
 
+// --- Central objects: neutron stars, white dwarfs, stars, planets ---------------------
+
+static void testCentralUnits() {
+    near(central::lengthKm(1.0, 10.0), 14.76625, 1e-9, "1 M of a 10 solar-mass hole is 14.77 km");
+    near(central::timeSeconds(1.0, 4.3e6), 21.18, 0.01, "1 M of time for Sgr A* is 21.2 s");
+    // M87*: 1 M is 64 AU.
+    near(central::lengthKm(1.0, 6.5e9) / central::kAuKm, 64.2, 0.1, "1 M of M87* is 64 AU");
+    // Catalogue compactness R / M.
+    for (const auto& e : central::catalog()) {
+        if (std::string(e.label) == "Sun") near(e.object.radius, 4.711e5, 1e2, "the Sun has R = 4.71e5 M");
+        if (std::string(e.label) == "Earth") near(e.object.radius / 1.44e9, 1.0, 0.01, "Earth has R = 1.44e9 M");
+        if (std::string(e.label) == "Neutron star") near(e.object.radius, 5.8, 0.05, "a 12 km neutron star has R = 5.8 M");
+    }
+}
+
+static void testSurfacePhysics() {
+    // Neutron star, 1.4 solar masses, R = 5.8 M.
+    near(1.0 + central::surfaceRedshift(5.8), 1.235441, 1e-6, "neutron star surface: 1 + z = 1.2355");
+    near(central::surfaceGravity(5.8), 0.036726, 1e-6, "neutron star surface gravity 0.0367 / M");
+    near(central::accelerationSI(central::surfaceGravity(5.8), 1.4) / 1.6e12, 1.0, 0.01,
+         "neutron star surface gravity 1.6e12 m/s^2");
+    // The Sun: z = 2.12e-6, measured as a 0.636 km/s redshift.
+    const double rSun = central::kSunRadiusKm / central::kKmPerSolarMass;
+    near(central::surfaceRedshift(rSun), 2.1225e-6, 2e-10, "solar surface redshift z = 2.12e-6");
+    near(central::surfaceRedshift(rSun) * central::kSpeedOfLightKmS, 0.636, 0.001, "solar redshift is 0.636 km/s");
+    // Sirius B at R = 3885 M: z = 2.575e-4 (77.2 km/s).
+    near(central::surfaceRedshift(3885.0) * central::kSpeedOfLightKmS, 77.2, 0.1, "Sirius B redshift 77.2 km/s");
+    // Limb deflection of starlight by the Sun: 4M/b = 1.751 arcsec, against the exact
+    // integral (twice the sweep of a ray leaving the limb tangentially, minus pi).
+    const double arcsec = kPi / (180.0 * 3600.0);
+    const double b = rSun / std::sqrt(1.0 - 2.0 / rSun);
+    near(4.0 / b / arcsec, 1.751, 0.001, "solar limb deflection 4M/b = 1.751 arcsec");
+    near((2.0 * central::maxBendingAngle(rSun) - kPi) / (4.0 / b), 1.0, 1e-4, "exact solar deflection matches 4M/b");
+
+    // A rigidly rotating surface element has a unit 4-velocity.
+    {
+        const double a = 0.3, R = 6.0, th = 1.0, omega = 0.02;
+        const double ut = central::rotatingSurfaceUt(a, R, th, omega);
+        // Kerr-Schild components equal Boyer-Lindquist ones when dr = 0.
+        const Vec4 u = {ut, 0.0, 0.0, omega * ut};
+        near(dot(metricTensor(a, R, th), u, u), -1.0, 1e-12, "rotating surface 4-velocity is unit");
+    }
+    near(central::Object{central::Kind::NeutronStar, "", 1.4, 5.8, 0.37, 0.35}.maxChi(), 0.548, 0.001,
+         "mass-shedding limit of a neutron star: chi < 0.55");
+}
+
+// The angle a photon leaving radius R at angle alpha to the radial direction sweeps
+// on its way to infinity, from the geodesic integrator (a = 0, equatorial).
+static double tracedBending(double R, double alpha) {
+    const double v[3] = {std::cos(alpha), 0.0, std::sin(alpha)};
+    Constants c;
+    State s;
+    launchFromZamo(0.0, R, kPi / 2, 0.0, v, 0.0, c, s);
+    while (s.r < 1e6) {
+        stepMino(0.0, c, s, photonStepSize(0.0, c, s, 2e-4));
+        enforceConstraints(0.0, c, s);
+    }
+    // What is left is a straight line in flat space: asin(b / r) more.
+    return s.phi + std::asin(c.L / c.E / s.r);
+}
+
+static void testSurfaceLightBending() {
+    // Neutron star, R = 5.8 M: exact integral against the ray tracer's integrator.
+    for (double alphaDeg : {10.0, 40.0, 70.0, 89.0}) {
+        const double alpha = alphaDeg * kPi / 180.0;
+        near(tracedBending(5.8, alpha), central::bendingAngle(5.8, alpha), 1e-6,
+             "traced light bending at R = 5.8 M matches the exact integral");
+    }
+    // Beloborodov's approximation, and how much of the star shows (~76%).
+    const double psiMax = central::maxBendingAngle(5.8);
+    near(psiMax * 180.0 / kPi, 121.75, 1.5, "light leaving the limb of R = 5.8 M sweeps ~122 degrees");
+    near(central::bendingAngleBeloborodov(5.8, kPi / 2) * 180.0 / kPi, 121.75, 0.01, "Beloborodov: 121.75 degrees");
+    near(central::visibleFraction(5.8), 0.76, 0.02, "a 5.8 M neutron star shows ~76% of its surface");
+    const double rFull = central::fullVisibilityRadius();
+    std::printf("      the whole surface is visible below R = %.4f M\n", rFull);
+    near(rFull, 3.52, 0.02, "the whole surface is visible below R ~ 3.52 M");
+    truth(central::visibleFraction(3.4) == 1.0, "R = 3.4 M: the whole surface shows");
+}
+
+static void testSurfaceRays() {
+    // A radial photon from the static surface of a R = 5.8 M star reaches a static
+    // camera far away with g = sqrt(1 - 2/R) / sqrt(1 - 2/r_cam).
+    trajectory::RayScene scene;
+    scene.disk = false;
+    scene.surface = 5.8;
+    scene.escapeRadius = 2e6;
+    const double rCam = 1e6;
+    const double atStar[3] = {-1.0, 0.0, 0.0};
+    auto ray = trajectory::traceRay(0.0, rCam, kPi / 2, 0.0, zamoAt(0.0, rCam, kPi / 2), atStar, scene);
+    truth(ray.end == trajectory::RayEnd::Surface, "looking at a neutron star: the ray ends on its surface");
+    near(ray.g, std::sqrt(1.0 - 2.0 / 5.8) / std::sqrt(1.0 - 2.0 / rCam), 1e-9,
+         "radial photon from a static surface: g = sqrt(1 - 2/R)");
+    near(ray.emissionCos, 1.0, 1e-6, "... leaving along the normal");
+
+    // The emission angle the ray tracer uses, cos = g |v_r| / sqrt(Sigma Delta), against
+    // the surface element's own orthonormal frame (rotating Kerr surface).
+    {
+        const double a = 0.3, R = 6.0, th = 1.1, omega = 0.02;
+        const double ut = central::rotatingSurfaceUt(a, R, th, omega);
+        const Frame f = observerFrame(a, R, th, {ut, 0.0, 0.0, omega * ut});
+        for (double angle : {0.2, 0.9, 1.4}) {
+            // Leaving with unit energy along n = (cos, sin * 0.6, sin * 0.8) in that frame.
+            const double n[3] = {std::cos(angle), 0.6 * std::sin(angle), 0.8 * std::sin(angle)};
+            const double look[3] = {-n[0], -n[1], -n[2]};
+            Constants c;
+            State s;
+            photonFromFrame(a, R, th, 0.3, f, look, c, s);
+            const double g = 1.0 / (ut * (c.E - omega * c.L));
+            const Metric m = metricAt(a, R, th);
+            near(g, 1.0, 1e-12, "a photon of unit energy in the surface frame has g = 1");
+            near(g * std::abs(s.vr) / std::sqrt(m.sigma * m.delta), n[0], 1e-12,
+                 "emission angle from g |v_r| / sqrt(Sigma Delta) matches the surface frame");
+        }
+    }
+
+    // Birkhoff: the same orbit around a black hole and a star; only how deep it reaches
+    // differs. Periapsis 5 M, apoapsis 20 M (a = 0).
+    double E = 0.0, L = 0.0;
+    truth(equatorialOrbit(0.0, 5.0, 20.0, true, E, L), "bound orbit between 5 and 20 M exists");
+    const Constants orbit = {E, L, 0.0, 1.0};
+    const State start = {0.0, 20.0, kPi / 2, 0.0, 0.0, 0.0};
+    auto around = [&](double surface) { return trajectory::classify(0.0, orbit, start, surface).fate; };
+    truth(around(0.0) == trajectory::Fate::Bound, "around a black hole the orbit is bound");
+    truth(around(4.5) == trajectory::Fate::Bound, "around a 4.5 M star the same orbit is bound (Birkhoff)");
+    truth(around(5.8) == trajectory::Fate::HitsSurface, "around a 5.8 M star it hits the surface");
+    const auto path = trajectory::predict(0.0, orbit, start, 2000.0, 0.3, 4000, 5.8);
+    truth(path.fate == trajectory::Fate::HitsSurface && path.rMin >= 5.75, "predicted path ends on the surface");
+}
+
+static void testLens() {
+    // A photon far from the hole (a = 0, r = 500) travelling along +phi passes a
+    // small black hole (m = 0.01) 2 M closer in: it turns 4m/b = 0.02 rad toward it.
+    const double r = 500.0, m = 0.01, b = 2.0;
+    const double v[3] = {0.0, 0.0, 1.0};
+    Constants c;
+    State s;
+    launchFromZamo(0.0, r, kPi / 2, 0.0, v, 0.0, c, s);
+    const auto x = toCartesian(0.0, r, kPi / 2, 0.0);
+    const trajectory::Point lens = {x[0] - b, x[1], x[2]};  // radially inward
+    Constants forward = c;
+    State sf = s;
+    truth(trajectory::lensKick(0.0, lens, m, false, forward, sf), "photon passing at b = 2 M is not captured");
+    const Metric mt = metricAt(0.0, r, kPi / 2);
+    const double eLocal = forward.E / std::sqrt(mt.sigma * mt.delta / mt.A);
+    near(sf.vr / (eLocal * std::sqrt(mt.sigma * mt.delta)), -std::sin(4.0 * m / b), 1e-12,
+         "thin lens: the ray turns 4m/b toward the small black hole");
+    near(eLocal, 1.0 / std::sqrt(1.0 - 2.0 / r), 1e-12, "... at fixed local frequency");
+    near(radialPotential(0.0, forward, r) / (sf.vr * sf.vr), 1.0, 1e-9, "... and stays a null geodesic");
+    Constants backward = c;
+    State sb = s;
+    trajectory::lensKick(0.0, lens, m, true, backward, sb);
+    truth(sb.vr > 0.0, "traced backwards, the earlier direction is turned the other way");
+    Constants captured = c;
+    State sc = s;
+    const trajectory::Point close = {x[0] - 0.05, x[1], x[2]};
+    truth(!trajectory::lensKick(0.0, close, m, false, captured, sc), "b < 3 sqrt(3) m: captured");
+
+    // Through the ray tracer: a sideways ray from r = 1000 passing a small black hole
+    // (m = 0.05) at b = 3 leaves for the sky 4m/b = 0.067 rad off its unlensed course,
+    // bent toward the lens.
+    trajectory::RayScene scene;
+    scene.disk = false;
+    scene.escapeRadius = 5000.0;
+    const double sideways[3] = {0.0, 0.0, 1.0};
+    const Frame f = zamoAt(0.0, 1000.0, kPi / 2);
+    auto plain = trajectory::traceRay(0.0, 1000.0, kPi / 2, 0.0, f, sideways, scene);
+    scene.lenses.push_back({{1000.0, 400.0, 3.0}, 0.05});
+    auto lensed = trajectory::traceRay(0.0, 1000.0, kPi / 2, 0.0, f, sideways, scene);
+    truth(plain.end == trajectory::RayEnd::Sky && lensed.end == trajectory::RayEnd::Sky && lensed.lensings == 1,
+          "the lensed ray still reaches the sky");
+    const double turned = std::acos(std::clamp(plain.skyDirection[0] * lensed.skyDirection[0] +
+                                               plain.skyDirection[1] * lensed.skyDirection[1] +
+                                               plain.skyDirection[2] * lensed.skyDirection[2], -1.0, 1.0));
+    near(turned, 4.0 * 0.05 / 3.0, 2e-3, "a small black hole deflects a passing ray by 4m/b");
+    truth(lensed.skyDirection[2] > plain.skyDirection[2], "... toward itself");
+}
+
+static void testMercury() {
+    // Mercury: a = 5.7909e10 m, e = 0.20563, 415.2 orbits per century: 42.98 arcsec.
+    const double e = 0.20563;
+    const double p = 5.7909e10 * (1.0 - e * e) / (central::kKmPerSolarMass * 1e3);
+    const double perCentury = central::periapsisAdvance(p, e) * (36525.0 / 87.9691);
+    near(perCentury * 180.0 / kPi * 3600.0, 42.98, 0.01, "Mercury's perihelion advances 42.98 arcsec per century");
+}
+
+static void testStellarStructure() {
+    const central::TovStar star = central::solveTov(100.0, 2.0, 1.28e-3);
+    std::printf("      TOV (K = 100, Gamma = 2, rho_c = 1.28e-3): M = %.4f, R = %.4f (%.2f km)\n", star.mass,
+                star.radius, star.radius * central::kKmPerSolarMass);
+    near(star.mass, 1.40, 0.005, "TOV polytrope: M = 1.40 solar masses");
+    near(star.radius, 9.586, 0.01, "TOV polytrope: circumferential radius 9.586 (14.2 km)");
+    const double mMax = central::neutronStarMaxMass();
+    std::printf("      maximum mass %.4f\n", mMax);
+    near(mMax, 1.637, 0.005, "TOV polytrope: maximum mass 1.64 solar masses");
+    near(central::neutronStarRadiusKm(1.4), star.radius * central::kKmPerSolarMass, 0.05,
+         "neutron-star radius for 1.4 solar masses from the mass-radius curve");
+    near(central::whiteDwarfRadiusKm(0.6), 8657.0, 5.0, "Nauenberg: a 0.6 solar-mass white dwarf is 8,660 km");
+    truth(central::whiteDwarfRadiusKm(1.5) == 0.0, "no white dwarf above the Chandrasekhar mass");
+}
+
+static void testAccretionEfficiency() {
+    near(central::blackHoleEfficiency(0.0), 1.0 - std::sqrt(8.0 / 9.0), 1e-12, "black hole a = 0: 5.72%");
+    near(central::blackHoleEfficiency(0.998), 0.321, 0.002, "black hole a = 0.998: 32%");
+    const central::SurfaceAccretion ns = central::surfaceEfficiency(0.0, 5.8, 0.0);
+    near(ns.rInner, 6.0, 1e-12, "neutron star R = 5.8: the disk stops at the ISCO");
+    near(ns.total, 1.0 - std::sqrt(1.0 - 2.0 / 5.8), 1e-12, "neutron star R = 5.8: 19.1% in all");
+    near(ns.disk, 1.0 - std::sqrt(8.0 / 9.0), 1e-12, "... of which the disk releases 5.72%");
+    near(ns.boundaryLayer, std::sqrt(8.0 / 9.0) - std::sqrt(1.0 - 2.0 / 5.8), 1e-12, "... and the surface the rest");
+    const central::SurfaceAccretion wd = central::surfaceEfficiency(0.0, 9800.0, 0.0);
+    near(wd.total, 1.02e-4, 0.01e-4, "white dwarf: 1e-4 of the rest mass");
+    near(central::alfvenRadiusKm(1e12, 12.0, 1.4, 1e17), 4225.0, 20.0, "Alfven radius for 1e12 G at 1e17 g/s");
+}
+
+static void testTidalScales() {
+    near(central::hillsMass(central::kSunRadiusKm, 1.0) / 1e8, 1.14, 0.01, "Hills mass for a Sun-like star: 1.14e8");
+    const double rStarSgr = central::kSunRadiusKm / (central::kKmPerSolarMass * 4.3e6);
+    near(rStarSgr, 0.11, 0.001, "the Sun is 0.11 M across at Sgr A*");
+    near(central::tidalRadius(rStarSgr, 1.0 / 4.3e6), 17.8, 0.1, "Sgr A* disrupts a Sun-like star at 18 M");
+    const double rStarM87 = central::kSunRadiusKm / (central::kKmPerSolarMass * 6.5e9);
+    truth(central::tidalRadius(rStarM87, 1.0 / 6.5e9) < horizonRadius(0.9), "M87* swallows a Sun-like star whole");
+}
+
+static void testCollapse() {
+    std::string message;
+    central::Object sun = central::catalog()[4].object;  // the Sun
+    truth(std::string(sun.name) == "Sun", "catalogue entry 4 is the Sun");
+    truth(!central::collapseIfUnstable(sun, message), "the Sun stands");
+    sun.radius = 2.2;
+    truth(central::collapseIfUnstable(sun, message) && sun.hasHorizon(), "below 9/4 M the Sun collapses");
+    near(sun.chi, 0.22, 1e-12, "... keeping its spin (J/M^2 = 0.22)");
+    central::Object earth = central::catalog()[0].object;
+    earth.radius = 2.0;
+    truth(central::collapseIfUnstable(earth, message) && earth.chi == 0.998, "the Earth must shed spin to collapse");
+    central::Object wd = central::catalog()[6].object;
+    wd.massSolar = 1.5;
+    truth(central::collapseIfUnstable(wd, message) && wd.kind == central::Kind::NeutronStar,
+          "a white dwarf over 1.44 solar masses becomes a neutron star");
+    central::Object ns = central::catalog()[8].object;
+    ns.massSolar = 1.7;
+    truth(central::collapseIfUnstable(ns, message) && ns.hasHorizon(), "a 1.7 solar-mass neutron star collapses");
+
+    // The compactness slider's stages, and what the scene and the metric make of a body.
+    truth(central::stageForCompactness(4.7e5, central::Kind::Star) == central::Kind::Star, "R = 4.7e5 M: a star");
+    truth(central::stageForCompactness(1e4, central::Kind::Star) == central::Kind::WhiteDwarf, "R = 1e4 M: white dwarf");
+    truth(central::stageForCompactness(10.0, central::Kind::Star) == central::Kind::NeutronStar, "R = 10 M: neutron star");
+    central::Object squeezed = central::catalog()[4].object;
+    squeezed.radius = 10.0;
+    truth(central::becomeStage(squeezed, central::Kind::NeutronStar, 5772.0) && squeezed.chi == 0.22,
+          "a squeezed Sun becomes neutron-star-like and keeps its J");
+    near(central::catalog()[4].object.sceneScale(), 4.711e5 / 6.0, 50.0, "the Sun's scene is laid out in units of R/6");
+    near(central::catalog()[8].object.sceneScale(), 1.0, 0.0, "a neutron star's scene is in M");
+    near(central::catalog()[0].object.metricSpin(), 0.99, 0.0, "a planet's Kerr exterior uses a = 0.99, not 890");
+    near(central::boundaryRadius(0.0, 0.0), 2.0, 1e-15, "a black hole's boundary is its horizon");
+    near(central::displayTemperature(20000.0), 20000.0, 0.0, "below 30,000 K colors are drawn as they are");
+    truth(central::displayTemperature(1e7) > central::displayTemperature(1e6) &&
+              central::displayTemperature(1e7) < 2e5,
+          "hotter neutron-star surfaces still look bluer, within the color table");
+}
+
+// Runs one group of checks, and says so if it was slow.
+static void run(const char* name, void (*test)()) {
+    const auto start = std::chrono::steady_clock::now();
+    test();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (seconds > 1.0) std::printf("      (%s took %.1f s)\n", name, seconds);
+}
+
 int main() {
-    testTidalModel();
-    testMutualGravity();
-    testKerrSchildMetric();
-    testFallThroughHorizon();
-    testObserverFrames();
-    testTrajectoryClassification();
-    testRayTrace();
-    testCartesianRoundTrip();
-    testMovingObserver();
-    testDebris();
-    testNearAxisPhotons();
-    testRadii();
-    testCircularOrbits();
-    testZamoRoundTrip();
-    testCircularIntegration();
-    testConstraintConservation();
-    testEquatorialOrbitSolver();
-    testPeriapsisPrecession();
-    testShadow();
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    run("testCentralUnits", testCentralUnits);
+    run("testSurfacePhysics", testSurfacePhysics);
+    run("testSurfaceLightBending", testSurfaceLightBending);
+    run("testSurfaceRays", testSurfaceRays);
+    run("testLens", testLens);
+    run("testMercury", testMercury);
+    run("testStellarStructure", testStellarStructure);
+    run("testAccretionEfficiency", testAccretionEfficiency);
+    run("testTidalScales", testTidalScales);
+    run("testCollapse", testCollapse);
+    run("testTidalModel", testTidalModel);
+    run("testMutualGravity", testMutualGravity);
+    run("testKerrSchildMetric", testKerrSchildMetric);
+    run("testFallThroughHorizon", testFallThroughHorizon);
+    run("testObserverFrames", testObserverFrames);
+    run("testTrajectoryClassification", testTrajectoryClassification);
+    run("testRayTrace", testRayTrace);
+    run("testCartesianRoundTrip", testCartesianRoundTrip);
+    run("testMovingObserver", testMovingObserver);
+    run("testDebris", testDebris);
+    run("testNearAxisPhotons", testNearAxisPhotons);
+    run("testRadii", testRadii);
+    run("testCircularOrbits", testCircularOrbits);
+    run("testZamoRoundTrip", testZamoRoundTrip);
+    run("testCircularIntegration", testCircularIntegration);
+    run("testConstraintConservation", testConstraintConservation);
+    run("testEquatorialOrbitSolver", testEquatorialOrbitSolver);
+    run("testPeriapsisPrecession", testPeriapsisPrecession);
+    run("testShadow", testShadow);
     std::printf("%d/%d checks passed\n", g_checks - g_failures, g_checks);
     return g_failures == 0 ? 0 : 1;
 }

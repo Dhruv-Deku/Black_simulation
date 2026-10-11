@@ -1,7 +1,30 @@
 #pragma once
 
+#include "central.h"
+
 // Everything the user can tweak from the control panel.
+//
+// Sizes and times that lay out the scene (disk radii, escape radius, prediction time,
+// time scale) are in scene units: sceneScale() M of length (1 for black holes and
+// neutron stars, R/6 for bigger objects) and sceneScale()^1.5 M of time, the
+// dynamical time at that size. For a black hole they are simply M.
 struct Settings {
+    // The central object; `spin` below is the Kerr parameter it implies
+    // (central.metricSpin()), kept up to date by the app.
+    central::Object central = [] {
+        central::Object o;
+        o.chi = 0.94;
+        return o;
+    }();
+    bool physicalUnits = false;    // readouts also in km, AU, seconds, hours
+    bool radiusFollowsMass = true; // white dwarfs and neutron stars: radius from the mass-radius relation
+    bool autoStage = true;         // the compactness slider turns a star into a white dwarf, then a neutron star
+    float accretionRate = 0.01f;   // in Eddington units: sets the magnetospheric (Alfven) radius
+    bool magnetosphere = true;     // magnetized stars truncate the disk and feed accretion columns
+    bool surfaceDetail = true;     // spots, granulation, hot spots, flares
+    float surfaceBrightness = 1.0f;
+    bool corona = true;            // stellar coronae and planetary atmospheres
+
     // Black hole
     float spin = 0.94f;  // a = J/M, in [0, 0.999]
 

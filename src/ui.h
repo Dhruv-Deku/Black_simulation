@@ -46,7 +46,7 @@ struct UiState {
     bool showOrbitMap = true;
     bool showHelp = false;
 
-    // Custom launch form
+    // Custom launch form. Radii and sizes are in scene units (M for black holes).
     int launchKind = 0;  // BodyKind
     float launchR = 12.0f;
     float launchPolarDeg = 90.0f;
@@ -59,10 +59,10 @@ struct UiState {
     float launchRa = 20.0f;
     float launchTemperature = 5800.0f;
     float launchRadius = 0.5f;
-    float launchMass = 1e-6f;  // units of the hole's mass
+    float launchMass = 1e-6f;  // units of the central mass
 
     // Orbit map
-    float mapExtent = 30.0f;  // half-width of the view, in M
+    float mapExtent = 30.0f;  // half-width of the view, in scene units (M for black holes)
     int mapView = 0;          // 0 = from above, 1 = from the side
 
     // Video
@@ -77,6 +77,10 @@ struct UiState {
     std::string screenshotStatus;
     std::string videoStatus;
     std::string cameraStatus;
+    std::string centralStatus;     // what just happened to the central object
+    int compactnessOrigin = -1;    // the kind the compactness slider started from (-1: not sliding)
+    double compactnessTemperature = 0.0;
+    bool radiusInKm = true;
 
     // Launch planner: the predicted fate and path of the custom launch.
     bool plannerOpen = false;      // the launch panel is open this frame
@@ -114,6 +118,7 @@ struct UiContext {
     int recordFrame = 0;
     int recordTotal = 0;
 
+    double scale = 1.0;  // scene scale (see Settings)
     // Predicted future paths of the bodies, indexed by Body::slot.
     const std::vector<trajectory::Path>* predictions = nullptr;
     double slowdown = 1.0;  // time runs this much slower (approaching the hole)
@@ -126,9 +131,12 @@ struct UiContext {
     int rideRequested = -1;          // history slot of a body to ride with
     int sceneRequested = -1;         // a Scene
     bool einsteinRingRequested = false;
+    int centralRequested = -1;       // a central::catalog() entry
+    bool burstRequested = false;     // set off a thermonuclear flash on the surface
 };
 
-// Turns the custom launch form into initial conditions. False if they are invalid.
-bool plannedLaunch(const UiState& ui, double spin, kerr::Constants& c, kerr::State& s);
+// Turns the custom launch form into initial conditions (scene scale `scale`, central
+// surface radius `surface` in M, 0 for a black hole). False if they are invalid.
+bool plannedLaunch(const UiState& ui, double spin, double scale, double surface, kerr::Constants& c, kerr::State& s);
 
 void drawUi(UiContext& ctx);

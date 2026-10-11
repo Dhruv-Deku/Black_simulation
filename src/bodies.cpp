@@ -1,6 +1,7 @@
 #include "bodies.h"
 
 #include "blackbody.h"
+#include "central.h"
 #include "gravity.h"
 
 #include <algorithm>
@@ -12,15 +13,19 @@ namespace {
 constexpr double kHalfPi = 0.5 * kerr::kPi;
 constexpr size_t kMaxTrail = 3000;
 constexpr size_t kMaxEvents = 8;
-constexpr int kBackfillSamples = 1400;  // 700 M of past orbit for each new body
+constexpr size_t kMaxImpacts = 16;
+constexpr int kBackfillSamples = 1400;  // 700 M of past orbit for each new body (times the scene scale)
 // A tidally stretched star is treated as torn apart once its longest axis reaches
 // this many radii: from there on its pieces are effectively unbound.
 constexpr double kDisruptionStretch = 2.5;
 // Gravity between bodies is softened over this fraction of their radii.
 constexpr double kSoftening = 0.1;
+// A small black hole bends light out to this many times its mass; beyond, the bend
+// (4m/b < 0.002 rad) is below a pixel and is faded out.
+constexpr double kLensReach = 2000.0;
 
 std::string format(const char* fmt, double a, double b = 0.0) {
-    char buf[160];
+    char buf[200];
     std::snprintf(buf, sizeof(buf), fmt, a, b);
     return buf;
 }
@@ -65,12 +70,22 @@ gravity::Member memberOf(const Body& b) {
     return {b.constants, b.state, b.mass, kSoftening * b.radius};
 }
 
+// Lorentz factor of a body relative to the rigidly rotating surface it strikes:
+// -u_body . u_surface, with u_surface = u^t (1, 0, 0, Omega).
+double impactGamma(double spin, const Body& b, double omega) {
+    const kerr::Vec4 u = kerr::fourVelocity(spin, b.constants, b.state);
+    const double ut = central::rotatingSurfaceUt(spin, b.state.r, b.state.theta, omega);
+    const kerr::Vec4 us = {ut, 0.0, 0.0, omega * ut};
+    return std::max(1.0, -kerr::dot(kerr::metricTensor(spin, b.state.r, b.state.theta), u, us));
+}
+
 }  // namespace
 
 glm::vec3 displayColor(const Body& body) {
     switch (body.kind) {
         case BodyKind::RockyPlanet: return {0.3f, 0.55f, 0.9f};
         case BodyKind::GasGiant: return {0.85f, 0.7f, 0.5f};
+        case BodyKind::MiniBlackHole: return {0.6f, 0.45f, 1.0f};
         default: return blackbody::hue(body.temperature);
     }
 }
@@ -82,6 +97,9 @@ const char* kindName(BodyKind kind) {
         case BodyKind::GasGiant: return "Gas giant";
         case BodyKind::Pulsar: return "Pulsar";
         case BodyKind::TidalStar: return "Star (tidal)";
+        case BodyKind::WhiteDwarf: return "White dwarf";
+        case BodyKind::NeutronStar: return "Neutron star";
+        case BodyKind::MiniBlackHole: return "Small black hole";
     }
     return "?";
 }
@@ -99,7 +117,8 @@ const std::vector<PresetInfo>& presetList() {
     static const std::vector<PresetInfo> list = {
         {Preset::IscoOrbit, "ISCO orbit",
          "A circular orbit at the innermost stable circular orbit, the closest a body can circle "
-         "without falling in. Closer to the hole for faster spins.", false},
+         "without falling in. Closer to the hole for faster spins. Around a star larger than its ISCO, "
+         "the innermost orbit skims the surface instead.", false},
         {Preset::StableOrbit, "Circular orbit", "A comfortable circular orbit at r = 10 M.", false},
         {Preset::RetrogradeOrbit, "Retrograde",
          "Circles against the hole's rotation. Frame dragging pushes the retrograde ISCO outward.", false},
@@ -126,7 +145,9 @@ const std::vector<PresetInfo>& presetList() {
         {Preset::TidalDisruption, "Tidal disruption",
          "A star falls toward the hole. Its shape follows the tides (the affine star model): an egg "
          "on the way in, squeezed flat at closest approach, then stretched without limit into a long "
-         "glowing stream (spaghettification). The debris stays bound and winds around the hole.", true},
+         "glowing stream (spaghettification). The debris stays bound and winds around the hole. With "
+         "physical units on, the star is a Sun at its true size: a hole above the Hills mass (~1e8 "
+         "Suns) swallows it whole.", true},
         {Preset::GrazingStar, "Grazing star",
          "A star that passes just outside its tidal radius: the tides squeeze and stretch it, and it "
          "leaves wobbling, but it survives.", true},
@@ -142,6 +163,12 @@ const std::vector<PresetInfo>& presetList() {
         {Preset::DebrisRing, "Tilted ring",
          "A ring of rubble tilted 30 degrees to the spin. Frame dragging precesses inner orbits "
          "fastest, so the ring slowly twists and warps.", true},
+        {Preset::MiniBlackHole, "Small black hole",
+         "A black hole of 2% of the central mass on a tilted orbit. It lenses whatever lies behind it "
+         "and swallows anything that strays within its horizon. (No exact spacetime holds two black "
+         "holes, so its lensing is the thin-lens approximation: a bend of 4m/b.)", true},
+        {Preset::WhiteDwarfCompanion, "White dwarf",
+         "A hot white dwarf, a stellar core the size of the Earth, on an eccentric orbit.", true},
     };
     return list;
 }
@@ -151,8 +178,28 @@ void BodySystem::clear() {
     departed.clear();
     events.clear();
     pendingDebris.clear();
+    impacts.clear();
+    accreted = 0.0;
     std::fill(std::begin(history.length), std::end(history.length), 0);
     m_counter = 0;
+}
+
+double BodySystem::boundary(double spin) const {
+    return central::boundaryRadius(spin, surface);
+}
+
+void BodySystem::setScale(double newScale, double spin) {
+    scale = newScale;
+    // Light takes longer to cross a bigger scene: the history's step follows the scale
+    // whenever the two drift apart by more than a factor sqrt(2).
+    const double wanted = 0.5 * newScale;
+    if (std::abs(std::log2(wanted / history.step)) <= 0.5) return;
+    history.step = wanted;
+    history.newest = static_cast<long long>(std::floor(time / history.step));
+    ++history.generation;
+    for (const Departed& d : departed) history.length[d.body.slot] = 0;
+    departed.clear();
+    for (Body& b : bodies) backfill(b, spin);
 }
 
 std::string BodySystem::nextName() {
@@ -198,18 +245,19 @@ void BodySystem::backfill(Body& body, double spin) {
     // (The past ignores the other bodies' pull and keeps today's shape.)
     Body past = body;
     kerr::State& s = past.state;
-    const double rh = kerr::horizonRadius(spin);
-    long long k = static_cast<long long>(std::floor(s.t / History::kStep));
+    // Followed back to just outside the horizon, or to the surface it would have come from.
+    const double rh = surface > 0.0 ? surface : kerr::horizonRadius(spin) + 0.05;
+    long long k = static_cast<long long>(std::floor(s.t / history.step));
     History::Sample later = sampleOf(spin, past);
     int n = 0;
     for (int guard = 0; n < kBackfillSamples && guard < 300000; ++guard) {
         const double tLater = s.t;
         kerr::stepCoordinateTime(spin, past.constants, s, -kerr::suggestedTimeStep(spin, past.constants, s, 0.01));
         kerr::normalizeAngles(s);
-        if (!std::isfinite(s.r) || s.r < rh + 0.05 || s.r > 3000.0) break;
+        if (!std::isfinite(s.r) || s.r < rh || s.r > 3000.0 * scale) break;
         const History::Sample earlier = sampleOf(spin, past);
-        while (n < kBackfillSamples && k * History::kStep >= s.t) {
-            const float f = static_cast<float>((k * History::kStep - s.t) / (tLater - s.t));
+        while (n < kBackfillSamples && k * history.step >= s.t) {
+            const float f = static_cast<float>((k * history.step - s.t) / (tLater - s.t));
             history.record(body.slot, k, mix(earlier, later, f));
             ++n;
             --k;
@@ -235,8 +283,9 @@ void BodySystem::depart(size_t index) {
 
 bool BodySystem::addFromZamo(double spin, double r, double theta, double phi, const double v[3], BodyKind kind,
                              const std::string& name) {
-    if (r < kerr::horizonRadius(spin) + 0.2) {
-        logEvent("Cannot place a body inside or at the horizon.");
+    if (r < boundary(spin) + 0.2 * scale) {
+        logEvent(surface > 0.0 ? "Cannot place a body inside or at the surface."
+                               : "Cannot place a body inside or at the horizon.");
         return false;
     }
     if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] >= 1.0) {
@@ -258,6 +307,10 @@ bool BodySystem::addCircular(double spin, double r, bool prograde, double phase,
         logEvent(format("No circular orbit exists at r = %.2f (inside the photon orbit).", r));
         return false;
     }
+    if (surface > 0.0 && r < surface) {
+        logEvent(format("r = %.3g M is inside the surface (R = %.3g M).", r, surface));
+        return false;
+    }
     Body body;
     body.name = name;
     body.kind = kind;
@@ -277,6 +330,7 @@ bool BodySystem::addEquatorial(double spin, double rp, double ra, bool prograde,
         logEvent(format("No bound orbit between r = %.2f and %.2f.", rp, ra));
         return false;
     }
+    if (surface > 0.0 && rp < surface) logEvent(format("Periapsis %.3g M is below the surface: it will hit it.", rp));
     Body body;
     body.name = name;
     body.kind = kind;
@@ -320,16 +374,23 @@ bool BodySystem::addCompanion(double spin, size_t primary, double mass, double s
 
 void BodySystem::addPreset(double spin, Preset preset) {
     std::uniform_real_distribution<double> uni(0.0, 1.0);
-    const double iscoPro = kerr::iscoRadius(spin, true);
-    const double iscoRetro = kerr::iscoRadius(spin, false);
+    // Presets are laid out in scene units: around a big star or planet everything is
+    // scaled up with it (radii by S, speeds by 1/sqrt(S), spin rates by S^-1.5), so the
+    // same demonstrations work around any object. For black holes S = 1.
+    const double S = scale, vS = 1.0 / std::sqrt(scale), tS = scale * std::sqrt(scale);
+    const float fS = static_cast<float>(S);
+    // Innermost stable circular orbits outside the object: the ISCO, or just above the surface.
+    const double clear = surface > 0.0 ? surface + 0.5 * S : 0.0;
+    const double iscoPro = std::max(kerr::iscoRadius(spin, true), clear);
+    const double iscoRetro = std::max(kerr::iscoRadius(spin, false), clear);
     const size_t before = bodies.size();
 
     // Applies to the body just added, if any.
     auto style = [&](float temperature, float radius, float spinRate = 0.0f) {
         if (bodies.size() > before) {
             bodies.back().temperature = temperature;
-            bodies.back().radius = radius;
-            bodies.back().spinRate = spinRate;
+            bodies.back().radius = radius * fS;
+            bodies.back().spinRate = static_cast<float>(spinRate / tS);
         }
     };
     // The ZAMO-frame velocity (tilted out of the equator by tilt) of the equatorial
@@ -346,16 +407,17 @@ void BodySystem::addPreset(double spin, Preset preset) {
         return true;
     };
     // A star whose shape follows the tides; its mass follows from its tidal radius,
-    // r_t = R (M / m)^(1/3).
-    auto tidalStar = [&](double rp, double ra, double tiltDeg, float radius, float tidalRadius, const char* name) {
+    // r_t = R (M / m)^(1/3). Radii in M.
+    auto tidalStar = [&](double rp, double ra, double tiltDeg, double radius, double tidalRadius, const char* name) {
         double v[3];
         if (!apoapsisVelocity(rp, ra, tiltDeg * kerr::kPi / 180.0, v)) {
             logEvent("Could not set up the orbit.");
             return;
         }
         if (addFromZamo(spin, ra, kHalfPi, uni(m_rng) * 6.28, v, BodyKind::TidalStar, name)) {
-            style(7000.0f, radius);
-            bodies.back().tidalRadius = tidalRadius;
+            bodies.back().temperature = 7000.0f;
+            bodies.back().radius = static_cast<float>(radius);
+            bodies.back().tidalRadius = static_cast<float>(tidalRadius);
             bodies.back().mass = std::pow(radius / tidalRadius, 3.0);
         }
     };
@@ -366,74 +428,76 @@ void BodySystem::addPreset(double spin, Preset preset) {
             style(9000.0f, 0.4f);
             break;
         case Preset::StableOrbit:
-            addCircular(spin, std::max(10.0, iscoPro + 3.0), true, uni(m_rng) * 6.28);
+            addCircular(spin, std::max(10.0 * S, iscoPro + 3.0 * S), true, uni(m_rng) * 6.28);
             style(5800.0f, 0.6f);
             break;
         case Preset::RetrogradeOrbit:
-            addCircular(spin, std::max(12.0, iscoRetro * 1.3), false, uni(m_rng) * 6.28, BodyKind::Star,
+            addCircular(spin, std::max(12.0 * S, iscoRetro * 1.3), false, uni(m_rng) * 6.28, BodyKind::Star,
                         "Retrograde star");
             style(4200.0f, 0.6f);
             break;
         case Preset::Precessing:
-            addEquatorial(spin, std::max(iscoPro * 1.5, 6.5), 24.0, true, uni(m_rng) * 6.28, BodyKind::Star,
+            addEquatorial(spin, std::max(iscoPro * 1.5, 6.5 * S), 24.0 * S, true, uni(m_rng) * 6.28, BodyKind::Star,
                           "Precessing star");
             style(7000.0f, 0.5f);
             break;
         case Preset::ZoomWhirl: {
             double rp;
-            if (kerr::separatrixPeriapsis(spin, 22.0, true, rp)) {
-                addEquatorial(spin, rp * (1.0 + 2e-4), 22.0, true, uni(m_rng) * 6.28, BodyKind::Star,
+            if (kerr::separatrixPeriapsis(spin, 22.0 * S, true, rp) && rp > clear) {
+                addEquatorial(spin, rp * (1.0 + 2e-4), 22.0 * S, true, uni(m_rng) * 6.28, BodyKind::Star,
                               "Zoom-whirl star");
                 style(12000.0f, 0.4f);
+            } else if (surface > 0.0) {
+                logEvent("Zoom-whirl orbits whirl near the photon orbit (r ~ 4 M): inside this object.");
             } else {
                 logEvent("Could not find a zoom-whirl orbit for this spin.");
             }
             break;
         }
         case Preset::PolarOrbit: {
-            double r = 10.0;
+            double r = 10.0 * S;
             double v[3] = {0.0, -1.0 / std::sqrt(r - 2.0), 0.0};
             addFromZamo(spin, r, kHalfPi, uni(m_rng) * 6.28, v, BodyKind::Star, "Polar orbiter");
             style(5000.0f, 0.55f);
             break;
         }
         case Preset::Plunge: {
-            double r = 14.0;
+            double r = 14.0 * S;
             double v[3] = {0.0, 0.0, 0.45 * kerr::circularZamoSpeed(spin, r, true)};
             addFromZamo(spin, r, kHalfPi, uni(m_rng) * 6.28, v, BodyKind::Star, "Doomed star");
             style(6500.0f, 0.55f);
             break;
         }
         case Preset::Flyby: {
-            double v[3] = {-0.27, 0.0, 0.13};
-            addFromZamo(spin, 40.0, kHalfPi, -0.6, v, BodyKind::Star, "Flyby star");
+            double v[3] = {-0.27 * vS, 0.0, 0.13 * vS};
+            addFromZamo(spin, 40.0 * S, kHalfPi, -0.6, v, BodyKind::Star, "Flyby star");
             style(20000.0f, 0.7f);
             break;
         }
         case Preset::Cluster: {
             for (int i = 0; i < 10; ++i) {
-                double r = 7.0 + 15.0 * uni(m_rng);
+                double r = (7.0 + 15.0 * uni(m_rng)) * S;
                 if (r < iscoPro * 1.2) r = iscoPro * 1.2;
                 double tilt = (uni(m_rng) * 2.0 - 1.0) * 1.05;  // up to ~60 degrees
                 double speed = kerr::circularZamoSpeed(spin, r, true) * (0.95 + 0.1 * uni(m_rng));
                 double v[3] = {0.0, -std::sin(tilt) * speed, std::cos(tilt) * speed};
                 if (!addFromZamo(spin, r, kHalfPi, uni(m_rng) * 6.28, v)) break;
                 bodies.back().temperature = static_cast<float>(3000.0 * std::pow(20000.0 / 3000.0, uni(m_rng)));
-                bodies.back().radius = static_cast<float>(0.25 + 0.3 * uni(m_rng));
+                bodies.back().radius = static_cast<float>((0.25 + 0.3 * uni(m_rng)) * S);
             }
             break;
         }
         case Preset::RockyPlanet:
-            addCircular(spin, std::max(9.0, iscoPro * 1.5), true, uni(m_rng) * 6.28, BodyKind::RockyPlanet,
+            addCircular(spin, std::max(9.0 * S, iscoPro * 1.5), true, uni(m_rng) * 6.28, BodyKind::RockyPlanet,
                         "Planet");
             style(0.0f, 0.75f, 0.06f);
             break;
         case Preset::GasGiant:
-            addCircular(spin, 17.0, true, uni(m_rng) * 6.28, BodyKind::GasGiant, "Gas giant");
+            addCircular(spin, 17.0 * S, true, uni(m_rng) * 6.28, BodyKind::GasGiant, "Gas giant");
             style(0.0f, 1.5f, 0.1f);
             break;
         case Preset::Pulsar: {
-            double r = 11.0, tilt = 0.25;
+            double r = 11.0 * S, tilt = 0.25;
             double speed = kerr::circularZamoSpeed(spin, r, true);
             double v[3] = {0.0, -std::sin(tilt) * speed, std::cos(tilt) * speed};
             addFromZamo(spin, r, kHalfPi, uni(m_rng) * 6.28, v, BodyKind::Pulsar, "Pulsar");
@@ -441,62 +505,107 @@ void BodySystem::addPreset(double spin, Preset preset) {
             break;
         }
         case Preset::TidalDisruption:
-            // A bound, eccentric orbit (periapsis 7 M, apoapsis 40 M) tilted 20 degrees,
-            // released at apoapsis, plunging to well inside the tidal radius (16 M). Its
-            // debris stays bound, winding around the hole on precessing orbits. (A star
-            // falling from far away would leave half its debris escaping and the rest
-            // returning only after many thousands of M.)
-            tidalStar(std::max(7.0, iscoPro * 1.3), 40.0, 20.0, 1.5f, 16.0f, "Doomed star");
+            if (massSolar > 0.0 && surface <= 0.0) {
+                // A Sun-like star at its true size around a hole of massSolar Suns:
+                // R* = R_sun in M, m* / M = 1 / massSolar, r_t = R* (M / m*)^(1/3).
+                const double rStar = central::kSunRadiusKm / (central::kKmPerSolarMass * massSolar);
+                const double rt = central::tidalRadius(rStar, 1.0 / massSolar);
+                const double rmb = kerr::marginallyBoundRadius(spin, true);
+                if (rt < rmb) {
+                    // The tides only win inside the hole's reach: it falls in whole.
+                    double v[3] = {0.0, 0.0, 0.3 * kerr::circularZamoSpeed(spin, 30.0, true)};
+                    if (addFromZamo(spin, 30.0, kHalfPi, uni(m_rng) * 6.28, v, BodyKind::Star, "Swallowed star")) {
+                        bodies.back().temperature = 5800.0f;
+                        bodies.back().radius = static_cast<float>(std::max(rStar, 0.05));
+                        bodies.back().mass = 1.0 / massSolar;
+                    }
+                    logEvent(format("A Sun-like star would be torn apart only inside r_t = %.3g M, within this hole's "
+                                    "reach (%.2f M): it is swallowed whole, as by any hole above the Hills mass "
+                                    "(1.1e8 Suns).", rt, rmb));
+                } else {
+                    tidalStar(std::max(rt / 2.3, iscoPro * 1.3), std::max(40.0, 2.5 * rt), 20.0, rStar, rt,
+                              "Doomed star");
+                    logEvent(format("A Sun-like star at its true size (%.3g M across) is torn apart within r_t = "
+                                    "%.3g M.", 2.0 * rStar, rt));
+                }
+            } else {
+                // A bound, eccentric orbit (periapsis 7 M, apoapsis 40 M) tilted 20 degrees,
+                // released at apoapsis, plunging to well inside the tidal radius (16 M). Its
+                // debris stays bound, winding around the hole on precessing orbits. (A star
+                // falling from far away would leave half its debris escaping and the rest
+                // returning only after many thousands of M.)
+                tidalStar(std::max(7.0 * S, iscoPro * 1.3), 40.0 * S, 20.0, 1.5 * S, 16.0 * S, "Doomed star");
+            }
             break;
         case Preset::GrazingStar:
             // Periapsis 14 M, just outside its tidal radius of 12 M (beta = 0.86): close
             // to the edge of disruption, which comes near beta = 0.9.
-            tidalStar(14.0, 45.0, -12.0, 1.3f, 12.0f, "Grazing star");
+            tidalStar(14.0 * S, 45.0 * S, -12.0, 1.3 * S, 12.0 * S, "Grazing star");
             break;
         case Preset::BinaryStar: {
             // The pair's center of mass falls from 55 M to 6.5 M; the pair is 2.5 M
             // across, so the hole's tide beats their mutual pull near periapsis.
             double v[3];
-            if (!apoapsisVelocity(std::max(6.5, iscoPro * 1.3), 55.0, 0.0, v) ||
-                !addFromZamo(spin, 55.0, kHalfPi, uni(m_rng) * 6.28, v, BodyKind::Star, "Binary A")) {
+            if (!apoapsisVelocity(std::max(6.5 * S, iscoPro * 1.3), 55.0 * S, 0.0, v) ||
+                !addFromZamo(spin, 55.0 * S, kHalfPi, uni(m_rng) * 6.28, v, BodyKind::Star, "Binary A")) {
                 logEvent("Could not set up the binary's orbit.");
                 break;
             }
             const size_t a = bodies.size() - 1;
             bodies[a].temperature = 9500.0f;
-            bodies[a].radius = 0.35f;
+            bodies[a].radius = 0.35f * fS;
             bodies[a].mass = 0.02;
             // Separated along r, orbiting each other in a plane across the orbit.
-            if (addCompanion(spin, a, 0.02, 2.5, 90.0, BodyKind::Star, "Binary B")) {
+            if (addCompanion(spin, a, 0.02, 2.5 * S, 90.0, BodyKind::Star, "Binary B")) {
                 bodies.back().temperature = 4500.0f;
-                bodies.back().radius = 0.35f;
+                bodies.back().radius = 0.35f * fS;
             }
             logEvent("A binary star falls toward the hole.");
             break;
         }
         case Preset::PlanetWithMoon: {
-            if (!addCircular(spin, 22.0, true, uni(m_rng) * 6.28, BodyKind::GasGiant, "Giant planet")) break;
+            if (!addCircular(spin, 22.0 * S, true, uni(m_rng) * 6.28, BodyKind::GasGiant, "Giant planet")) break;
             const size_t p = bodies.size() - 1;
-            bodies[p].radius = 0.6f;
-            bodies[p].spinRate = 0.1f;
+            bodies[p].radius = 0.6f * fS;
+            bodies[p].spinRate = static_cast<float>(0.1 / tS);
             bodies[p].mass = 0.006;
-            if (addCompanion(spin, p, 1e-6, 1.1, 0.0, BodyKind::RockyPlanet, "Moon")) {
-                bodies.back().radius = 0.2f;
-                bodies.back().spinRate = 0.05f;
+            if (addCompanion(spin, p, 1e-6, 1.1 * S, 0.0, BodyKind::RockyPlanet, "Moon")) {
+                bodies.back().radius = 0.2f * fS;
+                bodies.back().spinRate = static_cast<float>(0.05 / tS);
             }
             break;
         }
         case Preset::GasCloud: {
-            const double r = 35.0;
-            double v[3] = {0.0, -0.08, 0.6 * kerr::circularZamoSpeed(spin, r, true)};
-            pendingDebris.push_back(
-                {debris::cloud(spin, r, kHalfPi, uni(m_rng) * 6.28, v, 0.8, true, 100000, 6000.0f, m_rng), true});
+            const double r = 35.0 * S;
+            double v[3] = {0.0, -0.08 * vS, 0.6 * kerr::circularZamoSpeed(spin, r, true)};
+            pendingDebris.push_back({debris::cloud(spin, r, kHalfPi, uni(m_rng) * 6.28, v, 0.8 * S, true, 100000,
+                                                   6000.0f, m_rng, surface),
+                                     true});
             logEvent("A gas cloud falls toward the hole.");
             break;
         }
         case Preset::DebrisRing:
-            pendingDebris.push_back({debris::ring(spin, std::max(9.0, iscoPro * 1.4), 13.0, 30.0, 150000, 3500.0f, m_rng), true});
+            pendingDebris.push_back({debris::ring(spin, std::max(9.0 * S, iscoPro * 1.4), 13.0 * S, 30.0, 150000,
+                                                  3500.0f, m_rng, surface),
+                                     true});
             logEvent("A tilted debris ring forms.");
+            break;
+        case Preset::MiniBlackHole: {
+            // 2% of the central mass, circling at 14 M on an orbit tilted 25 degrees.
+            const double r = std::max(14.0 * S, iscoPro * 1.5), tilt = 25.0 * kerr::kPi / 180.0, m = 0.02;
+            const double speed = kerr::circularZamoSpeed(spin, r, true);
+            double v[3] = {0.0, -std::sin(tilt) * speed, std::cos(tilt) * speed};
+            if (addFromZamo(spin, r, kHalfPi, uni(m_rng) * 6.28, v, BodyKind::MiniBlackHole, "Small black hole")) {
+                bodies.back().mass = m;
+                bodies.back().temperature = 0.0f;
+                bodies.back().radius = static_cast<float>(3.0 * std::sqrt(3.0) * m);  // its shadow
+            }
+            break;
+        }
+        case Preset::WhiteDwarfCompanion:
+            addEquatorial(spin, std::max(9.0 * S, iscoPro * 1.5), 30.0 * S, true, uni(m_rng) * 6.28,
+                          BodyKind::WhiteDwarf, "White dwarf");
+            style(25000.0f, 0.25f);
             break;
     }
 }
@@ -504,7 +613,7 @@ void BodySystem::addPreset(double spin, Preset preset) {
 void BodySystem::recordTrail(Body& body, double spin) {
     auto p = kerr::toCartesian(spin, body.state.r, body.state.theta, body.state.phi);
     glm::vec3 pos(static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2]));
-    if (body.trail.empty() || glm::length(pos - body.trail.back()) > 0.15f) {
+    if (body.trail.empty() || glm::length(pos - body.trail.back()) > 0.15f * static_cast<float>(scale)) {
         body.trail.push_back(pos);
         if (body.trail.size() > kMaxTrail) body.trail.pop_front();
     }
@@ -526,7 +635,7 @@ void BodySystem::disrupt(const Body& body, double spin) {
     const float temperature =
         body.temperature * static_cast<float>(std::pow(std::max(tidal::determinant(body.shape.F), 0.05), -2.0 / 3.0));
     pendingDebris.push_back({debris::deformedStar(spin, body.state.r, body.state.theta, body.state.phi, v, body.radius,
-                                                  F, Fdot, 150000, temperature, m_rng),
+                                                  F, Fdot, 150000, temperature, m_rng, surface),
                              false});
     logEvent(body.name + " was torn apart by tidal forces.");
 }
@@ -534,6 +643,7 @@ void BodySystem::disrupt(const Body& body, double spin) {
 void BodySystem::drift(double spin, double target) {
     const double rh = kerr::horizonRadius(spin);
     const double limit = kerr::interiorLimit(spin);
+    const bool star = surface > 0.0;
     std::vector<size_t> finished;
 
     for (size_t i = 0; i < bodies.size(); ++i) {
@@ -546,16 +656,16 @@ void BodySystem::drift(double spin, double target) {
             const double rate = clockRate(spin, b.constants, b.state);
             kerr::stepCoordinateTime(spin, b.constants, b.state, h);
             kerr::normalizeAngles(b.state);
-            if (b.kind == BodyKind::TidalStar && std::isfinite(b.state.r) && b.state.r > rh) {
+            if (b.kind == BodyKind::TidalStar && std::isfinite(b.state.r) && b.state.r > (star ? surface : rh)) {
                 tidal::advance(b.shape, tidal::tidalTensor(spin, b.constants, b.state),
                                tidal::frequencySquared(b.tidalRadius), h * rate);
                 b.maxStretch = std::max(b.maxStretch, static_cast<float>(tidal::stretch(b.shape.F)));
             }
 
             const History::Sample after = sampleOf(spin, b);
-            for (long long k = static_cast<long long>(std::floor(t0 / History::kStep)) + 1;
-                 k * History::kStep <= b.state.t + 1e-9; ++k) {
-                const float f = static_cast<float>((k * History::kStep - t0) / (b.state.t - t0));
+            for (long long k = static_cast<long long>(std::floor(t0 / history.step)) + 1;
+                 k * history.step <= b.state.t + 1e-9; ++k) {
+                const float f = static_cast<float>((k * history.step - t0) / (b.state.t - t0));
                 history.record(b.slot, k, mix(before, after, f));
                 history.length[b.slot] = std::min(History::kColumns, history.length[b.slot] + 1);
             }
@@ -566,13 +676,26 @@ void BodySystem::drift(double spin, double target) {
                 gone = true;
                 break;
             }
-            if (b.state.r < rh && !b.inside) {
+            if (star && b.state.r <= surface + 0.5 * b.radius) {
+                // It strikes the surface: the energy of the impact, measured by the surface,
+                // is (gamma - 1) of its rest mass. The app turns it into a hot spot.
+                const double gamma = impactGamma(spin, b, surfaceOmega);
+                impacts.push_back({b.state.theta, b.state.phi, b.state.t, gamma - 1.0, b.mass});
+                while (impacts.size() > kMaxImpacts) impacts.erase(impacts.begin());
+                accreted += b.mass;
+                ++impactCount;
+                logEvent(b.name + format(" hit the surface at %.3g c, releasing %.2g of its rest energy.",
+                                         std::sqrt(std::max(0.0, 1.0 - 1.0 / (gamma * gamma))), gamma - 1.0));
+                gone = true;
+            } else if (!star && b.state.r < rh && !b.inside) {
                 b.inside = true;
                 logEvent(b.name + " crossed the event horizon.");
             }
-            if (b.state.r < limit) {
+            if (gone) {
+                // Already handled.
+            } else if (!star && b.state.r < limit) {
                 gone = true;  // as deep as anything is followed
-            } else if (b.state.r > 3000.0) {
+            } else if (b.state.r > 3000.0 * scale) {
                 logEvent(b.name + " escaped to infinity.");
                 gone = true;
             } else if (b.kind == BodyKind::TidalStar && tidal::stretch(b.shape.F) > kDisruptionStretch) {
@@ -586,6 +709,29 @@ void BodySystem::drift(double spin, double target) {
         else b.state.t = target;
     }
     for (auto it = finished.rbegin(); it != finished.rend(); ++it) depart(*it);
+}
+
+void BodySystem::swallowByMiniHoles(double spin) {
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        if (bodies[i].kind != BodyKind::MiniBlackHole) continue;
+        const kerr::State& h = bodies[i].state;
+        const auto xh = kerr::toCartesian(spin, h.r, h.theta, h.phi);
+        for (size_t j = 0; j < bodies.size(); ++j) {
+            if (j == i) continue;
+            const Body& other = bodies[j];
+            const auto xo = kerr::toCartesian(spin, other.state.r, other.state.theta, other.state.phi);
+            const double d = std::sqrt((xo[0] - xh[0]) * (xo[0] - xh[0]) + (xo[1] - xh[1]) * (xo[1] - xh[1]) +
+                                       (xo[2] - xh[2]) * (xo[2] - xh[2]));
+            // Its horizon (2m, in units of M) plus the other body's size.
+            const double reach = 2.0 * bodies[i].mass + 0.5 * other.radius;
+            if (d > reach) continue;
+            bodies[i].mass += other.mass;
+            logEvent(other.name + " was swallowed by " + bodies[i].name + ".");
+            depart(j);
+            if (j < i) --i;
+            return;  // indices have shifted; the rest waits for the next step
+        }
+    }
 }
 
 void BodySystem::update(double spin, double dt, bool gravity) {
@@ -609,22 +755,29 @@ void BodySystem::update(double spin, double dt, bool gravity) {
         drift(spin, target);
     } else {
         // Kick, drift, kick, in steps short enough for the tightest pair.
+        const double maxStep = scale * std::sqrt(scale);  // 1 M, in scene time
         double t = time;
         for (int guard = 0; t < target - 1e-12 && guard < 10000; ++guard) {
             gather();
-            const double h = std::min(gravity::stepLimit(spin, members, 1.0), target - t);
+            const double h = std::min(gravity::stepLimit(spin, members, maxStep), target - t);
             kick(0.5 * h);
             drift(spin, t + h);
             kick(0.5 * h);
             t += h;
         }
     }
+    for (const Body& b : bodies) {
+        if (b.kind == BodyKind::MiniBlackHole) {
+            swallowByMiniHoles(spin);
+            break;
+        }
+    }
     time = target;
-    history.newest = static_cast<long long>(std::floor(time / History::kStep));
+    history.newest = static_cast<long long>(std::floor(time / history.step));
     // Light from anything in view left it at most this long ago (see fillGpu).
-    constexpr double kLightWindow = 800.0;
+    const double lightWindow = 800.0 * scale;
     for (size_t i = departed.size(); i-- > 0;) {
-        if (time - departed[i].lostTime > kLightWindow) {
+        if (time - departed[i].lostTime > lightWindow) {
             history.length[departed[i].body.slot] = 0;
             departed.erase(departed.begin() + static_cast<std::ptrdiff_t>(i));
         }
@@ -636,7 +789,7 @@ void BodySystem::respin(double oldSpin, double newSpin) {
     for (size_t i = bodies.size(); i-- > 0;) {
         Body& b = bodies[i];
         const double t = b.state.t;
-        if (b.state.r < kerr::interiorLimit(newSpin)) {
+        if (b.state.r < kerr::interiorLimit(newSpin) || (surface > 0.0 && b.state.r < surface)) {
             remove(i);
             continue;
         }
@@ -661,20 +814,27 @@ void BodySystem::respin(double oldSpin, double newSpin) {
 
 void BodySystem::fillGpu(double spin, bool lightDelay, double cameraR, GpuBodies& out) const {
     out = {};
+    // Everything goes out in render units: lengths and times in units of `scale` M.
+    const double inv = 1.0 / scale;
+    const float fInv = static_cast<float>(inv), fScale = static_cast<float>(scale);
     // Light from anything we can see left it at most about this long ago.
     const int window = std::min(History::kColumns - 1,
-                                static_cast<int>(std::ceil((cameraR * 1.5 + 200.0) / History::kStep)));
+                                static_cast<int>(std::ceil((cameraR * 1.5 + 200.0 * scale) / history.step)));
     float shellMin = 1e30f, shellMax = 0.0f;
     int n = 0;
     auto add = [&](const Body& b, double lostAgo) {
         if (n >= GpuBodies::kMax) return;
         const History::Sample now = sampleOf(spin, b);
         GpuBody& g = out.bodies[n++];
-        g.positionRadius = glm::vec4(glm::vec3(now.position), b.radius);
-        g.fourVelocity = now.u;
-        g.params = glm::vec4(b.temperature, b.brightness, static_cast<float>(b.kind), b.seed);
+        const bool hole = b.kind == BodyKind::MiniBlackHole;
+        g.positionRadius = glm::vec4(glm::vec3(now.position) * fInv, b.radius * fInv);
+        // u^t and u^r are dimensionless; u^theta and u^phi are rates per unit length.
+        g.fourVelocity = glm::vec4(now.u.x, now.u.y, now.u.z * fScale, now.u.w * fScale);
+        // A small black hole carries its mass (render units) where stars keep their temperature.
+        g.params = glm::vec4(hole ? static_cast<float>(b.mass * inv) : b.temperature, b.brightness,
+                             static_cast<float>(b.kind), b.seed);
         const double angle = std::fmod(b.spinRate * b.state.t, 2.0 * kerr::kPi);
-        g.motion = glm::vec4(static_cast<float>(angle), b.spinRate, static_cast<float>(b.slot),
+        g.motion = glm::vec4(static_cast<float>(angle), b.spinRate * fScale, static_cast<float>(b.slot),
                              static_cast<float>(history.length[b.slot]));
         g.shapeA = now.shapeA;
         g.shapeB = now.shapeB;
@@ -693,9 +853,9 @@ void BodySystem::fillGpu(double spin, bool lightDelay, double cameraR, GpuBodies
                     fastest = std::max(fastest, glm::length(glm::vec3(later) - glm::vec3(sample)));
                 }
             }
-            fastest /= static_cast<float>(History::kStep);
-            const float sinceNewest = static_cast<float>(time - history.newest * History::kStep);
-            if (sinceNewest > 1e-6f && len > 0) {
+            fastest /= static_cast<float>(history.step);
+            const float sinceNewest = static_cast<float>(time - history.newest * history.step);
+            if (sinceNewest > 1e-6f * fScale && len > 0) {
                 fastest = std::max(fastest, glm::length(glm::vec3(now.position) - glm::vec3(row[column(history.newest)])) /
                                                 sinceNewest);
             }
@@ -703,11 +863,14 @@ void BodySystem::fillGpu(double spin, bool lightDelay, double cameraR, GpuBodies
         // Light-travel delay changes a little faster than distance along a ray; keep a margin.
         g.shapeB.w = 1.2f * fastest + 0.01f;
         // The Cartesian mapping stretches distances by up to |a| near the hole, and a
-        // tidally deformed star reaches out to its longest axis.
-        const float margin = b.radius * b.maxStretch + static_cast<float>(spin) + 0.5f;
-        g.range = glm::vec4(rMin - margin, rMax + margin, static_cast<float>(lostAgo), b.radius * b.maxStretch * 1.01f);
-        shellMin = std::min(shellMin, rMin - margin);
-        shellMax = std::max(shellMax, rMax + margin);
+        // tidally deformed star reaches out to its longest axis. A small black hole bends
+        // rays passing well outside its shadow.
+        const double reach = hole ? kLensReach * b.mass : b.radius * b.maxStretch;
+        const double margin = reach + spin + 0.5 * scale;
+        g.range = glm::vec4(static_cast<float>((rMin - margin) * inv), static_cast<float>((rMax + margin) * inv),
+                            static_cast<float>(lostAgo * inv), static_cast<float>(reach * 1.01 * inv));
+        shellMin = std::min(shellMin, g.range.x);
+        shellMax = std::max(shellMax, g.range.y);
     };
     for (const Body& b : bodies) add(b, -1.0);
     // Gone bodies are seen only through their light still in flight.
@@ -716,6 +879,6 @@ void BodySystem::fillGpu(double spin, bool lightDelay, double cameraR, GpuBodies
     }
     out.info = glm::ivec4(n, column(history.newest), lightDelay ? 1 : 0, History::kColumns);
     out.shell = glm::vec4(std::max(shellMin, 0.0f), shellMax,
-                          static_cast<float>((time - history.newest * History::kStep) / History::kStep),
-                          static_cast<float>(History::kStep));
+                          static_cast<float>((time - history.newest * history.step) / history.step),
+                          static_cast<float>(history.step * inv));
 }

@@ -1,5 +1,6 @@
 #include "app.h"
 
+#include "central.h"
 #include "gravity.h"
 #include "kerr.h"
 
@@ -11,6 +12,7 @@
 #include <imgui_impl_opengl3.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -26,8 +28,19 @@ const std::map<std::string, Preset>& presetNames() {
         {"planet", Preset::RockyPlanet},    {"gas-giant", Preset::GasGiant},    {"pulsar", Preset::Pulsar},
         {"tde", Preset::TidalDisruption},   {"cloud", Preset::GasCloud},        {"ring", Preset::DebrisRing},
         {"grazing", Preset::GrazingStar},   {"binary", Preset::BinaryStar},     {"moon", Preset::PlanetWithMoon},
+        {"mini-hole", Preset::MiniBlackHole}, {"white-dwarf", Preset::WhiteDwarfCompanion},
     };
     return names;
+}
+
+// Command-line name of a catalogue entry: "Sirius B" -> "sirius-b", "Sgr A*" -> "sgr-a".
+std::string centralKey(const char* label) {
+    std::string key;
+    for (const char* c = label; *c; ++c) {
+        if (*c == ' ') key += '-';
+        else if (*c != '*') key += static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
+    }
+    return key;
 }
 
 void APIENTRY glDebugCallback(GLenum, GLenum type, GLuint, GLenum severity, GLsizei, const GLchar* message,
@@ -95,8 +108,17 @@ void printUsage() {
         "Black Hole Simulator: real-time ray tracing of a rotating (Kerr) black hole.\n\n"
         "usage: blackhole [options]\n"
         "  --size WxH             window size (default 1600x900)\n"
-        "  --spin A               black hole spin a/M in [0, 0.999]\n"
-        "  --distance R           camera distance in M\n"
+        "  --central NAME         the object at the center:\n"
+        "                           earth jupiter brown-dwarf red-dwarf sun red-giant white-dwarf\n"
+        "                           sirius-b neutron-star pulsar magnetar stellar-black-hole sgr-a m87\n"
+        "  --mass MSUN            its mass in solar masses (sets the physical units)\n"
+        "  --radius-km KM         its radius in km\n"
+        "  --compactness R        its radius in M (R/M); below 9/4 it collapses\n"
+        "  --temperature K        its surface temperature\n"
+        "  --field G              its magnetic field in gauss (neutron stars, white dwarfs)\n"
+        "  --physical-units       readouts in km, AU, seconds and hours too\n"
+        "  --spin A               spin J/M^2 (a/M for a black hole, in [0, 0.999])\n"
+        "  --distance R           camera distance in M (around a star or planet, in units of R/6)\n"
         "  --inclination DEG      camera angle from the spin axis (90 = edge-on)\n"
         "  --azimuth DEG          camera azimuth\n"
         "  --fov DEG              vertical field of view\n"
@@ -125,7 +147,7 @@ void printUsage() {
         "                           orbits:  isco circular retrograde precessing zoom-whirl\n"
         "                                    polar plunge flyby cluster\n"
         "                           objects: planet gas-giant pulsar tde grazing binary moon\n"
-        "                                    cloud ring einstein-ring\n"
+        "                                    cloud ring einstein-ring mini-hole white-dwarf\n"
         "  --advance T            run the simulation for T M before starting\n"
         "  --scale S              ray tracing resolution scale (0.25 to 2)\n"
         "  --no-disk              hide the accretion disk\n"
@@ -245,6 +267,36 @@ bool parseArguments(int argc, char** argv, LaunchOptions& out, std::string& erro
             int c = choice({"default", "m87", "sgra", "gargantua", "cygnus"});
             if (c < 0) return false;
             out.scene = c;
+        } else if (arg == "--central") {
+            const char* name = value();
+            if (!name) return false;
+            const auto& list = central::catalog();
+            int found = -1;
+            for (size_t k = 0; k < list.size(); ++k) {
+                if (centralKey(list[k].label) == name) found = static_cast<int>(k);
+            }
+            if (found < 0) {
+                error = std::string("unknown central object: ") + name;
+                return false;
+            }
+            out.central = found;
+        } else if (arg == "--mass") {
+            if (!number(v)) return false;
+            out.massSolar = std::clamp(v, 1e-8, 1e11);
+        } else if (arg == "--radius-km") {
+            if (!number(v)) return false;
+            out.radiusKm = std::max(v, 1e-3);
+        } else if (arg == "--compactness") {
+            if (!number(v)) return false;
+            out.compactness = std::max(v, 0.5);
+        } else if (arg == "--temperature") {
+            if (!number(v)) return false;
+            out.surfaceTemperature = std::clamp(v, 10.0, 1e8);
+        } else if (arg == "--field") {
+            if (!number(v)) return false;
+            out.magneticField = std::clamp(v, 0.0, 1e16);
+        } else if (arg == "--physical-units") {
+            out.physicalUnits = true;
         } else if (arg == "--ride") {
             if (!number(v)) return false;
             out.ride = static_cast<int>(v);
@@ -376,13 +428,29 @@ bool App::init(const LaunchOptions& options, const std::filesystem::path& shader
 
 void App::applyOptions(const LaunchOptions& o) {
     if (o.scene) applyScene(*o.scene);
-    if (o.spin) m_settings.spin = *o.spin;
-    m_lastSpin = m_settings.spin;
-    if (o.distance) m_camera.r = *o.distance;
+    if (o.central) applyCentral(*o.central);
+    central::Object& c = m_settings.central;
+    if (o.massSolar) {
+        // Same size in km, unless a white dwarf or neutron star follows its mass-radius relation.
+        const double km = central::lengthKm(c.radius, c.massSolar);
+        c.massSolar = *o.massSolar;
+        double followed = 0.0;
+        if (c.kind == central::Kind::WhiteDwarf) followed = central::whiteDwarfRadiusKm(c.massSolar);
+        if (c.kind == central::Kind::NeutronStar) followed = central::neutronStarRadiusKm(c.massSolar);
+        if (!c.hasHorizon()) c.radius = (followed > 0.0 ? followed : km) / (central::kKmPerSolarMass * c.massSolar);
+    }
+    if (o.radiusKm && !c.hasHorizon()) c.radius = *o.radiusKm / (central::kKmPerSolarMass * c.massSolar);
+    if (o.compactness && !c.hasHorizon()) c.radius = *o.compactness;
+    if (o.surfaceTemperature) c.surfaceTemperature = *o.surfaceTemperature;
+    if (o.magneticField) c.magneticField = *o.magneticField;
+    if (o.physicalUnits) m_settings.physicalUnits = true;
+    if (o.spin) c.chi = *o.spin;
+    syncCentral(0.0, 0.0f);
+    if (o.distance) m_camera.r = *o.distance * sceneScale();
     if (o.inclinationDeg) m_camera.theta = std::clamp(*o.inclinationDeg, 1.0, 179.0) * kerr::kPi / 180.0;
     if (o.azimuthDeg) m_camera.phi = *o.azimuthDeg * kerr::kPi / 180.0;
     if (o.fov) m_camera.fovDeg = *o.fov;
-    m_camera.r = std::max(m_camera.r, kerr::horizonRadius(m_settings.spin) + 0.3);
+    m_camera.r = std::max(m_camera.r, m_camera.minDistance(m_settings.spin));
     if (o.sky) m_settings.skyMode = *o.sky;
     if (o.renderScale) m_settings.renderScale = *o.renderScale;
     if (o.relativity) m_settings.relativity = *o.relativity;
@@ -415,8 +483,11 @@ void App::applyOptions(const LaunchOptions& o) {
     if (o.ride && *o.ride >= 0 && *o.ride < static_cast<int>(m_bodies.bodies.size())) {
         rideWith(m_bodies.bodies[*o.ride].slot);
     }
+    // --advance is in M around a black hole, in scene time (scale^1.5 M) around a bigger object.
+    const double tScale = sceneScale() * std::sqrt(sceneScale());
     for (double t = 0.0; t < o.advance; t += 1.0) {
-        const double dt = std::min(1.0, o.advance - t);
+        const double dt = std::min(1.0, o.advance - t) * tScale;
+        syncCentral(dt, 0.0f);
         advanceSimulation(dt);
         syncRide(dt);
     }
@@ -431,6 +502,10 @@ void App::applyOptions(const LaunchOptions& o) {
                     trajectory::rayEndName(r.end));
         std::printf("  r_end = %.3f  g = %.3f  turns = %.2f  r_min = %.3f  delay = %.1f M  b = %.3f  q = %.3f\n",
                     r.rEnd, r.g, r.turns, r.rMin, r.delay, r.b, r.q);
+        if (r.end == trajectory::RayEnd::Surface) {
+            std::printf("  left the surface at theta = %.3f, %.1f degrees from the normal (its frame)\n", r.surfaceTheta,
+                        std::acos(std::clamp(r.emissionCos, -1.0, 1.0)) * 180.0 / kerr::kPi);
+        }
     }
 }
 
@@ -456,7 +531,7 @@ bool App::pressed(int key) {
 
 void App::handleInput(float dt) {
     ImGuiIO& io = ImGui::GetIO();
-    const double minR = kerr::horizonRadius(m_settings.spin) + 0.3;
+    const double minR = m_camera.minDistance(m_settings.spin);
     const bool moving = m_camera.motion != CameraMotion::Hover;
 
     // Mouse: a drag belongs to the camera only if it started outside the UI.
@@ -553,7 +628,7 @@ double App::approachSlowdown() const {
     const bool falling = m_camera.motion == CameraMotion::FreeFall ||
                          (m_camera.motion == CameraMotion::RideAlong && m_camera.path.vr < 0.0);
     if (!falling) return 1.0;
-    const double x = m_camera.r / (4.0 * kerr::horizonRadius(m_settings.spin));
+    const double x = m_camera.r / (4.0 * central::boundaryRadius(m_settings.spin, m_camera.surface));
     return std::clamp(x * x, 0.04, 1.0);
 }
 
@@ -585,6 +660,9 @@ void App::syncRide(double dt) {
 void App::updatePredictions() {
     const auto& bodies = m_bodies.bodies;
     const double spin = m_settings.spin;
+    // Scene units: lengths scale with the scene, times with its dynamical time.
+    const double scale = sceneScale(), tScale = scale * std::sqrt(scale);
+    const double surface = m_bodies.surface;
     std::vector<gravity::Member> members;
     std::vector<int> slots;
     for (const Body& b : bodies) {
@@ -607,17 +685,18 @@ void App::updatePredictions() {
         }
         if (!m_jointJob.valid() && (m_settings.showPredictions || m_ui.plannerOpen)) {
             m_jointSlots = slots;
-            double duration = m_settings.predictionTime;
+            double duration = m_settings.predictionTime * tScale;
             if (m_ui.plannerOpen && m_ui.plannerValid) {
-                gravity::Member planned{m_ui.plannerConstants, m_ui.plannerState, m_ui.launchMass, 0.1 * m_ui.launchRadius};
+                gravity::Member planned{m_ui.plannerConstants, m_ui.plannerState, m_ui.launchMass,
+                                        0.1 * m_ui.launchRadius * scale};
                 planned.s.t = m_bodies.time;
                 members.push_back(planned);
                 m_jointSlots.push_back(-1);
                 m_jointPlannerKey = m_ui.plannerKey;
-                duration = std::max(duration, 1500.0);
+                duration = std::max(duration, 1500.0 * tScale);
             }
-            m_jointJob = std::async(std::launch::async, [spin, members, duration]() {
-                return gravity::predict(spin, members, duration, 0.3, 3000);
+            m_jointJob = std::async(std::launch::async, [spin, members, duration, scale, tScale, surface]() {
+                return gravity::predict(spin, members, duration, 0.3 * scale, 3000, surface, 2000.0 * scale, tScale);
             });
         }
         if (m_ui.plannerKey != m_jointPlannerKey) m_ui.plannerJointValid = false;
@@ -631,7 +710,8 @@ void App::updatePredictions() {
     for (int k = 0; k < 2; ++k) {
         m_predictNext = (m_predictNext + 1) % static_cast<int>(bodies.size());
         const Body& b = bodies[m_predictNext];
-        m_predictions[b.slot] = trajectory::predict(spin, b.constants, b.state, m_settings.predictionTime, 0.3, 3000);
+        m_predictions[b.slot] = trajectory::predict(spin, b.constants, b.state, m_settings.predictionTime * tScale,
+                                                    0.3 * scale, 3000, surface, 2000.0 * scale);
     }
 }
 
@@ -680,7 +760,7 @@ void App::buildPaths() {
         for (size_t j = 0; j < path.points.size(); j += step) planned.points.push_back(toVec(path.points[j]));
         lines.push_back(std::move(planned));
     }
-    m_renderer.setPaths(lines, m_settings.spin);
+    m_renderer.setPaths(lines, m_settings.spin, sceneScale());
 }
 
 void App::inspectPixel(double x, double y) {
@@ -692,19 +772,27 @@ void App::inspectPixel(double x, double y) {
     const double look[3] = {dir.x, dir.y, dir.z};
 
     const double spin = m_settings.spin;
+    const CentralView view = centralView();
     trajectory::RayScene scene;
     scene.disk = m_settings.diskEnabled;
     scene.diskPrograde = m_settings.diskPrograde;
-    scene.diskInner = m_settings.diskInnerAtIsco ? kerr::iscoRadius(spin, m_settings.diskPrograde)
-                                                 : std::max<double>(m_settings.diskInner, kerr::horizonRadius(spin) + 0.05);
-    scene.diskOuter = std::max<double>(m_settings.diskOuter, scene.diskInner + 0.5);
-    scene.escapeRadius = std::max<double>(m_settings.escapeRadius, 1.5 * m_camera.r);
-    std::vector<int> owner;
+    scene.diskInner = view.diskInner;
+    scene.diskOuter = view.diskOuter;
+    scene.surface = view.surface;
+    scene.surfaceOmega = view.omega;
+    scene.escapeRadius = std::max<double>(m_settings.escapeRadius * sceneScale(), 1.5 * m_camera.r);
+    std::vector<int> owner, lensOwner;
     const int riding = ridingIndex();
     for (size_t i = 0; i < m_bodies.bodies.size(); ++i) {
         if (static_cast<int>(i) == riding) continue;
         const Body& b = m_bodies.bodies[i];
-        scene.spheres.push_back({kerr::toCartesian(spin, b.state.r, b.state.theta, b.state.phi), b.radius});
+        const auto pos = kerr::toCartesian(spin, b.state.r, b.state.theta, b.state.phi);
+        if (b.kind == BodyKind::MiniBlackHole) {
+            scene.lenses.push_back({pos, b.mass});
+            lensOwner.push_back(static_cast<int>(i));
+            continue;
+        }
+        scene.spheres.push_back({pos, b.radius});
         owner.push_back(static_cast<int>(i));
     }
 
@@ -715,7 +803,13 @@ void App::inspectPixel(double x, double y) {
     m_ui.inspectX = static_cast<float>(x);
     m_ui.inspectY = static_cast<float>(y);
     m_ui.inspectBody.clear();
-    if (m_ui.inspect.body >= 0) m_ui.inspectBody = m_bodies.bodies[owner[m_ui.inspect.body]].name;
+    if (m_ui.inspect.end == trajectory::RayEnd::Body && m_ui.inspect.body >= 0) {
+        m_ui.inspectBody = m_bodies.bodies[owner[m_ui.inspect.body]].name;
+    } else if (m_ui.inspect.end == trajectory::RayEnd::Lens && m_ui.inspect.body >= 0) {
+        m_ui.inspectBody = m_bodies.bodies[lensOwner[m_ui.inspect.body]].name;
+    } else if (m_ui.inspect.end == trajectory::RayEnd::Surface) {
+        m_ui.inspectBody = m_settings.central.name;
+    }
 }
 
 void App::applyScene(int scene) {
@@ -734,6 +828,14 @@ void App::applyScene(int scene) {
     s.jetsEnabled = false;
     s.jetPower = defaults.jetPower;
     s.spin = defaults.spin;
+    // Every famous scene has a black hole at the center.
+    s.central = defaults.central;
+    auto hole = [&](const char* name, double massSolar, float spin) {
+        s.central.name = name;
+        s.central.massSolar = massSolar;
+        s.central.chi = spin;
+        s.spin = spin;
+    };
     auto view = [&](double r, double inclinationDeg) {
         m_camera.r = r;
         m_camera.theta = inclinationDeg * kerr::kPi / 180.0;
@@ -741,7 +843,7 @@ void App::applyScene(int scene) {
     switch (scene) {
         case SceneM87:
             // EHT: about 17 degrees from the spin axis; a powerful jet nearly toward us.
-            s.spin = 0.94f;
+            hole("M87*", 6.5e9, 0.94f);
             view(38.0, 17.0);
             s.diskTemperature = 5200.0f;
             s.diskBrightness = 5.0f;
@@ -751,7 +853,7 @@ void App::applyScene(int scene) {
             break;
         case SceneSgrA:
             // Dim and turbulent; EHT images favour a fairly face-on view.
-            s.spin = 0.9f;
+            hole("Sgr A*", 4.3e6, 0.9f);
             view(30.0, 35.0);
             s.diskTemperature = 3800.0f;
             s.diskBrightness = 3.0f;
@@ -760,7 +862,7 @@ void App::applyScene(int scene) {
             break;
         case SceneGargantua:
             // Interstellar: near-maximal spin, nearly edge-on, frequency shifts left out.
-            s.spin = 0.999f;
+            hole("Gargantua", 1e8, 0.999f);
             view(26.0, 86.0);
             s.diskTemperature = 4600.0f;
             s.diskBrightness = 5.0f;
@@ -770,7 +872,7 @@ void App::applyScene(int scene) {
             break;
         case SceneCygnusX1: {
             // About 27 degrees inclination, a hot inner disk, and a blue supergiant companion.
-            s.spin = 0.998f;
+            hole("Cygnus X-1", 21.2, 0.998f);
             view(50.0, 27.0);
             s.diskTemperature = 16000.0f;
             s.diskBrightness = 3.0f;
@@ -786,6 +888,193 @@ void App::applyScene(int scene) {
             break;
     }
     m_ui.cameraStatus = std::string("Scene: ") + kSceneNames[std::clamp(scene, 0, SceneCount - 1)];
+    syncCentral(0.0, 0.0f);
+}
+
+void App::applyCentral(int index) {
+    const auto& list = central::catalog();
+    if (index < 0 || index >= static_cast<int>(list.size())) return;
+    const central::CatalogEntry& e = list[static_cast<size_t>(index)];
+    const Settings defaults;
+    m_settings.central = e.object;
+    m_settings.diskEnabled = e.disk;
+    m_settings.diskInnerAtIsco = true;
+    m_settings.diskOuter = defaults.diskOuter;
+    m_settings.jetsEnabled = false;
+    m_flashTime = -1e30;
+    m_burstFuel = 0.0;
+    m_ui.compactnessOrigin = -1;
+    // Rescale everything first, then put the camera where this object wants it.
+    syncCentral(0.0, 0.0f);
+    m_camera.reset();
+    syncCentral(0.0, 0.0f);
+    m_camera.r = std::max(e.cameraDistance * sceneScale(), m_camera.minDistance(m_settings.spin));
+    m_ui.centralStatus = std::string(e.label) + ": " + e.description;
+}
+
+void App::triggerFlash(double strength, double fadeScene, const std::string& message) {
+    const double scale = sceneScale();
+    m_flashTime = m_bodies.time;
+    m_flashStrength = strength;
+    m_flashFade = fadeScene * scale * std::sqrt(scale);
+    if (!message.empty()) {
+        m_bodies.logEvent(message);
+        m_ui.centralStatus = message;
+    }
+}
+
+void App::syncCentral(double simDt, float realDt) {
+    central::Object& o = m_settings.central;
+    // Pressure gives out: a collapse (to a black hole, or a white dwarf to a neutron star).
+    std::string message;
+    if (central::collapseIfUnstable(o, message)) {
+        m_ui.centralStatus = message;
+        m_bodies.logEvent(message);
+        m_screenFlash = 1.0f;
+        m_ui.compactnessOrigin = -1;
+        if (!o.hasHorizon()) triggerFlash(8.0, 30.0, "");  // a newborn neutron star blazes
+    }
+    // J is kept as the star is squeezed (only the spin slider stops at mass shedding),
+    // so a collapse inherits it; the surface itself never turns faster than it can.
+    m_settings.spin = static_cast<float>(o.metricSpin());
+
+    const double scale = o.sceneScale();
+    const double surface = o.hasHorizon() ? 0.0 : o.radius;
+    m_bodies.surface = surface;
+    m_bodies.surfaceOmega = o.hasHorizon() ? 0.0 : o.surfaceOmega();
+    m_bodies.massSolar = m_settings.physicalUnits && o.hasHorizon() ? o.massSolar : 0.0;
+    m_camera.surface = surface;
+    m_camera.scale = scale;
+
+    // Bodies, gas and camera keep their places and local velocities through a change of
+    // spin; a change of scale only changes the units (and the camera stays put in them).
+    if (m_settings.spin != m_lastSpin || scale != m_lastScale) {
+        if (m_settings.spin != m_lastSpin) {
+            m_bodies.respin(m_lastSpin, m_settings.spin);
+            m_camera.respin(m_lastSpin, m_settings.spin);
+        }
+        m_particles.reframe(m_lastSpin, m_settings.spin, m_lastScale, scale, surface);
+        if (scale != m_lastScale) {
+            if (m_camera.motion == CameraMotion::Hover) m_camera.r *= scale / m_lastScale;
+            m_bodies.setScale(scale, m_settings.spin);
+        }
+        m_lastSpin = m_settings.spin;
+        m_lastScale = scale;
+    }
+    if (m_camera.motion == CameraMotion::Hover) m_camera.r = std::max(m_camera.r, m_camera.minDistance(m_settings.spin));
+
+    // Thermonuclear flashes: hydrogen and helium piling up on a neutron star ignite in a
+    // Type I X-ray burst (about 5 MeV per nucleon, a few percent of what the infall
+    // released); on a white dwarf, a nova. Fuel arrives with the disk's accretion and
+    // with anything that strikes the surface.
+    const bool neutron = o.kind == central::Kind::NeutronStar, dwarf = o.kind == central::Kind::WhiteDwarf;
+    const double tScale = scale * std::sqrt(scale);
+    if (neutron || dwarf) {
+        double fuel = 0.0;
+        if (m_settings.diskEnabled && simDt > 0.0) {
+            fuel += m_settings.accretionRate / 0.01 * simDt / ((neutron ? 600.0 : 3000.0) * tScale);
+        }
+        const double gas = m_particles.accreted();
+        const double struck = static_cast<double>(m_bodies.impactCount);
+        fuel += 0.4 * std::max(0.0, struck + 2.0 * gas - m_lastAccreted);
+        m_lastAccreted = struck + 2.0 * gas;
+        m_burstFuel += fuel;
+        if (m_burstFuel >= 1.0) {
+            m_burstFuel = 0.0;
+            if (neutron) {
+                triggerFlash(4.0, 30.0, "Type I X-ray burst: the helium layer on the surface ignited and burned across the "
+                                        "star in seconds (~5 MeV per nucleon).");
+            } else {
+                triggerFlash(10.0, 300.0, "Nova: hydrogen accreted onto the white dwarf ignited in a thermonuclear runaway.");
+            }
+        }
+    }
+    if (o.magnetar && simDt > 0.0 &&
+        std::uniform_real_distribution<double>(0.0, 1.0)(m_rng) < simDt / (1500.0 * tScale)) {
+        triggerFlash(6.0, 20.0, "Magnetar flare: the crust cracked under the magnetic stress.");
+    }
+    m_screenFlash *= std::exp(-std::max(realDt, 0.0f) / 0.35f);
+}
+
+CentralView App::centralView() const {
+    const Settings& s = m_settings;
+    const central::Object& o = s.central;
+    const double spin = s.spin, scale = sceneScale();
+    CentralView v;
+    v.kind = static_cast<int>(o.kind);
+    v.detail = s.surfaceDetail;
+    v.brightness = s.surfaceBrightness;
+    const double isco = kerr::iscoRadius(spin, s.diskPrograde);
+    if (o.hasHorizon()) {
+        v.diskInner = s.diskInnerAtIsco ? isco : std::max<double>(s.diskInner * scale, kerr::horizonRadius(spin) + 0.05);
+    } else {
+        v.surface = o.radius;
+        v.omega = o.surfaceOmega();
+        v.phase = std::fmod(v.omega * m_bodies.time, 2.0 * kerr::kPi);
+        v.azimuthShift = kerr::azimuthShift(spin, o.radius);
+        v.temperature = static_cast<float>(central::displayTemperature(o.surfaceTemperature));
+        const double tilt = o.magneticTiltDeg * kerr::kPi / 180.0;
+        v.magneticAxis = glm::vec3(static_cast<float>(std::sin(tilt)), 0.0f, static_cast<float>(std::cos(tilt)));
+        v.pulsar = o.pulsar;
+        v.magnetar = o.magnetar;
+        const bool neutron = o.kind == central::Kind::NeutronStar, dwarf = o.kind == central::Kind::WhiteDwarf;
+        // Polar caps: ~1e7 K on a neutron star; on a magnetic white dwarf, where the
+        // accretion columns land.
+        if (neutron) v.hotSpotTemperature = static_cast<float>(central::displayTemperature(o.surfaceTemperature * 10.0));
+        if (dwarf && o.magneticField > 1e5 && s.diskEnabled) {
+            v.hotSpotTemperature = static_cast<float>(central::displayTemperature(o.surfaceTemperature * 3.0));
+        }
+        // Coronae and atmospheres, exaggerated so they show: a real corona is a millionth
+        // as bright as the Sun's surface, and Earth's air is 0.1% of its radius thick.
+        // The strength k makes the glow along a tangent line, k sqrt(2 pi R H), a set
+        // fraction of the surface brightness.
+        if (s.corona) {
+            auto glow = [&](double height, glm::vec3 color, double fraction) {
+                v.coronaHeight = height * o.radius;
+                v.coronaColor = color * static_cast<float>(fraction / std::sqrt(2.0 * kerr::kPi * o.radius * v.coronaHeight));
+            };
+            if (o.kind == central::Kind::Star) glow(0.08, glm::vec3(0.85f, 0.9f, 1.0f), 0.12);
+            if (o.kind == central::Kind::RockyPlanet) glow(0.015, glm::vec3(0.3f, 0.5f, 1.0f), 0.25);
+            if (o.kind == central::Kind::GasGiant) glow(0.01, glm::vec3(0.9f, 0.8f, 0.65f), 0.1);
+        }
+        // Magnetospheric truncation: the field stops the disk near half the Alfven radius,
+        // and the gas rides the field lines down to the poles.
+        double inner = s.diskInnerAtIsco ? std::max(isco, o.radius) : std::max<double>(s.diskInner * scale, o.radius);
+        if ((neutron || dwarf) && s.magnetosphere && s.diskEnabled && o.magneticField > 0.0) {
+            const double rKm = central::lengthKm(o.radius, o.massSolar);
+            const double rA = central::alfvenRadiusKm(o.magneticField, rKm, o.massSolar,
+                                                      s.accretionRate * central::eddingtonRate(o.massSolar)) /
+                              (central::kKmPerSolarMass * o.massSolar);
+            if (0.5 * rA > o.radius * 1.05) {
+                v.funnelRadius = 0.5 * rA;
+                inner = std::max(inner, v.funnelRadius);
+            }
+        }
+        v.diskInner = inner;
+        // Bodies that struck the surface, where they hit in the rotating frame (long faded
+        // ones are left out).
+        v.impactFade = 20.0 * scale * std::sqrt(scale);
+        for (const Impact& impact : m_bodies.impacts) {
+            const double age = m_bodies.time - impact.time;
+            if (age > 20.0 * v.impactFade) continue;
+            const double lon = impact.phi - v.azimuthShift - v.omega * impact.time;
+            const double st = std::sin(impact.theta);
+            const float strength = static_cast<float>(3.0 * std::clamp(std::sqrt(impact.energy / 0.05), 0.3, 4.0));
+            v.impacts.push_back(glm::vec4(static_cast<float>(st * std::cos(lon)), static_cast<float>(st * std::sin(lon)),
+                                          static_cast<float>(std::cos(impact.theta)), strength));
+            v.impactAges.push_back(age);
+        }
+        if (v.impacts.size() > 8) {
+            v.impacts.erase(v.impacts.begin(), v.impacts.end() - 8);
+            v.impactAges.erase(v.impactAges.begin(), v.impactAges.end() - 8);
+        }
+    }
+    v.impactFade = 20.0 * scale * std::sqrt(scale);
+    v.diskOuter = std::max(s.diskOuter * scale, v.diskInner * 1.2);
+    v.flashAge = m_bodies.time - m_flashTime;
+    v.flashStrength = m_flashStrength;
+    v.flashFade = m_flashFade;
+    return v;
 }
 
 void App::addEinsteinRing() {
@@ -793,12 +1082,12 @@ void App::addEinsteinRing() {
     // local ZAMO: it falls almost straight in, staying lined up for a while.
     const double spin = m_settings.spin;
     const auto c = kerr::toCartesian(spin, m_camera.r, m_camera.theta, m_camera.phi);
-    const double scale = -40.0 / std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    const double scale = -40.0 * sceneScale() / std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
     const auto [r, theta, phi] = kerr::fromCartesian(spin, c[0] * scale, c[1] * scale, c[2] * scale);
     const double v[3] = {0.0, 0.0, 0.0};
     if (m_bodies.addFromZamo(spin, r, theta, phi, v, BodyKind::Star, "Ring star")) {
         m_bodies.bodies.back().temperature = 9000.0f;
-        m_bodies.bodies.back().radius = 1.6f;
+        m_bodies.bodies.back().radius = 1.6f * static_cast<float>(sceneScale());
         m_bodies.logEvent("A star sits exactly behind the hole: its light forms an Einstein ring.");
     }
 }
@@ -809,6 +1098,12 @@ void App::advanceSimulation(double dt) {
     for (const auto& batch : m_bodies.pendingDebris) m_particles.spawn(batch.particles, m_bodies.time, batch.existedBefore);
     m_bodies.pendingDebris.clear();
     GasParams gas;
+    const CentralView view = centralView();
+    gas.scale = sceneScale();
+    gas.surface = view.surface;
+    gas.surfaceShift = view.azimuthShift;
+    gas.surfacePhase = view.phase;
+    gas.impactFadeTime = view.impactFade;
     gas.physics = m_settings.gasPhysics;
     gas.collisionRate = m_settings.gasCollisions;
     gas.coolingTime = m_settings.gasCoolingTime;
@@ -830,6 +1125,19 @@ void App::advanceSimulation(double dt) {
     m_particles.update(spin, dt, gas);
     const bool wasInside = m_camera.insideHorizon(spin), wasEnded = m_camera.ended;
     m_camera.advance(spin, dt);
+    if (m_camera.landed) {
+        // Touchdown on a star or planet.
+        m_camera.landed = false;
+        const central::Object& o = m_settings.central;
+        const double v = m_camera.landingSpeed;
+        const double g = central::accelerationSI(central::surfaceGravity(o.radius), o.massSolar) / 9.80665;
+        char text[400];
+        std::snprintf(text, sizeof(text),
+                      "You landed on the surface at %.3g c (gamma %.3g). Surface gravity: %.3g g. Clocks here run at "
+                      "%.4g%% of the rate far away.",
+                      v, 1.0 / std::sqrt(std::max(1.0 - v * v, 1e-12)), g, 100.0 * central::surfaceClockRate(o.radius));
+        m_ui.cameraStatus = text;
+    }
     if (m_camera.insideHorizon(spin) && !wasInside && m_camera.motion != CameraMotion::Hover) {
         m_ui.cameraStatus = "You crossed the event horizon. Nothing marked the moment, but there is no way "
                             "back: from here every path, even light's, leads inward.";
@@ -943,16 +1251,11 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
         ImGui::NewFrame();
         if (!headless) handleInput(dt);
 
-        // Simulation
-        if (m_settings.spin != m_lastSpin) {
-            m_bodies.respin(m_lastSpin, m_settings.spin);
-            m_particles.respin(m_lastSpin, m_settings.spin);
-            m_camera.respin(m_lastSpin, m_settings.spin);
-            m_lastSpin = m_settings.spin;
-            m_camera.r = std::max(m_camera.r, kerr::horizonRadius(m_settings.spin) + 0.3);
-        }
+        // Simulation. Time runs in scene units: the dynamical time grows as scale^1.5.
         const bool advance = !m_settings.paused && !screenshotMode;
-        const double simDt = advance ? dt * m_settings.timeScale * approachSlowdown() : 0.0;
+        const double tScale = sceneScale() * std::sqrt(sceneScale());
+        const double simDt = advance ? dt * m_settings.timeScale * tScale * approachSlowdown() : 0.0;
+        syncCentral(simDt, dt);
         advanceSimulation(simDt);
         syncRide(simDt);
         if (m_camera.lookAhead && m_camera.motion != CameraMotion::Hover) m_camera.faceVelocity(m_settings.spin);
@@ -964,7 +1267,7 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
                 m_camera.phi = m_recording.startPhi + 2.0 * kerr::kPi * progress;
             } else if (m_recording.cameraPath == RecordPushIn) {
                 m_camera.r = std::max(m_recording.startR * std::pow(0.3, progress),
-                                      kerr::horizonRadius(m_settings.spin) + 1.0);
+                                      m_camera.minDistance(m_settings.spin) + 0.7 * sceneScale());
             }
         } else if (m_settings.autoOrbit && !headless && m_camera.motion == CameraMotion::Hover) {
             m_camera.orbit(m_settings.autoOrbitSpeed * dt, 0.0);
@@ -984,13 +1287,17 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
         buildPaths();
         GpuBodies gpuBodies;
         m_bodies.fillGpu(m_settings.spin, m_settings.lightDelay, m_camera.r, gpuBodies);
+        const CentralView view = centralView();
         FrameInputs in;
         in.settings = &m_settings;
         in.camera = &m_camera;
         in.bodies = &gpuBodies;
         in.particles = &m_particles;
+        in.central = &view;
         in.skipBody = ridingIndex();
         in.spin = m_settings.spin;
+        in.scale = sceneScale();
+        in.exposureBoost = 1.0f + 6.0f * m_screenFlash;
         in.time = m_bodies.time;
         in.width = m_recording.active ? m_recording.width : fbw;
         in.height = m_recording.active ? m_recording.height : fbh;
@@ -1005,6 +1312,7 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
         ui.recordTotal = m_recording.total;
         ui.predictions = &m_predictions;
         ui.slowdown = approachSlowdown();
+        ui.scale = sceneScale();
         if (!headless || options.screenshotUi) drawUi(ui);
         ImGui::Render();
         if (headless) {
@@ -1021,6 +1329,11 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
         if (ui.rideRequested >= 0) rideWith(ui.rideRequested);
         if (ui.sceneRequested >= 0) applyScene(ui.sceneRequested);
         if (ui.einsteinRingRequested) addEinsteinRing();
+        if (ui.centralRequested >= 0) applyCentral(ui.centralRequested);
+        if (ui.burstRequested) {
+            const bool dwarf = m_settings.central.kind == central::Kind::WhiteDwarf;
+            triggerFlash(dwarf ? 10.0 : 4.0, dwarf ? 300.0 : 30.0, dwarf ? "Nova." : "Type I X-ray burst.");
+        }
         if (ui.stopRecordingRequested) stopRecording();
         if (ui.recordRequested && !m_recording.active) {
             const VideoSize& size = kVideoSizes[m_ui.videoSize];
@@ -1038,6 +1351,16 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
                 exitCode = 2;
             }
             saveScreenshot(options.screenshotPath);
+            {
+                const central::Object& o = m_settings.central;
+                std::printf("  central: %s (%s), M = %.4g Msun, a = %.4f, scene scale %.4g", o.name.c_str(),
+                            central::kindName(o.kind), o.massSolar, m_settings.spin, sceneScale());
+                if (!o.hasHorizon()) {
+                    std::printf(", R = %.6g M = %s, 1 + z = %.6f", o.radius, central::formatLength(o.radius, o.massSolar).c_str(),
+                                1.0 + central::surfaceRedshift(o.radius));
+                }
+                std::printf("\n");
+            }
             for (const Body& b : m_bodies.bodies) {
                 const auto x = kerr::toCartesian(m_settings.spin, b.state.r, b.state.theta, b.state.phi);
                 std::printf("  %-16s %-12s r = %8.3f  theta = %6.3f  E = %.6f  L = %+.5f  Q = %.5f  "
@@ -1054,6 +1377,8 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
                                            : m_camera.insideHorizon(m_settings.spin) ? " (inside the horizon)" : "");
             }
             for (const std::string& e : m_bodies.events) std::printf("  event: %s\n", e.c_str());
+            if (!m_ui.cameraStatus.empty()) std::printf("  camera status: %s\n", m_ui.cameraStatus.c_str());
+            if (!m_ui.centralStatus.empty()) std::printf("  central status: %s\n", m_ui.centralStatus.c_str());
             std::printf("GPU time per frame: %.2f ms at %dx%d traced\n", m_renderer.gpuMilliseconds(),
                         m_renderer.traceWidth(), m_renderer.traceHeight());
             break;

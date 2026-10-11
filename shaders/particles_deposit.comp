@@ -14,6 +14,7 @@ layout(std430, binding = 2) buffer Grid {
 
 uniform int uCount;
 uniform float uSpin;
+uniform float uMass;  // central mass in render units (see particle_common.glsl)
 uniform int uSeen;  // deposit the light-delayed copies
 uniform ivec3 uGridDims;
 uniform vec2 uGridLogR;
@@ -50,7 +51,7 @@ void main() {
         ph = p.seen.z;
         // The copy follows today's constants of motion (the gas may have nudged them
         // since): put its velocities back on vr^2 = R, vtheta^2 = Theta.
-        float delta = r * r - 2.0 * r + a * a;
+        float delta = r * r - 2.0 * uMass * r + a * a;
         float P = E * (r * r + a * a) - a * L;
         float x = L - a * E;
         float R = P * P - delta * (r * r + x * x + Q);
@@ -68,7 +69,7 @@ void main() {
     }
 
     float tDot, phiDot, accR, accTh;
-    massiveRhs(a, E, L, Q, r, th, vr, tDot, phiDot, accR, accTh);
+    massiveRhs(uMass, a, E, L, Q, r, th, vr, tDot, phiDot, accR, accTh);
     float sigma = r * r + a * a * cos(th) * cos(th);
     vec4 u = vec4(clamp(tDot / sigma, 0.0, 50.0), vr / sigma, vth / sigma, phiDot / sigma);
 

@@ -33,7 +33,11 @@ void Camera::orbit(double dPhi, double dTheta) {
 }
 
 void Camera::zoom(double factor, double minR) {
-    r = std::clamp(r * factor, minR, 2000.0);
+    r = std::clamp(r * factor, minR, 2000.0 * scale);
+}
+
+double Camera::minDistance(double spin) const {
+    return surface > 0.0 ? surface + 0.02 * scale : kerr::horizonRadius(spin) + 0.3;
 }
 
 void Camera::look(float dYaw, float dPitch) {
@@ -73,8 +77,12 @@ bool Camera::startFall(double spin, std::string& message) {
         message = "Falling freely.";
         return true;
     }
-    if (r < kerr::horizonRadius(spin) + 0.2) {
+    if (surface <= 0.0 && r < kerr::horizonRadius(spin) + 0.2) {
         message = "Too close to the horizon to start from rest.";
+        return false;
+    }
+    if (surface > 0.0 && r < surface + 0.05 * scale) {
+        message = "Already on the surface.";
         return false;
     }
     const double v[3] = {0.0, 0.0, 0.0};  // at rest relative to the ZAMO: zero angular momentum
@@ -87,7 +95,7 @@ bool Camera::startFall(double spin, std::string& message) {
 }
 
 bool Camera::hover(double spin, std::string& message) {
-    if (r < kerr::horizonRadius(spin) + 0.05) {
+    if (surface <= 0.0 && r < kerr::horizonRadius(spin) + 0.05) {
         message = "Nothing can hover inside the horizon: everything there must fall inward.";
         return false;
     }
@@ -124,14 +132,35 @@ void Camera::rideWith(int slot, const kerr::Constants& c, const kerr::State& s, 
 void Camera::advance(double spin, double dt) {
     if (motion == CameraMotion::Hover || motion == CameraMotion::RideAlong || ended || dt <= 0.0) return;
     const double limit = kerr::interiorLimit(spin);
+    const double ground = surface + 0.02 * scale;  // where a landing camera stops (stars and planets)
     const double target = path.t + dt;
     for (int guard = 0; path.t < target - 1e-12 && guard < 20000; ++guard) {
         const double h = std::min(target - path.t, kerr::suggestedTimeStep(spin, geodesic, path, 0.005));
         const kerr::Derivatives d = kerr::derivatives(spin, geodesic, path);
         properTime += h * kerr::metricAt(spin, path.r, path.theta).sigma / d.dt;  // dtau/dt = Sigma / (dt/dMino)
+        const kerr::State before = path;
         kerr::stepCoordinateTime(spin, geodesic, path, h);
         kerr::normalizeAngles(path);
-        if (path.r < limit || !std::isfinite(path.r)) {
+        if (surface > 0.0 && path.r <= ground) {
+            // Touchdown: measure the speed against the local ZAMO just before, then stand
+            // on the surface (held there like a hovering observer).
+            double v[3];
+            kerr::zamoVelocity(spin, geodesic, before, v);
+            landingSpeed = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            landed = true;
+            motion = CameraMotion::Hover;
+            rideSlot = -1;
+            r = ground;
+            theta = std::clamp(before.theta, 0.02, kerr::kPi - 0.02);
+            phi = std::fmod(before.phi, 2.0 * kerr::kPi);
+            // Look out along the ground toward the horizon (on a compact star it is lifted
+            // by light bending).
+            yaw = 0.0f;
+            pitch = 1.4f;  // nearly level, the ground just below the view
+            lookAhead = false;
+            return;
+        }
+        if ((surface <= 0.0 && path.r < limit) || !std::isfinite(path.r)) {
             ended = true;
             break;
         }
@@ -158,7 +187,9 @@ void Camera::respin(double oldSpin, double newSpin) {
 }
 
 glm::vec3 Camera::velocity(double spin) const {
-    if (motion == CameraMotion::Hover || r < kerr::horizonRadius(spin) + 0.05) return glm::vec3(0.0f);
+    if (motion == CameraMotion::Hover || (surface <= 0.0 && r < kerr::horizonRadius(spin) + 0.05)) {
+        return glm::vec3(0.0f);
+    }
     double v[3];
     kerr::zamoVelocity(spin, geodesic, path, v);
     return glm::vec3(static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2]));

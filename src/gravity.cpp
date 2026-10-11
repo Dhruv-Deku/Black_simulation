@@ -1,5 +1,7 @@
 #include "gravity.h"
 
+#include "central.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -148,8 +150,10 @@ bool interacting(const std::vector<Member>& members) {
 }
 
 std::vector<trajectory::Path> predict(double a, std::vector<Member> members, double duration, double minSpacing,
-                                      size_t maxPoints) {
-    const double rh = kerr::horizonRadius(a);
+                                      size_t maxPoints, double surface, double escapeRadius, double maxStep) {
+    // Black holes: stop just outside the horizon. Stars and planets: at the surface.
+    const double rh = surface > 0.0 ? surface - 0.02 : kerr::horizonRadius(a);
+    const trajectory::Fate fallsIn = surface > 0.0 ? trajectory::Fate::HitsSurface : trajectory::Fate::Plunges;
     std::vector<trajectory::Path> paths(members.size());
     std::vector<bool> done(members.size(), false);
     std::vector<std::array<double, 3>> last(members.size());
@@ -173,7 +177,7 @@ std::vector<trajectory::Path> predict(double a, std::vector<Member> members, dou
             }
         }
         if (active.empty()) break;
-        const double h = std::min(stepLimit(a, active, 1.0), duration - elapsed);
+        const double h = std::min(stepLimit(a, active, maxStep), duration - elapsed);
         kick(a, active, 0.5 * h);
         for (size_t k = 0; k < active.size(); ++k) {
             Member& m = active[k];
@@ -182,7 +186,7 @@ std::vector<trajectory::Path> predict(double a, std::vector<Member> members, dou
                 const double step = std::min(target - m.s.t, kerr::suggestedTimeStep(a, m.c, m.s, 0.01));
                 kerr::stepCoordinateTime(a, m.c, m.s, step);
                 kerr::normalizeAngles(m.s);
-                if (!std::isfinite(m.s.r) || m.s.r < rh + 0.02 || m.s.r > 2000.0) break;
+                if (!std::isfinite(m.s.r) || m.s.r < rh + 0.02 || m.s.r > escapeRadius) break;
             }
         }
         kick(a, active, 0.5 * h);
@@ -194,11 +198,11 @@ std::vector<trajectory::Path> predict(double a, std::vector<Member> members, dou
             const kerr::State& s = members[i].s;
             path.duration = elapsed;
             if (!std::isfinite(s.r) || s.r < rh + 0.02) {
-                path.fate = trajectory::Fate::Plunges;
+                path.fate = fallsIn;
                 done[i] = true;
                 continue;
             }
-            if (s.r > 2000.0) {
+            if (s.r > escapeRadius) {
                 path.fate = trajectory::Fate::Escapes;
                 done[i] = true;
                 continue;
