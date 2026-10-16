@@ -16,6 +16,9 @@ constexpr double kLogTMax = 5.3;  // log10 of the highest (200,000 K)
 // luminance 1. Hotter emitters are therefore brighter as well as bluer.
 std::vector<float> makeTable(int n);
 
+// Visible luminance of a blackbody at temperature T, relative to one at 6500 K.
+double luminance(double temperature);
+
 // Hue of a blackbody at temperature T, normalized so the largest channel is 1.
 glm::vec3 hue(double temperature);
 
