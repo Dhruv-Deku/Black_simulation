@@ -51,6 +51,56 @@ bool launch(double a, const Vec3& p, const Vec3& vel, float temperature, double 
     return true;
 }
 
+// Eigenvectors of a symmetric 3x3 matrix by Jacobi rotations: `along` belongs to the
+// largest eigenvalue, `across` to the other two.
+struct StretchAxes {
+    Vec3 along;
+    Vec3 across[2];
+};
+
+StretchAxes stretchAxes(tidal::Mat3 A) {
+    double V[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+    for (int sweep = 0; sweep < 30; ++sweep) {
+        const double off = A[0][1] * A[0][1] + A[0][2] * A[0][2] + A[1][2] * A[1][2];
+        if (off < 1e-24) break;
+        for (int p = 0; p < 2; ++p) {
+            for (int q = p + 1; q < 3; ++q) {
+                if (std::abs(A[p][q]) < 1e-300) continue;
+                const double theta = 0.5 * (A[q][q] - A[p][p]) / A[p][q];
+                const double t = (theta >= 0.0 ? 1.0 : -1.0) / (std::abs(theta) + std::sqrt(theta * theta + 1.0));
+                const double c = 1.0 / std::sqrt(t * t + 1.0), s = t * c;
+                for (int k = 0; k < 3; ++k) {  // A <- A J
+                    const double akp = A[k][p], akq = A[k][q];
+                    A[k][p] = c * akp - s * akq;
+                    A[k][q] = s * akp + c * akq;
+                }
+                for (int k = 0; k < 3; ++k) {  // A <- J^T A
+                    const double apk = A[p][k], aqk = A[q][k];
+                    A[p][k] = c * apk - s * aqk;
+                    A[q][k] = s * apk + c * aqk;
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const double vkp = V[k][p], vkq = V[k][q];
+                    V[k][p] = c * vkp - s * vkq;
+                    V[k][q] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    int big = 0;
+    for (int i = 1; i < 3; ++i) {
+        if (A[i][i] > A[big][big]) big = i;
+    }
+    StretchAxes out;
+    int n = 0;
+    for (int j = 0; j < 3; ++j) {
+        const Vec3 v = {V[0][j], V[1][j], V[2][j]};
+        if (j == big) out.along = v;
+        else out.across[n++] = v;
+    }
+    return out;
+}
+
 }  // namespace
 
 std::vector<ParticleInit> cloud(double a, double r, double theta, double phi, const double v[3], double radius,
@@ -78,7 +128,12 @@ std::vector<ParticleInit> cloud(double a, double r, double theta, double phi, co
         }
         const Vec3 p = {center[0] + offset[0], center[1] + offset[1], center[2] + offset[2]};
         ParticleInit init;
-        if (launch(a, p, vel, temperature * warmth(rng), surface, init)) out.push_back(init);
+        if (launch(a, p, vel, temperature * warmth(rng), surface, init)) {
+            // Shear stretches a cloud along its orbit: label it across (radially and vertically).
+            init.label[0] = static_cast<float>(dot(offset, ax.r) / radius);
+            init.label[1] = static_cast<float>(dot(offset, ax.theta) / radius);
+            out.push_back(init);
+        }
     }
     return out;
 }
@@ -91,6 +146,12 @@ std::vector<ParticleInit> deformedStar(double a, double r, double theta, double 
     const kerr::LocalAxes ax = blAxes(theta, phiBL);
     Vec3 vel;
     for (int i = 0; i < 3; ++i) vel[i] = v[0] * ax.r[i] + v[1] * ax.theta[i] + v[2] * ax.phi[i];
+
+    // The directions in the undeformed star that the tide stretches least: F^T F's
+    // eigenvectors (F's right singular vectors) other than the one of the largest
+    // eigenvalue. Coordinates along them label the parcels across the stream.
+    const tidal::Mat3 C = tidal::multiply(tidal::transpose(F), F);
+    const StretchAxes axes = stretchAxes(C);
 
     std::uniform_real_distribution<double> uni(-1.0, 1.0);
     std::uniform_real_distribution<float> warmth(0.9f, 1.1f);
@@ -108,7 +169,11 @@ std::vector<ParticleInit> deformedStar(double a, double r, double theta, double 
             u[i] = vel[i] + Fdot[i][0] * X[0] + Fdot[i][1] * X[1] + Fdot[i][2] * X[2];
         }
         ParticleInit init;
-        if (launch(a, p, u, temperature * warmth(rng), surface, init)) out.push_back(init);
+        if (launch(a, p, u, temperature * warmth(rng), surface, init)) {
+            init.label[0] = static_cast<float>(dot(X, axes.across[0]) / radius);
+            init.label[1] = static_cast<float>(dot(X, axes.across[1]) / radius);
+            out.push_back(init);
+        }
     }
     return out;
 }
@@ -135,7 +200,12 @@ std::vector<ParticleInit> ring(double a, double rInner, double rOuter, double ti
         const double speed = std::abs(kerr::circularZamoSpeed(a, R, prograde)) * (1.0 + 0.003 * jitter(rng));
         const Vec3 vel = {-s * speed, c * ct * speed, c * st * speed};
         ParticleInit init;
-        if (launch(a, p, vel, temperature * warmth(rng), surface, init)) out.push_back(init);
+        if (launch(a, p, vel, temperature * warmth(rng), surface, init)) {
+            // Shear stretches the ring along its orbits: label it radially and vertically.
+            init.label[0] = static_cast<float>((2.0 * R - rInner - rOuter) / std::max(rOuter - rInner, 1e-6));
+            init.label[1] = static_cast<float>(height / (0.03 * R));
+            out.push_back(init);
+        }
     }
     return out;
 }

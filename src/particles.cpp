@@ -14,19 +14,18 @@ struct GpuParticle {
     glm::vec4 constants;     // E, L, Q, gas density last frame
     glm::vec4 seen;          // the light-delayed copy: r, theta, phi, and the time it is at
     glm::vec4 seenVelocity;  // vr, vtheta, time created (-1e30: always existed), time lost
+    glm::vec4 label;         // Lagrangian labels across the stretch (ParticleInit::label), 0, 0
 };
-static_assert(sizeof(GpuParticle) == 80, "std430 layout");
+static_assert(sizeof(GpuParticle) == 96, "std430 layout");
 
-constexpr int kChannels = 6;
+// Per voxel: weight, four velocity (or temperature and velocity) sums, temperature,
+// and the two labels (see grid_resolve.comp).
+constexpr int kChannels = 8;
 constexpr float kDensityScale = 1e-3f;
 constexpr float kKelvinPerC2 = 1.3e7f;  // see particles_update.comp
 
 glm::ivec3 gridDims() {
     return {ParticleSystem::kGridR, ParticleSystem::kGridTheta, ParticleSystem::kGridPhi};
-}
-
-glm::vec2 gridLogR() {
-    return {std::log(ParticleSystem::kGridRMin), std::log(ParticleSystem::kGridRMax)};
 }
 
 }  // namespace
@@ -116,7 +115,8 @@ void ParticleSystem::spawn(const std::vector<ParticleInit>& particles, double ti
         const float vr = static_cast<float>(p.vr * k * k), vth = static_cast<float>(p.vtheta * k);
         data.push_back({glm::vec4(r, p.theta, p.phi, 1.0f), glm::vec4(vr, vth, p.temperature, weight),
                         glm::vec4(p.E, static_cast<float>(p.L * k), static_cast<float>(p.Q * k * k), 0.0f),
-                        glm::vec4(r, p.theta, p.phi, now), glm::vec4(vr, vth, created, 1e30f)});
+                        glm::vec4(r, p.theta, p.phi, now), glm::vec4(vr, vth, created, 1e30f),
+                        glm::vec4(p.label[0], p.label[1], 0.0f, 0.0f)});
     }
     // Write into the ring of slots, wrapping around over the oldest particles.
     size_t done = 0;
@@ -196,6 +196,7 @@ void ParticleSystem::update(double spin, double dt, const GasParams& gas) {
     m_update.set("uCollisionRate", static_cast<float>(gas.collisionRate / dynamical));
     m_update.set("uCoolingTime", static_cast<float>(std::max(gas.coolingTime, 1.0f) * dynamical));
     m_update.set("uFloorTemperature", gas.floorTemperature);
+    m_update.set("uDropRadius", 3.0f * m_gridRMax);
     const int bodyCount = static_cast<int>(std::min<size_t>(gas.bodies.size(), 32));
     m_update.set("uBodyCount", bodyCount);
     if (bodyCount > 0) {

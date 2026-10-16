@@ -121,6 +121,9 @@ void centralReadouts(UiContext& ctx) {
         const double gSI = central::accelerationSI(central::surfaceGravity(R), o.massSolar);
         row("Radius", printf1("%.5g M", R) + " = " + central::formatLength(R, o.massSolar),
             "In units of M = G M / c^2. The Sun is 471,000 M, a white dwarf ~10,000 M, a neutron star ~6 M.");
+        row("Size", central::sizeComparison(central::lengthKm(R, o.massSolar)),
+            "Its real size. Each object is framed to fill the view; the scale bar at the bottom of the view "
+            "shows how big things are, and bodies around it are drawn at their real sizes.");
         row("Compactness M/R", printf1("%.3g", 1.0 / R) + printf1("   (%.3g x Buchdahl)", R / central::kBuchdahlRadius),
             "No static star can be smaller than the Buchdahl limit, R = 9/4 M: below it no pressure holds it up.");
         row("Surface redshift", printf1("1 + z = %.6g", 1.0 + z) + printf1("  (%.3g km/s)", z * central::kSpeedOfLightKmS),
@@ -137,11 +140,15 @@ void centralReadouts(UiContext& ctx) {
         }
         row("Seen at once", printf1("%.1f%% of the surface", 100.0 * cachedFraction),
             "Light bending lets you see past the limb: below R = 3.52 M the whole surface is visible at once.");
-        row("Photon ring", R < 3.0 ? "outside the surface" : "inside the star (none)",
-            "Light can circle at r = 3M. Only a star smaller than that shows the photon ring.");
-        const double isco = kerr::iscoRadius(a, true);
-        row("ISCO", R < isco ? lengthText(s, isco) + " (outside: disk stops there)" : std::string("inside the star"),
-            "Innermost stable circular orbit. A neutron star (R ~ 5.8 M) is smaller than its ISCO.");
+        // Strong-gravity features only matter for compact objects: for a star or planet
+        // they lie thousands of times deeper than its surface.
+        if (R < 30.0) {
+            row("Photon ring", R < 3.0 ? "outside the surface" : "inside the star (none)",
+                "Light can circle at r = 3M. Only a star smaller than that shows the photon ring.");
+            const double isco = kerr::iscoRadius(a, true);
+            row("ISCO", R < isco ? lengthText(s, isco) + " (outside: disk stops there)" : std::string("inside the star"),
+                "Innermost stable circular orbit. A neutron star (R ~ 5.8 M) is smaller than its ISCO.");
+        }
         const central::SurfaceAccretion acc = central::surfaceEfficiency(a, R, o.surfaceOmega());
         row("Accretion: disk", printf1("%.4g%% of rest mass", 100.0 * acc.disk),
             "Energy released by gas spiralling through the disk to its inner edge, max(ISCO, R).");
@@ -160,6 +167,8 @@ void centralReadouts(UiContext& ctx) {
                 "stops near half of it; inside, gas flows along field lines onto the magnetic poles.");
         }
     } else {
+        row("Size", "horizon " + central::sizeComparison(central::lengthKm(kerr::horizonRadius(a), o.massSolar)),
+            "The event horizon's real size for this mass: 3 km across per solar mass without spin.");
         row("Accretion efficiency", printf1("%.4g%% of rest mass", 100.0 * central::blackHoleEfficiency(a)),
             "1 - E_isco: the energy a thin disk releases before the gas crosses the horizon. 5.7% without spin, "
             "32% at a = 0.998.");
@@ -300,8 +309,15 @@ void centralSection(UiContext& ctx) {
                  "holes cannot exceed 1. The slider stops at the mass-shedding limit, where the equator would fly "
                  "apart (Omega ~ 0.65 sqrt(M / R^3)). Outside, the Kerr metric with a = min(J/M^2, 0.99) is used: "
                  "right in mass and angular momentum, approximate in the quadrupole.");
-            ImGui::TextDisabled("Turns once every %s; Kerr spin a = %.3f", central::formatTime(2.0 * kerr::kPi /
-                                std::max(o.surfaceOmega(), 1e-300), o.massSolar).c_str(), s.spin);
+            const std::string period =
+                central::formatTime(2.0 * kerr::kPi / std::max(o.surfaceOmega(), 1e-300), o.massSolar);
+            if (o.radius < 30.0) {
+                ImGui::TextDisabled("Turns once every %s; Kerr spin a = %.3f", period.c_str(), s.spin);
+            } else {
+                // Frame dragging at the surface, omega ~ 2J/R^3, against the surface's own spin.
+                ImGui::TextDisabled("Turns once every %s; frame dragging %.2g of that", period.c_str(),
+                                    2.0 * o.chi / (o.radius * o.radius * o.radius) / std::max(o.surfaceOmega(), 1e-300));
+            }
             if (o.chi > o.maxChi() * 1.0001) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.65f, 0.3f, 1.0f));
                 ImGui::TextWrapped("Squeezed, it would spin faster than its surface can (mass shedding): the surface "
@@ -342,12 +358,56 @@ void centralSection(UiContext& ctx) {
             ImGui::SetItemTooltip(neutron ? "Helium accreted on a neutron star ignites and burns across the whole surface "
                                             "in seconds (a Type I X-ray burst)."
                                           : "Hydrogen accreted on a white dwarf ignites in a thermonuclear runaway.");
+            if (neutron) {
+                ImGui::Checkbox("Field lines", &s.fieldLines);
+                help("The dipole's closed field lines, r = L sin^2(theta) about the magnetic axis, out to the light "
+                     "cylinder c / Omega or the disk's edge, turning with the star and bent by its gravity like "
+                     "everything else. A magnetar's are twisted (~1 radian) and wrapped in a glow of electron-"
+                     "positron pairs. False color: this plasma shines in X-rays and radio, not visible light.");
+                ImGui::SameLine();
+                ImGui::Checkbox("Beams", &s.pulsarBeams);
+                help("A pulsar's twin beams, from the open field lines over its magnetic poles, at the opening angle "
+                     "the last open field line gives (28 degrees for the Crab, ~4 for a slow magnetar). Drawn as if "
+                     "they lit a faint haze; light far out left when the star had turned less, so fast pulsars' "
+                     "beams curve into a spiral. A real beam is seen only as a flash as it sweeps over you.");
+                ImGui::SliderFloat("Magnetosphere glow", &s.magnetosphereGlow, 0.05f, 10.0f, "%.2f",
+                                   ImGuiSliderFlags_Logarithmic);
+            }
         }
         ImGui::Checkbox("Surface detail", &s.surfaceDetail);
+        help("Granulation (convection cells sized from the pressure scale height, boiling at their real "
+             "lifetime), starspots in their real latitudes and groups, faculae, flares on red dwarfs, hot "
+             "polar caps and flares on neutron stars, impact hot spots. Fine detail fades in as you get close.");
         ImGui::SameLine();
         ImGui::Checkbox("Corona / atmosphere", &s.corona);
-        help("A star's corona and a planet's atmosphere, as a faint glow above the limb. Both are exaggerated so "
-             "they show: a real corona is a millionth as bright as the Sun's surface.");
+        help("A star's corona (and pink chromosphere), or a planet's air. The air is drawn at true scale: sunlight "
+             "scattered by molecules (blue), aerosols and ozone, 100 km thick on an Earth-sized planet. The "
+             "corona has the real Sun's profile and streamers, brightened (below) since the real one is a "
+             "millionth as bright as the disk.");
+        if (o.kind == central::Kind::RockyPlanet || o.kind == central::Kind::GasGiant) {
+            ImGui::Checkbox("Spacecraft maps", &s.planetMaps);
+            help("The Earth from NASA's Blue Marble (with the sea floor), its cloud cover and the Black Marble's city "
+                 "lights; Jupiter from Cassini's global map. The light, the air, the glint and the night side are "
+                 "still computed. Untick for the procedural planet (used for any planet that is not these two).");
+        }
+        if (o.kind == central::Kind::Star || dwarf || neutron) {
+            ImGui::Checkbox("Film colors", &s.filmColor);
+            help("A blackbody's true color is pale: the Sun is white, a 3,000 K red dwarf peach. Films and colorized "
+                 "solar images show stars warmer and deeper: the Sun golden with an orange limb, red dwarfs red. "
+                 "Only the hue changes; the brightness (limb darkening, spots, granulation, flares) is the physics. "
+                 "Untick for the true color.");
+            if (dwarf && s.diskEnabled) {
+                ImGui::SameLine();
+                ImGui::Checkbox("Companion", &s.companionStar);
+                help("The red dwarf feeding the disk (0.15 solar masses), filling its Roche lobe 57 radii away, and "
+                     "the stream of its gas falling from the L1 point along its ballistic path to the disk's rim.");
+            }
+        }
+        if (o.kind == central::Kind::Star && s.corona) {
+            ImGui::SliderFloat("Corona brightness", &s.coronaBoost, 1.0f, 1e6f, "x%.0f real", ImGuiSliderFlags_Logarithmic);
+            help("x1 is the real Sun's corona, a millionth of the disk's brightness, seen only when the disk is "
+                 "hidden (a total eclipse).");
+        }
         ImGui::SliderFloat("Surface brightness", &s.surfaceBrightness, 0.05f, 20.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
     }
 
@@ -393,12 +453,17 @@ void centralSection(UiContext& ctx) {
     if (!ui.centralStatus.empty()) ImGui::TextWrapped("%s", ui.centralStatus.c_str());
     if (!o.hasHorizon()) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
-        ImGui::TextWrapped("Outside the surface, orbits and light bending are exactly those of a black hole of the "
-                           "same mass (Birkhoff's theorem). Only how close you can get is different.");
+        ImGui::TextWrapped(o.radius < 30.0
+                               ? "Gravity outside depends only on the mass and spin (Birkhoff's theorem): out here a "
+                                 "black hole of the same mass would pull the same way. What differs is the surface, "
+                                 "and how close you can get."
+                               : "Its gravity is ordinary Newtonian gravity to a few parts in a million (M/R): light "
+                                 "bends by microradians, clocks barely slow. Relativity only shows if you squeeze it "
+                                 "(Compactness, above).");
         ImGui::PopStyleColor();
     }
     centralReadouts(ctx);
-    radiiTable(ctx);
+    if (o.hasHorizon() || o.radius < 30.0) radiiTable(ctx);
 }
 
 void cameraSection(UiContext& ctx) {
@@ -521,10 +586,23 @@ void diskSection(UiContext& ctx) {
 
     ImGui::Checkbox(s.central.hasHorizon() ? "Inner edge at ISCO" : "Inner edge at ISCO or surface", &s.diskInnerAtIsco);
     if (!s.diskInnerAtIsco) sceneSlider("Inner radius", s.diskInner, 1.0f, 15.0f, S, false);
-    sceneSlider("Outer radius", s.diskOuter, 4.0f, 60.0f, S, false);
-    ImGui::SliderFloat("Peak temperature", &s.diskTemperature, 1500.0f, 40000.0f, "%.0f K", ImGuiSliderFlags_Logarithmic);
-    help("Sets the disk's color through the blackbody spectrum. Real disks around stellar black holes "
-         "reach millions of kelvin; here it is kept in the visible range so the colors mean something.");
+    const bool hole = s.central.hasHorizon();
+    sceneSlider("Outer radius", s.diskOuter, 4.0f, hole ? 60.0f : 200.0f, S, !hole);
+    if (s.diskPhysicalTemperature > 0.0) {
+        // Around a neutron star or white dwarf the temperature follows from the physics.
+        ImGui::Text("Peak temperature %s K", printf1("%.3g", s.diskPhysicalTemperature).c_str());
+        help("A thin disk's hottest ring, sigma T^4 = 3 G M Mdot / (8 pi r^3) (1 - sqrt(r_in / r)) at r = 49/36 "
+             "r_in, set by the mass, the accretion rate and the inner edge: ~1e7 K (X-rays) around a neutron "
+             "star, a few 1e4 K (ultraviolet) around a white dwarf. Drawn at a compressed color temperature, "
+             "as hot surfaces are.");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(drawn as %.0f K)", s.diskTemperature);
+    } else {
+        ImGui::SliderFloat("Peak temperature", &s.diskTemperature, 1500.0f, 40000.0f, "%.0f K",
+                           ImGuiSliderFlags_Logarithmic);
+        help("Sets the disk's color through the blackbody spectrum. Real disks around stellar black holes "
+             "reach millions of kelvin; here it is kept in the visible range so the colors mean something.");
+    }
     ImGui::SliderFloat("Brightness", &s.diskBrightness, 0.05f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
     ImGui::SliderFloat("Opacity", &s.diskOpacity, 0.0f, 1.0f, "%.2f");
     ImGui::SliderFloat("Turbulence", &s.diskTurbulence, 0.0f, 1.0f, "%.2f");
@@ -571,13 +649,18 @@ void skySection(UiContext& ctx) {
 void presetButtons(UiContext& ctx, bool objects) {
     const float buttonWidth = (ImGui::GetContentRegionAvail().x - 2.0f * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
     int column = 0;
+    // Only what could really be found around this center.
+    const central::Host host = central::hostOf(ctx.settings.central);
     for (const PresetInfo& p : presetList()) {
-        if (p.object != objects) continue;
+        if (p.object != objects || !presetAvailable(p, host)) continue;
         if (column++ % 3 != 0) ImGui::SameLine();
         if (ImGui::Button(p.label, ImVec2(buttonWidth, 0))) ctx.bodies.addPreset(ctx.settings.spin, p.preset);
         ImGui::SetItemTooltip("%s", p.description);
     }
-    if (objects) {
+    if (objects && column == 0) {
+        ImGui::TextDisabled("Nothing is known to orbit this kind of object; try the orbits below.");
+    }
+    if (objects && host == central::Host::BlackHole) {
         if (column++ % 3 != 0) ImGui::SameLine();
         if (ImGui::Button("Einstein ring", ImVec2(buttonWidth, 0))) ctx.einsteinRingRequested = true;
         ImGui::SetItemTooltip("Puts a star exactly behind the hole, as seen from the camera. Its light "
@@ -688,9 +771,16 @@ void plannerSection(UiContext& ctx) {
 
     ImGui::TextWrapped("Set a start and a velocity, or drag on the orbit map (top view) from the start "
                        "point in the direction to throw. The verdict and the dashed path update live.");
+    const int previousKind = ui.launchKind;
     ImGui::Combo("Type", &ui.launchKind,
                  "Star\0Rocky planet\0Gas giant\0Pulsar\0Star (tidally disrupted)\0White dwarf\0Neutron star\0"
-                 "Small black hole\0");
+                 "Small black hole\0Moon or rock\0");
+    // Around a star or planet, bodies have real sizes: a typical one of the chosen kind.
+    const bool realSizes = !s.central.hasHorizon();
+    if (realSizes && (ui.launchKind != previousKind || ui.launchRadiusKm <= 0.0f)) {
+        static const float typicalKm[] = {695700.0f, 6371.0f, 69911.0f, 12.0f, 695700.0f, 8700.0f, 12.0f, 0.0f, 1737.0f};
+        ui.launchRadiusKm = typicalKm[std::clamp(ui.launchKind, 0, 8)];
+    }
     sceneSlider("Start radius", ui.launchR, 2.0f, 80.0f, S, true);
     ImGui::SliderFloat("Polar angle", &ui.launchPolarDeg, 1.0f, 179.0f, "%.0f deg");
     ImGui::SliderFloat("Azimuth##launch", &ui.launchAzimuthDeg, 0.0f, 360.0f, "%.0f deg");
@@ -704,10 +794,17 @@ void plannerSection(UiContext& ctx) {
     const BodyKind kind = static_cast<BodyKind>(ui.launchKind);
     const bool planet = kind == BodyKind::RockyPlanet || kind == BodyKind::GasGiant;
     const bool hole = kind == BodyKind::MiniBlackHole;
-    if (!planet && !hole) {
+    const bool rock = kind == BodyKind::Moon;
+    if (!planet && !hole && !rock) {
         ImGui::SliderFloat("Temperature", &ui.launchTemperature, 2000.0f, 40000.0f, "%.0f K", ImGuiSliderFlags_Logarithmic);
     }
-    if (!hole) sceneSlider("Size", ui.launchRadius, 0.1f, 2.0f, S, false);
+    if (!hole && realSizes) {
+        ImGui::SliderFloat("Radius", &ui.launchRadiusKm, 0.01f, 1e7f, "%.4g km", ImGuiSliderFlags_Logarithmic);
+        help("Its real radius. The Sun is 695,700 km, Jupiter 69,911, the Earth 6,371, the Moon 1,737, a white "
+             "dwarf ~8,700, a neutron star ~12. Smaller than a pixel, it shows as a point of light.");
+    } else if (!hole) {
+        sceneSlider("Size", ui.launchRadius, 0.1f, 2.0f, S, false);
+    }
     if (kind != BodyKind::TidalStar) {
         ImGui::SliderFloat("Mass", &ui.launchMass, 1e-7f, 0.05f, "%.2g M", ImGuiSliderFlags_Logarithmic);
         help("In units of the central mass. A Sun-like star around a million-Sun hole is 1e-6: its pull "
@@ -793,8 +890,9 @@ void plannerSection(UiContext& ctx) {
 
     auto finish = [&]() {
         Body& b = sys.bodies.back();
-        b.temperature = planet || hole ? 0.0f : ui.launchTemperature;
-        b.radius = ui.launchRadius * fS;
+        b.temperature = planet || hole || rock ? 0.0f : ui.launchTemperature;
+        b.radius = realSizes ? static_cast<float>(central::kmToM(ui.launchRadiusKm, s.central.massSolar))
+                             : ui.launchRadius * fS;
         const float spinScale = 1.0f / (fS * std::sqrt(fS));
         if (kind == BodyKind::RockyPlanet) b.spinRate = 0.06f * spinScale;
         if (kind == BodyKind::GasGiant) b.spinRate = 0.1f * spinScale;
@@ -838,8 +936,11 @@ void objectsSection(UiContext& ctx) {
     ImGui::SetNextItemWidth(-1);
     char speed[96];
     std::snprintf(speed, sizeof(speed), "%%.4g x   (%.3g M per second)", s.timeScale * tS);
-    ImGui::SliderFloat("##timescale", &s.timeScale, 0.1f, 500.0f, speed, ImGuiSliderFlags_Logarithmic);
-    if (s.physicalUnits) {
+    // Moons and planets take days to years to go round: around a star or planet time can
+    // run far faster.
+    const bool hole = s.central.hasHorizon();
+    ImGui::SliderFloat("##timescale", &s.timeScale, 0.1f, hole ? 500.0f : 1e5f, speed, ImGuiSliderFlags_Logarithmic);
+    if (s.physicalUnits || !hole) {
         ImGui::TextDisabled("Each second shows %s.", central::formatTime(s.timeScale * tS, s.central.massSolar).c_str());
     }
     ImGui::Checkbox("Light travel time", &s.lightDelay);
@@ -869,6 +970,14 @@ void objectsSection(UiContext& ctx) {
     presetButtons(ctx, false);
 
     ctx.state.plannerOpen = false;
+    // Open by default around a black hole; around a star or planet its planned orbit
+    // would be one more ring in the view, so it starts closed there.
+    static int plannerHost = -1;
+    const int host = static_cast<int>(central::hostOf(s.central));
+    if (host != plannerHost) {
+        ImGui::SetNextItemOpen(host == static_cast<int>(central::Host::BlackHole));
+        plannerHost = host;
+    }
     if (ImGui::TreeNodeEx("Launch planner", ImGuiTreeNodeFlags_DefaultOpen)) {
         plannerSection(ctx);
         ImGui::TreePop();
@@ -878,7 +987,10 @@ void objectsSection(UiContext& ctx) {
         ImGui::SeparatorText("Debris");
         ImGui::Text("%d particles", ctx.particles.alive());
         ImGui::SameLine();
-        if (ImGui::SmallButton("Clear")) ctx.particles.clear();
+        if (ImGui::SmallButton("Clear")) {
+            ctx.particles.clear();
+            sys.tidalEvents.clear();  // the flare and outflow go with the debris
+        }
         ImGui::SliderFloat("Glow", &s.debrisBrightness, 0.1f, 20.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
         ImGui::SliderFloat("Thickness", &s.debrisOpacity, 0.005f, 3.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
         help("How strongly the gas absorbs light: low is a faint translucent glow, high is dense and opaque.");
@@ -896,6 +1008,9 @@ void objectsSection(UiContext& ctx) {
                  "of the scene's dynamical time around a big object.");
             ImGui::SliderFloat("Coolest", &s.gasFloorTemperature, 1000.0f, 15000.0f, "%.0f K", ImGuiSliderFlags_Logarithmic);
             help("The light around the hole keeps the gas from cooling below this.");
+            ImGui::SliderFloat("Glows as", &s.debrisGlowFloor, 0.0f, 20000.0f, s.debrisGlowFloor > 0.0f ? "%.0f K" : "its own heat");
+            help("Display only: the gas glows at least as if it were this hot. A torn-apart star's stream is lit by its "
+                 "leftover heat and then by the flare; its pressure still follows its own temperature.");
         }
     }
 
@@ -924,7 +1039,8 @@ void objectsSection(UiContext& ctx) {
                 ImGui::SetItemTooltip("%s, mass %.2g M%s", kindName(b.kind), b.mass,
                                       b.inside ? " (inside the horizon)" : "");
                 ImGui::TableNextColumn();
-                ImGui::Text("%.4g", b.state.r);
+                if (s.central.hasHorizon()) ImGui::Text("%.4g", b.state.r);
+                else ImGui::TextUnformatted(central::formatLength(b.state.r, s.central.massSolar).c_str());
                 ImGui::TableNextColumn();
                 ImGui::Text("%.6f", b.constants.E);
                 ImGui::SetItemTooltip("Energy per unit rest mass, conserved. Below 1 means bound.");
@@ -949,6 +1065,177 @@ void objectsSection(UiContext& ctx) {
         }
     }
     for (const std::string& e : sys.events) ImGui::TextDisabled("%s", e.c_str());
+}
+
+// --- Tidal disruption flare -----------------------------------------------------------
+
+// The light curve of a tidal disruption on log-log axes: the fallback rate (orange), the
+// luminosity that escapes (blue; photon trapping flattens it near the peak), the
+// t^(-5/3) law through the peak (grey, dashed), and now (white).
+void lightCurve(const tde::Aftermath& after, double now) {
+    const tde::Event& e = after.reference();
+    const double t0 = e.time;
+    const double tLo = std::max(0.5 * e.fallback.firstReturn, 1.0);
+    const double tHi = std::max({8.0 * (after.peakTime() - t0), 1.5 * (now - t0), 4.0 * tLo});
+    const double yLo = -3.0, yHi = 0.25;  // log10 of rate / peak
+
+    const float em = ImGui::GetFontSize();
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImVec2 size(ImGui::GetContentRegionAvail().x, 8.0f * em);
+    ImGui::InvisibleButton("lightcurve", size);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 corner(origin.x + size.x, origin.y + size.y);
+    dl->AddRectFilled(origin, corner, IM_COL32(10, 11, 16, 255));
+    dl->PushClipRect(origin, corner, true);
+    auto px = [&](double t) { return origin.x + static_cast<float>(std::log(t / tLo) / std::log(tHi / tLo)) * size.x; };
+    auto py = [&](double v) {
+        const double y = std::log10(std::max(v, 1e-12));
+        return corner.y - static_cast<float>((y - yLo) / (yHi - yLo)) * size.y;
+    };
+    // Decades of time.
+    for (double d = std::pow(10.0, std::ceil(std::log10(tLo))); d < tHi; d *= 10.0) {
+        dl->AddLine(ImVec2(px(d), origin.y), ImVec2(px(d), corner.y), IM_COL32(255, 255, 255, 22));
+    }
+    const int n = 220;
+    std::vector<ImVec2> rate, light;
+    for (int i = 0; i < n; ++i) {
+        const double t = tLo * std::pow(tHi / tLo, static_cast<double>(i) / (n - 1));
+        const double level = after.level(t0 + t);
+        if (level > 1e-4) rate.emplace_back(px(t), py(level));
+        const double lum = after.luminosity(t0 + t);
+        if (lum > 1e-4) light.emplace_back(px(t), py(lum));
+    }
+    // The t^(-5/3) law through the peak.
+    const double tp = after.peakTime() - t0;
+    for (int i = 0; i < 24; ++i) {
+        const double ta = tp * std::pow(1.25, 2 * i), tb = tp * std::pow(1.25, 2 * i + 1);
+        dl->AddLine(ImVec2(px(ta), py(std::pow(ta / tp, -5.0 / 3.0))), ImVec2(px(tb), py(std::pow(tb / tp, -5.0 / 3.0))),
+                    IM_COL32(150, 150, 160, 160), 1.0f);
+    }
+    if (light.size() > 1) dl->AddPolyline(light.data(), static_cast<int>(light.size()), IM_COL32(110, 170, 255, 255), 0, 1.5f);
+    if (rate.size() > 1) dl->AddPolyline(rate.data(), static_cast<int>(rate.size()), IM_COL32(255, 160, 60, 255), 0, 2.0f);
+    if (now > t0 + tLo) dl->AddLine(ImVec2(px(now - t0), origin.y), ImVec2(px(now - t0), corner.y), IM_COL32(255, 255, 255, 200));
+    dl->PopClipRect();
+    dl->AddText(ImVec2(origin.x + 4, origin.y + 2), IM_COL32(255, 160, 60, 255), "fallback");
+    dl->AddText(ImVec2(origin.x + 4, origin.y + 2 + em), IM_COL32(110, 170, 255, 255), "light");
+    dl->AddText(ImVec2(origin.x + 4, origin.y + 2 + 2 * em), IM_COL32(150, 150, 160, 255), "t^-5/3");
+    char label[96];
+    std::snprintf(label, sizeof(label), "time since disruption (log), to %.3g M", tHi);
+    dl->AddText(ImVec2(corner.x - ImGui::CalcTextSize(label).x - 4, corner.y - em - 2), IM_COL32(150, 150, 160, 255), label);
+}
+
+void flareSection(UiContext& ctx) {
+    Settings& s = ctx.settings;
+    BodySystem& sys = ctx.bodies;
+    ImGui::Checkbox("Flare and outflow", &s.tdeFlare);
+    help("When a star is torn apart, the bound part of its debris swings out and comes back one orbit later, each "
+         "parcel after its own exact (Kerr) radial period. Returning, the stream crosses itself (relativistic "
+         "precession swings it round), shocks and settles into a small new disk: the hole flares. Much of the "
+         "returning gas is blown out instead, by the shocks and the trapped radiation, in a wind that is wide while "
+         "the fallback is strong and narrows into a funnel along the axis as it fades. This is what ESO's "
+         "animation of AT2019qiz shows.");
+    if (!sys.tidalEvents.empty()) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Forget")) sys.tidalEvents.clear();
+        ImGui::SetItemTooltip("Forget the disruptions so far (their debris stays).");
+    }
+    if (sys.tidalEvents.empty()) {
+        ImGui::TextWrapped("No star has been torn apart yet. Try Famous black holes -> Tidal disruption, or "
+                           "Objects -> Tidal disruption flare.");
+    } else if (s.tdeFlare) {
+        const tde::Aftermath after(sys.tidalEvents, outflowParams(s), s.central.massSolar, s.spin);
+        if (after.active()) {
+            const tde::Event& e = after.reference();
+            const double now = sys.time;
+            const double level = after.level(now);
+            if (now < after.start()) {
+                ImGui::Text("Debris coming back in %s", timeText(s, after.start() - now).c_str());
+            } else {
+                ImGui::Text("Fallback at %.0f%% of its peak, %s", 100.0 * level, now < after.peakTime() ? "rising" : "fading");
+            }
+            lightCurve(after, now);
+            if (ImGui::BeginTable("flare", 2, ImGuiTableFlags_SizingStretchProp)) {
+                auto row = [](const char* name, const std::string& value, const char* tip) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", name);
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(value.c_str());
+                    if (tip) ImGui::SetItemTooltip("%s", tip);
+                };
+                row("Closest approach", lengthText(s, e.pericenter) + printf1(",  beta = %.2f", e.tidalRadius / e.pericenter),
+                    "beta = r_t / r_p: how deep inside its tidal radius the star went.");
+                row("Debris", printf1("%.0f%% bound, ", 100.0 * e.fallback.boundFraction) +
+                                  printf1("%.0f%% escaping", 100.0 * e.unboundFraction),
+                    "From each parcel's orbit when the star came apart: the unbound part leaves for good in a long "
+                    "tail; the bound part returns.");
+                row("First back", timeText(s, e.fallback.firstReturn) + "  after the disruption",
+                    "The most bound debris returns after its own orbital period.");
+                row("Peak", timeText(s, after.peakTime() - e.time) + printf1(",  then ~ t^%.2f", e.fallback.lateSlope),
+                    "A flat spread of debris energies gives t^(-5/3) (Rees 1988; Phinney 1989).");
+                row("Returned so far", printf1("%.1f%% of the star", 100.0 * after.returned(now)), nullptr);
+                if (now > after.start()) {
+                    row("Outflow front", lengthText(s, after.front(now)),
+                        "The leading edge of the wind, coasting out from the circularization radius.");
+                    row("Opening", printf1("+-%.0f degrees", after.opening(now) / kDeg),
+                        "Half-opening angle of the gas launched now: wide at first, when the returning stream's "
+                        "self-crossing shock throws it out every which way; a narrow funnel once a disk has formed.");
+                }
+                row("Flare (Sun-like star)",
+                    printf1("%.3g x Eddington", after.eddingtonRatio(now)) +
+                        printf1("  (accretion %.3g x)", after.accretionRatio(now)),
+                    "What escapes when this hole eats a Sun-like star, at this point of the fallback: above Eddington "
+                    "most of the light is trapped in the inflow and what escapes grows only as 1 + ln(L / L_Edd).");
+                ImGui::EndTable();
+            }
+            const tde::Scales sun = tde::physicalScales(s.central.massSolar, 1.0, central::kSunRadiusKm);
+            const double edd = central::eddingtonRate(s.central.massSolar) * 3.15576e7 / 1.98847e33;  // Suns a year
+            ImGui::TextWrapped("A Sun-like star torn apart by a hole of %.3g Suns starts coming back after %.3g days and "
+                               "falls back at up to %.2g Suns a year, %.0f times the Eddington rate. (The simulated star "
+                               "is bigger, so that it can be seen and its debris returns in minutes, not weeks.)",
+                               s.central.massSolar, sun.tMin / 86400.0, sun.peakRate, sun.peakRate / std::max(edd, 1e-30));
+        }
+    }
+
+    ImGui::SeparatorText("Outflow");
+    ImGui::SliderFloat("Blown out", &s.outflowFraction, 0.0f, 0.95f, "%.2f");
+    help("Share of the returning debris that the wind carries away; the rest is accreted and powers the flare. "
+         "Simulations find a large part, perhaps most, is blown out.");
+    ImGui::SliderFloat("Speed", &s.outflowSpeed, 0.02f, 0.3f, "%.3f c", ImGuiSliderFlags_Logarithmic);
+    help("Terminal speed along the axis (slower toward the rim). AT2019qiz's outflow ran at about 10,000 km/s "
+         "(0.03 c); radio and X-ray outflows of other events reach 0.1-0.2 c.");
+    ImGui::SliderFloat("Opening", &s.outflowOpeningDeg, 5.0f, 60.0f, "+-%.0f deg");
+    help("Half-opening angle of the funnel once the fallback has faded.");
+    ImGui::SliderFloat("Widening", &s.outflowWidening, 1.0f, 4.0f, "%.1f x");
+    help("How much wider the outflow is at first, before a disk has formed to collimate it: its first, widest "
+         "gas makes the cap; the funnel that follows makes the stem.");
+    ImGui::SliderFloat("Thickness##outflow", &s.outflowThickness, 0.05f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+    help("Opacity of the wind. A real one is so opaque (electron scattering) that its photosphere lies far out, "
+         "hiding the inside; here it is kept translucent enough to see.");
+    ImGui::SliderFloat("Lit", &s.outflowBrightness, 0.05f, 10.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+    help("How brightly the flare lights the outflow.");
+    ImGui::Checkbox("New disk", &s.flareDisk);
+    help("With the accretion disk off (a quiet hole), the returning gas forms its own small disk, out to about twice "
+         "the pericenter (where gas keeping the stream's angular momentum circles), shining with the flare.");
+    ImGui::SameLine();
+    ImGui::Checkbox("Film lighting", &s.flareCinematic);
+    help("The flare's light on the outflow fades as R^-0.7 instead of the true R^-2, so that its far reaches show, "
+         "as in artists' renditions. Off: true to the inverse-square law.");
+    ImGui::Checkbox("Follow the event", &s.flareCamera);
+    help("The camera's distance follows the event: close for the star's approach and its disruption, then back out "
+         "with the stream and the outflow. Zooming yourself turns it off.");
+    ImGui::SameLine();
+    ImGui::Checkbox("Skip the wait", &s.flareFastForward);
+    help("Once the stream has left, nothing much changes for hundreds of M until the bound debris comes back: time "
+         "runs faster until then.");
+    if (ctx.pace > 1.01) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "fast-forwarding x%.1f", ctx.pace);
+    }
+    ImGui::Checkbox("Strands in the debris", &s.debrisFilaments);
+    help("The tide stretches whatever structure the star had into fine strands along the stream. Each parcel remembers "
+         "where it sat in the star, across the stretch; the strands are drawn from that, so they move with the gas. "
+         "They need finer steps through the gas, so they cost speed.");
 }
 
 void videoSection(UiContext& ctx) {
@@ -1359,10 +1646,43 @@ bool plannedLaunch(const UiState& ui, double spin, double scale, double surface,
     return true;
 }
 
+// A scale bar at the bottom of the view: how long a length is at the central object's
+// distance (bent light magnifies things near a black hole or neutron star a little).
+void scaleBar(UiContext& ctx) {
+    const Camera& cam = ctx.camera;
+    const Settings& s = ctx.settings;
+    if (cam.insideHorizon(s.spin)) return;
+    const ImVec2 screen = ImGui::GetIO().DisplaySize;
+    const double pixelAngle = 2.0 * std::tan(0.5 * cam.fovDeg * kDeg) / std::max(screen.y, 1.0f);
+    const double kmPerPixel = central::lengthKm(cam.r * pixelAngle, s.central.massSolar);
+    if (!(kmPerPixel > 0.0)) return;
+    // A round length (1, 2 or 5 times a power of ten) about 120 pixels long.
+    const double target = 120.0 * kmPerPixel;
+    const double decade = std::pow(10.0, std::floor(std::log10(target)));
+    double km = decade;
+    for (double step : {2.0, 5.0, 10.0}) {
+        if (decade * step <= target) km = decade * step;
+    }
+    const float length = static_cast<float>(km / kmPerPixel);
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const float em = ImGui::GetFontSize();
+    const ImVec2 a(screen.x - length - 2.0f * em, screen.y - 1.6f * em);
+    const ImVec2 b(screen.x - 2.0f * em, a.y);
+    const ImU32 color = IM_COL32(230, 230, 235, 220);
+    dl->AddLine(a, b, color, 2.0f);
+    dl->AddLine(ImVec2(a.x, a.y - 0.4f * em), ImVec2(a.x, a.y + 0.4f * em), color, 2.0f);
+    dl->AddLine(ImVec2(b.x, b.y - 0.4f * em), ImVec2(b.x, b.y + 0.4f * em), color, 2.0f);
+    const std::string label = central::formatLength(central::kmToM(km, s.central.massSolar), s.central.massSolar) +
+                              (s.central.hasHorizon() ? "" : "  at the center's distance");
+    const float width = ImGui::CalcTextSize(label.c_str()).x;
+    dl->AddText(ImVec2(b.x - width, a.y - 1.5f * em), color, label.c_str());
+}
+
 void drawUi(UiContext& ctx) {
     UiState& ui = ctx.state;
     helpWindow(ui);
     inspectorWindow(ctx);
+    scaleBar(ctx);
     if (!ui.showPanel) {
         ui.plannerOpen = false;
         if (ui.showOrbitMap) orbitMap(ctx);
@@ -1380,6 +1700,13 @@ void drawUi(UiContext& ctx) {
         if (ImGui::CollapsingHeader("Accretion disk and jets", ImGuiTreeNodeFlags_DefaultOpen)) diskSection(ctx);
         ui.plannerOpen = false;
         if (ImGui::CollapsingHeader("Objects and orbits", ImGuiTreeNodeFlags_DefaultOpen)) objectsSection(ctx);
+        if (ctx.settings.central.hasHorizon()) {
+            // Open by itself once a star has been torn apart.
+            static size_t eventsSeen = 0;
+            if (ctx.bodies.tidalEvents.size() > eventsSeen) ImGui::SetNextItemOpen(true);
+            eventsSeen = ctx.bodies.tidalEvents.size();
+            if (ImGui::CollapsingHeader("Tidal disruption flare")) flareSection(ctx);
+        }
         if (ImGui::CollapsingHeader("Record video")) videoSection(ctx);
         if (ImGui::CollapsingHeader("Sky")) skySection(ctx);
         if (ImGui::CollapsingHeader("Rendering")) renderSection(ctx);

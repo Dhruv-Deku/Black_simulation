@@ -1,3 +1,4 @@
+
 # Builds the simulator and runs the physics tests.
 #   .\build.ps1            Release build + tests
 #   .\build.ps1 -Run       ...then start the simulator

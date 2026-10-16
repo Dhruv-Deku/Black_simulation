@@ -1,9 +1,12 @@
 // Physics tests for the Kerr geodesic code, checked against closed-form results.
 
+#include "bodies.h"
 #include "central.h"
 #include "debris.h"
 #include "gravity.h"
 #include "kerr.h"
+#include "surface.h"
+#include "tde.h"
 #include "tidal.h"
 #include "trajectory.h"
 
@@ -1148,7 +1151,9 @@ static void testCollapse() {
     truth(!central::collapseIfUnstable(sun, message), "the Sun stands");
     sun.radius = 2.2;
     truth(central::collapseIfUnstable(sun, message) && sun.hasHorizon(), "below 9/4 M the Sun collapses");
-    near(sun.chi, 0.22, 1e-12, "... keeping its spin (J/M^2 = 0.22)");
+    // The Sun's spin from its 25.4-day equatorial rotation and I = 0.07 M R^2.
+    near(central::catalog()[4].object.chi, 0.22, 0.002, "the Sun's J/M^2 from its rotation period is 0.22");
+    near(sun.chi, central::catalog()[4].object.chi, 1e-15, "... and it collapses keeping its spin");
     central::Object earth = central::catalog()[0].object;
     earth.radius = 2.0;
     truth(central::collapseIfUnstable(earth, message) && earth.chi == 0.998, "the Earth must shed spin to collapse");
@@ -1166,7 +1171,8 @@ static void testCollapse() {
     truth(central::stageForCompactness(10.0, central::Kind::Star) == central::Kind::NeutronStar, "R = 10 M: neutron star");
     central::Object squeezed = central::catalog()[4].object;
     squeezed.radius = 10.0;
-    truth(central::becomeStage(squeezed, central::Kind::NeutronStar, 5772.0) && squeezed.chi == 0.22,
+    truth(central::becomeStage(squeezed, central::Kind::NeutronStar, 5772.0) &&
+              squeezed.chi == central::catalog()[4].object.chi,
           "a squeezed Sun becomes neutron-star-like and keeps its J");
     near(central::catalog()[4].object.sceneScale(), 4.711e5 / 6.0, 50.0, "the Sun's scene is laid out in units of R/6");
     near(central::catalog()[8].object.sceneScale(), 1.0, 0.0, "a neutron star's scene is in M");
@@ -1178,7 +1184,466 @@ static void testCollapse() {
           "hotter neutron-star surfaces still look bluer, within the color table");
 }
 
+// --- Real objects at real sizes ------------------------------------------------------
+
+// Periods between successive apoapses of the first body, from its r(t) sampled every
+// `chunk` over `duration` (each maximum refined by a parabola through three samples).
+static double apoapsisPeriod(BodySystem& sys, double spin, double chunk, double duration, double& rMin) {
+    std::vector<double> times, radii;
+    sys.setFrameTime(chunk, spin);
+    for (double t = 0.0; t <= duration && !sys.bodies.empty(); t += chunk) {
+        times.push_back(sys.time);
+        radii.push_back(sys.bodies[0].state.r);
+        sys.update(spin, chunk, false);
+    }
+    rMin = *std::min_element(radii.begin(), radii.end());
+    std::vector<double> peaks;
+    for (size_t i = 1; i + 1 < radii.size(); ++i) {
+        if (radii[i] > radii[i - 1] && radii[i] >= radii[i + 1]) {
+            const double a = radii[i - 1], b = radii[i], c = radii[i + 1];
+            peaks.push_back(times[i] + 0.5 * chunk * (a - c) / (a - 2.0 * b + c));
+        }
+    }
+    return peaks.size() >= 2 ? peaks[1] - peaks[0] : 0.0;
+}
+
+// A pulsar's light cylinder and beam (src/central.h): the geometry of the last open
+// field line, against the measured relations.
+static void testPulsarBeams() {
+    constexpr double deg = 3.14159265358979 / 180.0;
+    // c P / (2 pi): 1,608 km for the Crab's 33.7 ms.
+    near(central::lightCylinderKm(0.0337), 299792.458 * 0.0337 / (2.0 * 3.14159265358979), 1e-9,
+         "the Crab's light cylinder is c P / 2 pi (1,608 km)");
+    near(central::radioEmissionHeightKm(1.0), 400.0, 1e-9, "radio comes from ~400 km above a 1 s pulsar");
+    near(central::radioEmissionHeightKm(0.0337), 400.0 * std::pow(0.0337, 0.3), 1e-9,
+         "and from 400 P^0.3 km (Kijak and Gil 2003): 145 km for the Crab");
+    // Small angles: rho = 3/2 theta_open = 1.24 deg (r_em / 10 km)^(1/2) P^(-1/2) (Gil et al.).
+    const double slow = 1.24 * deg * std::sqrt(central::radioEmissionHeightKm(1.0) / 10.0);
+    near(central::beamHalfAngle(1.0) / slow, 1.0, 0.02, "a 1 s pulsar's beam: 1.24 deg sqrt(r_em / 10 km / P)");
+    // Against Rankin's (1993) outer cones, 5.75 deg / sqrt(P): within the spread of
+    // measured emission heights.
+    near(central::beamHalfAngle(0.0337) / (5.75 * deg / std::sqrt(0.0337)), 1.0, 0.2,
+         "the Crab's beam is ~28 deg wide, as the 5.75 deg / sqrt(P) of measured cones");
+    truth(central::beamHalfAngle(7.5) < 6.0 * deg && central::beamHalfAngle(7.5) > 2.0 * deg,
+          "a 7.5 s magnetar's beam is a few degrees");
+    // Millisecond pulsars' open field lines fill most of the sky: very wide profiles.
+    truth(central::beamHalfAngle(1.0 / 401.0) > 60.0 * deg, "a millisecond pulsar's beam is wider than 60 deg");
+    truth(central::beamHalfAngle(0.1) > central::beamHalfAngle(1.0) && central::beamHalfAngle(1.0) > central::beamHalfAngle(10.0),
+          "faster pulsars have wider beams");
+    // A dipole line at colatitude theta points theta + atan(tan(theta) / 2) from the axis:
+    // 90 deg where tan^2(theta) = 2; when more lines are open the beam fills the hemisphere.
+    near(central::beamHalfAngle(1e-6), 0.5 * 3.14159265358979, 1e-12,
+         "when every line is open the beam reaches the magnetic equator");
+}
+
+// A cataclysmic variable's geometry (src/central.h) against published fits.
+static void testCloseBinary() {
+    near(central::rocheLobeFraction(1.0), 0.3789, 0.0005, "Eggleton's Roche lobe for equal masses is 0.379 a");
+    // L1 against Plavec and Kratochvil's (1964) fit, 0.500 - 0.227 log10(q), good to ~1%.
+    bool l1 = true;
+    for (double q : {0.1, 0.25, 0.5, 1.0}) {
+        l1 = l1 && std::abs(central::innerLagrangeFraction(q) / (0.5 - 0.227 * std::log10(q)) - 1.0) < 0.015;
+    }
+    truth(l1, "L1 sits where Plavec and Kratochvil's fit puts it (q = 0.1 to 1)");
+    near(central::innerLagrangeFraction(1.0), 0.5, 1e-9, "for equal masses L1 is halfway");
+    // The stream's closest approach to the accretor, Lubow and Shu's (1975) fit
+    // r_min / a = 0.0488 q^-0.464 (0.05 < q < 1).
+    for (double q : {0.1, 0.25, 0.5}) {
+        double closest = 0.0;
+        central::rocheStream(q, 0.0, 16, closest);
+        near(closest / (0.0488 * std::pow(q, -0.464)), 1.0, 0.06, "the stream swings within Lubow and Shu's r_min");
+    }
+    // Coriolis bends it ahead of the companion (toward +y) and it ends at the disk's rim.
+    double closest = 0.0;
+    const double rim = central::tidalTruncationFraction(0.25);
+    const auto stream = central::rocheStream(0.25, rim, 16, closest);
+    truth(stream.size() == 16 && stream.back()[1] > 0.0 && std::hypot(stream.back()[0], stream.back()[1]) < rim + 1e-3,
+          "the stream bends ahead of the companion and stops at the disk's rim (0.48 a for q = 0.25)");
+}
+
+static void testRealWorld() {
+    using central::Host;
+    const auto& cat = central::catalog();
+    truth(cat.size() == 15, "the catalogue holds 15 objects");
+
+    // Spins from observed rotation periods, chi = I Omega / M^2 (c J / G M^2).
+    near(central::chiFromPeriod(0.0337, 1.4, 12.0, 0.35), 0.0152, 0.0002, "the Crab pulsar (33.7 ms): chi = 0.015");
+    // J = 0.3307 M R^2 (2 pi / 86,164 s) = 5.86e33 kg m^2/s; G M^2 / c = 7.94e30 kg m^2/s.
+    near(cat[0].object.chi, 5.86e33 / 7.94e30, 4.0, "the Earth's J/M^2 is ~738");
+    near(cat[4].object.chi, 0.22, 0.002, "the Sun's (25.4 days) is 0.22");
+    // The accreting millisecond pulsar's field holds its disk off at half the Alfven radius.
+    near(0.5 * central::alfvenRadiusKm(2e8, 12.0, 1.4, 0.01 * central::eddingtonRate(1.4)), 26.0, 3.0,
+         "a 2e8 G millisecond pulsar holds its disk off at ~26 km");
+    truth(cat[9].object.pulsar && !cat[9].disk && cat[11].object.magnetar && !cat[11].disk,
+          "the Crab pulsar and the magnetar have no disk");
+
+    // Each catalogue object is the right kind of place.
+    const Host want[] = {Host::Earthlike,   Host::GasGiant,    Host::BrownDwarf,  Host::RedDwarf,    Host::SunLike,
+                         Host::Giant,       Host::WhiteDwarf,  Host::WhiteDwarf,  Host::NeutronStar, Host::NeutronStar,
+                         Host::NeutronStar, Host::NeutronStar, Host::BlackHole,   Host::BlackHole,   Host::BlackHole};
+    bool hosts = true;
+    for (size_t k = 0; k < cat.size() && k < 15; ++k) hosts = hosts && central::hostOf(cat[k].object) == want[k];
+    truth(hosts, "every catalogue object is classified as the right host");
+
+    // Sizes in words.
+    auto says = [](double km, const char* phrase) {
+        return central::sizeComparison(km).find(phrase) != std::string::npos;
+    };
+    truth(says(12.0, "city"), "a neutron star is the size of a city");
+    truth(says(8700.0, "1.4 times the size of the Earth"), "a white dwarf is 1.4 times the Earth");
+    truth(says(central::kSunRadiusKm, "about the size of the Sun"), "the Sun is the size of the Sun");
+    truth(says(100.0 * central::kSunRadiusKm, "Mercury's orbit"), "a red giant is as wide as Mercury's orbit");
+
+    // Sunlight.
+    near(central::fluxRelativeToEarth(central::kSunRadiusKm, central::kSunTemperature, central::kAuKm), 1.0, 1e-12,
+         "the Sun's light at 1 AU is the unit");
+    near(central::fluxRelativeToEarth(central::kSunRadiusKm, central::kSunTemperature, 0.5 * central::kAuKm), 4.0,
+         1e-12, "... and falls off as 1/d^2");
+    const central::Object& proxima = cat[3].object;
+    const double rRatio = central::lengthKm(proxima.radius, proxima.massSolar) / central::kSunRadiusKm;
+    near(rRatio * rRatio * std::pow(proxima.surfaceTemperature / central::kSunTemperature, 4.0) / 0.00165, 1.0, 0.15,
+         "Proxima's radius and temperature give its luminosity (0.0017 Suns)");
+
+    // Thin-disk temperatures: the peak factor at r = 49/36 r_in, by brute force.
+    double best = 0.0;
+    for (double x = 1.0; x < 4.0; x += 1e-5) best = std::max(best, std::pow(x, -0.75) * std::pow(1.0 - 1.0 / std::sqrt(x), 0.25));
+    const double mdot = 0.01 * central::eddingtonRate(1.4), rIn = 12.4;
+    const double tStar = std::pow(3.0 * 6.674e-8 * 1.4 * 1.98847e33 * mdot / (8.0 * kPi * 5.6704e-5 * std::pow(rIn * 1e5, 3.0)),
+                                  0.25);
+    near(central::diskPeakTemperature(1.4, mdot, rIn) / tStar, best, 1e-9, "the disk is hottest at r = 49/36 r_in");
+    near(central::diskPeakTemperature(1.4, 2.0 * mdot, rIn) / central::diskPeakTemperature(1.4, mdot, rIn),
+         std::pow(2.0, 0.25), 1e-12, "... and its temperature goes as mdot^(1/4)");
+    const double tNs = central::diskPeakTemperature(1.4, mdot, rIn);
+    const double tWd = central::diskPeakTemperature(0.6, 0.01 * central::eddingtonRate(0.6), 8700.0);
+    truth(tNs > 1e6 && tNs < 1e7, "a neutron star's disk is X-ray hot (1e6-1e7 K)");
+    truth(tWd > 1e4 && tWd < 5e4, "a white dwarf's disk is ultraviolet-hot (1e4-5e4 K)");
+
+    // Bodies too small to resolve are drawn as points sending the same light.
+    double dim = 0.0;
+    const double drawn = pointSourceRadius(0.01, 100.0, 0.001, dim);
+    near(drawn, kPointRadiusPixels * 0.1, 1e-15, "an unresolved body is drawn a pixel wide");
+    near(drawn * drawn * dim, 1e-4, 1e-15, "... dimmed to send the same light");
+    near(pointSourceRadius(1.0, 100.0, 0.001, dim), 1.0, 0.0, "a resolved body is drawn at its size");
+
+    // What may orbit what.
+    auto offered = [](Preset p, Host h) {
+        for (const PresetInfo& info : presetList()) {
+            if (info.preset == p) return presetAvailable(info, h);
+        }
+        return false;
+    };
+    truth(!offered(Preset::TidalDisruption, Host::NeutronStar) && !offered(Preset::Pulsar, Host::SunLike),
+          "black-hole demonstrations are not offered around stars");
+    truth(offered(Preset::Moon, Host::Earthlike) && offered(Preset::GalileanMoons, Host::GasGiant) &&
+              offered(Preset::InnerPlanets, Host::SunLike) && offered(Preset::IscoOrbit, Host::NeutronStar),
+          "real companions are offered where they belong");
+
+    // Around a neutron star the orbit demonstrations carry a blob of plasma, 0.3 km.
+    {
+        BodySystem sys;
+        const central::Object ns = cat[8].object;
+        sys.host = central::hostOf(ns);
+        sys.centralMassSolar = ns.massSolar;
+        sys.surface = ns.radius;
+        sys.setScale(ns.sceneScale(), ns.metricSpin());
+        sys.addPreset(ns.metricSpin(), Preset::IscoOrbit);
+        truth(sys.bodies.size() == 1 && sys.bodies[0].name == "Plasma blob", "a neutron star's ISCO holds plasma");
+        if (!sys.bodies.empty()) {
+            near(central::lengthKm(sys.bodies[0].radius, ns.massSolar), 0.3, 1e-6, "... 0.3 km across");
+        }
+    }
+
+    // The Moon: real size, real orbit, and the period Kepler gives a test mass,
+    // 2 pi sqrt(a^3 / G M_earth) = 27.45 days (the real 27.32 includes the Moon's own mass).
+    {
+        BodySystem sys;
+        const central::Object earth = cat[0].object;
+        const double spin = earth.metricSpin();
+        sys.host = central::hostOf(earth);
+        sys.centralMassSolar = earth.massSolar;
+        sys.centralRadiusKm = central::kEarthRadiusKm;
+        sys.surface = earth.radius;
+        sys.setScale(earth.sceneScale(), spin);
+        sys.addPreset(spin, Preset::Moon);
+        truth(sys.bodies.size() == 1 && sys.bodies[0].kind == BodyKind::Moon, "the Moon is added");
+        if (!sys.bodies.empty()) {
+            const double M = earth.massSolar;
+            near(central::lengthKm(sys.bodies[0].radius, M), 1737.4, 1e-3, "the Moon at its real radius");
+            near(central::lengthKm(sys.bodies[0].state.r, M), 384400.0 * 1.0549, 1.0, "released at apogee, 405,500 km");
+            const double a = central::kmToM(384400.0, M);
+            const double kepler = 2.0 * kPi * a * std::sqrt(a);
+            double rMin = 0.0;
+            const double period = apoapsisPeriod(sys, spin, kepler / 2000.0, 2.2 * kepler, rMin);
+            near(period / kepler, 1.0, 1e-3, "the Moon's orbit takes the Kepler period");
+            near(central::timeSeconds(kepler, M) / 86400.0, 27.45, 0.05, "... 27.45 days");
+            near(central::lengthKm(rMin, M), 384400.0 * (1.0 - 0.0549), 300.0, "perigee 363,300 km: the orbit holds");
+        }
+    }
+
+    // Mercury round a Sun-like star, at 0.387 AU: its 88-day year.
+    {
+        BodySystem sys;
+        const central::Object sun = cat[4].object;
+        const double spin = sun.metricSpin();
+        sys.host = central::hostOf(sun);
+        sys.centralMassSolar = 1.0;
+        sys.centralRadiusKm = central::kSunRadiusKm;
+        sys.surface = sun.radius;
+        sys.setScale(sun.sceneScale(), spin);
+        sys.addPreset(spin, Preset::InnerPlanets);
+        truth(sys.bodies.size() == 3 && sys.bodies[0].name == "Mercury", "Mercury, Venus and the Earth are added");
+        if (sys.bodies.size() == 3) {
+            near(central::lengthKm(sys.bodies[2].radius, 1.0), central::kEarthRadiusKm, 1e-3, "the Earth at its real size");
+            const double a = central::kmToM(0.3871 * central::kAuKm, 1.0);
+            const double kepler = 2.0 * kPi * a * std::sqrt(a);
+            near(central::timeSeconds(kepler, 1.0) / 86400.0, 87.97, 0.1, "Mercury's year is 88 days");
+            double rMin = 0.0;
+            const double period = apoapsisPeriod(sys, spin, kepler / 2000.0, 2.2 * kepler, rMin);
+            near(period / kepler, 1.0, 1e-3, "... and its orbit takes that long");
+            near(central::lengthKm(rMin, 1.0) / central::kAuKm, 0.3871 * (1.0 - 0.2056), 0.001, "perihelion 0.307 AU");
+        }
+    }
+}
+
 // Runs one group of checks, and says so if it was slow.
+// --- What surfaces look like ------------------------------------------------------
+
+static void testSurfaceAppearance() {
+    // Eddington-Barbier with a grey atmosphere: bolometrically, Eddington's law.
+    for (double mu : {0.0, 0.3, 0.5, 1.0}) {
+        const double ratio = std::pow(surface::limbTemperatureFactor(mu) / surface::limbTemperatureFactor(1.0), 4.0);
+        near(ratio, (2.0 + 3.0 * mu) / 5.0, 1e-12, "grey limb darkening integrates to (2 + 3 mu) / 5");
+    }
+    // In visible light the limb is darker in the blue than in the red, and the Sun's
+    // measured darkening at 550 nm (~0.70 at mu = 0.5, Neckel and Labs) is matched to ~5%.
+    const double blue = surface::limbDarkening(5772.0, 0.2, 420.0), red = surface::limbDarkening(5772.0, 0.2, 680.0);
+    truth(blue < red && red < 1.0, "the limb is darker and redder");
+    near(surface::limbDarkening(5772.0, 0.5, 550.0), 0.70, 0.04, "solar limb darkening at 550 nm, mu = 0.5");
+
+    // Convection: the Sun's granules (~1,000-1,500 km, 5-20 minutes); a red giant's
+    // handful of huge cells.
+    const double gSun = surface::surfaceGravityCgs(1.0, central::kSunRadiusKm);
+    near(gSun, 27400.0, 100.0, "solar surface gravity (cm/s^2)");
+    near(surface::pressureScaleHeightKm(5772.0, gSun), 134.0, 3.0, "solar pressure scale height (km)");
+    const double granule = surface::granuleSizeKm(5772.0, gSun);
+    truth(granule > 1000.0 && granule < 1500.0, "solar granules are ~1,300 km across");
+    const double life = surface::granuleLifetimeSeconds(5772.0, gSun) / 60.0;
+    truth(life > 5.0 && life < 20.0, "solar granules live 5-20 minutes");
+    const double gGiant = surface::surfaceGravityCgs(1.0, 100.0 * central::kSunRadiusKm);
+    const double cells = 100.0 * central::kSunRadiusKm / surface::granuleSizeKm(4000.0, gGiant);
+    truth(cells > 3.0 && cells < 20.0, "a red giant has a few huge convection cells (per radian)");
+
+    // Starspots: umbrae ~1,850 K cooler on the Sun, ~200 K on a cool red dwarf.
+    near(surface::spotTemperatureDrop(5772.0), 1850.0, 1.0, "solar umbral temperature drop");
+    const double proxima = surface::spotTemperatureDrop(3042.0);
+    truth(proxima > 120.0 && proxima < 350.0, "red dwarf spots are only a few hundred K cooler");
+    bool unit = true, belts = true;
+    const surface::SpotPattern sun = surface::makeSpots(surface::SpotStyle::Solar, 0.6, 7u);
+    for (const surface::Spot& spot : sun.spots) {
+        unit = unit && std::abs(glm::length(spot.direction) - 1.0f) < 1e-5f;
+        belts = belts && std::abs(std::asin(spot.direction.z)) < 45.0 * kPi / 180.0;
+    }
+    truth(!sun.spots.empty() && static_cast<int>(sun.spots.size()) <= surface::kMaxSpots, "spot count within the shader's list");
+    truth(!sun.regions.empty() && static_cast<int>(sun.regions.size()) <= surface::kMaxRegions, "active regions");
+    truth(unit, "spot directions are unit vectors");
+    truth(belts, "sunspots stay in the low-latitude belts");
+    const surface::SpotPattern dwarf = surface::makeSpots(surface::SpotStyle::RedDwarf, 0.8, 7u);
+    double biggest = 0.0;
+    for (const surface::Spot& spot : dwarf.spots) biggest = std::max(biggest, static_cast<double>(spot.radius));
+    truth(biggest > 0.1, "red dwarfs carry far larger spots");
+
+    // The corona: Allen's electron density times the dilution, integrated along the line
+    // of sight, has the shape of Baumbach's measured brightness from 1.02 to 6 R.
+    const double ref = surface::coronaColumn(1.1) / surface::baumbachBrightness(1.1);
+    for (double rho : {1.02, 1.05, 1.2, 1.5, 2.0, 3.0, 6.0}) {
+        const double shape = surface::coronaColumn(rho) / surface::baumbachBrightness(rho) / ref;
+        near(shape, 1.0, 0.06, "K-corona profile against Baumbach");
+    }
+    near(surface::coronaScaleReal() * surface::coronaColumn(1.1), 0.8 * surface::baumbachBrightness(1.1), 1e-15,
+         "corona calibrated to the disk center");
+
+    // Which look each object gets.
+    central::Object o = central::catalog()[4].object;  // the Sun
+    surface::Appearance a = surface::appearance(o);
+    truth(a.look == surface::Look::Photosphere && a.corona, "the Sun: granulation, spots and a corona");
+    near(a.granuleFrequency, central::kSunRadiusKm / granule, 1e-6 * a.granuleFrequency, "granules per radian");
+    truth(surface::appearance(central::catalog()[2].object).look == surface::Look::BrownDwarf, "a brown dwarf has weather");
+    truth(surface::appearance(central::catalog()[0].object).atmosphere, "the Earth has air");
+}
+
+// --- Tidal disruption flares (src/tde.h) --------------------------------------------
+
+// Coordinate time between two pericenter passages, by brute force: march in Mino time
+// and time the moments vr turns from negative to positive. Also the first such moment.
+static double measuredRadialPeriod(double a, const Constants& c, State s, double* firstPericenter = nullptr) {
+    double prevVr = s.vr, prevT = s.t, first = -1.0;
+    for (int i = 0; i < 40000000; ++i) {
+        stepMino(a, c, s, 2e-5 * s.r);
+        if (prevVr < 0.0 && s.vr >= 0.0) {
+            const double f = -prevVr / (s.vr - prevVr);
+            const double t = prevT + f * (s.t - prevT);
+            if (first < 0.0) {
+                first = t;
+                if (firstPericenter) *firstPericenter = t;
+            } else {
+                return t - first;
+            }
+        }
+        prevVr = s.vr;
+        prevT = s.t;
+    }
+    return 0.0;
+}
+
+static void testTidalFlare() {
+    using namespace tde;
+    // A Sun torn apart by a million-Sun hole: the classic numbers. The most bound debris
+    // (a = r_t^2 / 2 R*) returns after ~41 days; the fallback then peaks near 3 Suns a
+    // year, ~100 times what the hole could swallow at its Eddington luminosity.
+    const Scales sun6 = physicalScales(1e6, 1.0, central::kSunRadiusKm);
+    near(sun6.tidalRadius / (central::kSunRadiusKm * 100.0), 1.0, 1e-12, "r_t = R* (M / m)^(1/3)");
+    near(sun6.tMin / 86400.0, 40.95, 0.1, "first debris returns after 41 days (1e6 Suns)");
+    near(sun6.peakRate, 2.97, 0.02, "peak fallback ~3 Suns a year");
+    near(physicalScales(1e8, 1.0, central::kSunRadiusKm).tMin / sun6.tMin, 10.0, 1e-9, "t_min grows as M^(1/2)");
+    const Scales g = classicalScales(1.0, 1e-3, 1.0);
+    near(g.tMin, keplerPeriod(1.0, -g.energySpread), 1e-9 * g.tMin, "t_min is the period of the most bound debris");
+    near(keplerPeriod(1.0, -1.0 / 200.0), 2.0 * kPi * std::pow(100.0, 1.5), 1e-9, "Kepler: 2 pi a^1.5");
+    near(escapingLuminosity(0.5), 0.5, 1e-15, "below Eddington all the light escapes");
+    near(escapingLuminosity(100.0), 1.0 + std::log(100.0), 1e-12, "photon trapping: 1 + ln(L / L_Edd)");
+    near(eddingtonLuminosity(1e6) / 1.2572e44, 1.0, 1e-12, "Eddington luminosity of 1e6 Suns");
+
+    // Radial periods from the quadrature against brute-force integration: Schwarzschild,
+    // a rapidly spinning hole, and a very eccentric orbit like the debris.
+    struct Case {
+        double a, rp, ra;
+        const char* what;
+    };
+    const Case cases[] = {{0.0, 8.0, 40.0, "radial period, Schwarzschild rp=8 ra=40"},
+                          {0.9, 6.0, 30.0, "radial period, a=0.9 rp=6 ra=30"},
+                          {0.6, 7.5, 120.0, "radial period, a=0.6 rp=7.5 ra=120 (eccentric)"}};
+    for (const Case& k : cases) {
+        double E, L;
+        if (!equatorialOrbit(k.a, k.rp, k.ra, true, E, L)) {
+            truth(false, k.what);
+            continue;
+        }
+        const Constants c{E, L, 0.0, 1.0};
+        // Start part way out, heading outward.
+        const double r0 = 0.5 * (k.rp + k.ra);
+        State s{0.0, r0, kPi / 2, 0.0, std::sqrt(radialPotential(k.a, c, r0)), 0.0};
+        const RadialOrbit o = radialOrbit(k.a, c, s);
+        truth(o.kind == RadialOrbit::Bound, "bound orbit recognised");
+        near(o.rp, k.rp, 1e-7, "pericenter from the zeros of R(r)");
+        near(o.ra, k.ra, 1e-6 * k.ra, "apocenter from the zeros of R(r)");
+        double next = 0.0;
+        const double measured = measuredRadialPeriod(k.a, c, s, &next);
+        near(o.period / measured, 1.0, 2e-5, k.what);
+        near(o.toPericenter / next, 1.0, 1e-4, "time to the next pericenter, outbound");
+        State in = s;
+        in.vr = -in.vr;
+        const RadialOrbit back = radialOrbit(k.a, c, in);
+        double nextIn = 0.0;
+        measuredRadialPeriod(k.a, c, in, &nextIn);
+        near(back.toPericenter / nextIn, 1.0, 1e-4, "time to the next pericenter, inbound");
+    }
+    {
+        // Far out the period is Kepler's, with relativistic corrections of order M / a.
+        double E, L;
+        equatorialOrbit(0.0, 500.0, 1500.0, true, E, L);
+        const Constants c{E, L, 0.0, 1.0};
+        const State s{0.0, 500.0, kPi / 2, 0.0, 0.0, 0.0};
+        near(radialOrbit(0.0, c, s).period / (2.0 * kPi * std::pow(1000.0, 1.5)), 1.0, 0.01, "wide orbit: Kepler period");
+    }
+
+    // A flat spread of orbital energies, -dE to +dE: half is bound, and the fallback
+    // after the first return follows dM/dt = (1 / 2dE) (1/3) (2 pi)^(2/3) t^(-5/3).
+    {
+        const double dE = 0.03;
+        std::vector<double> times, weights;
+        const int n = 200000;
+        for (int i = 0; i < n; ++i) {
+            const double e = -dE + 2.0 * dE * (i + 0.5) / n;
+            if (e < 0.0) {
+                times.push_back(keplerPeriod(1.0, e));
+                weights.push_back(1.0);
+            }
+        }
+        Fallback f;
+        f.build(times, weights, n);
+        near(f.boundFraction, 0.5, 1e-6, "flat dM/dE: half the debris is bound");
+        near(f.firstReturn / keplerPeriod(1.0, -dE), 1.0, 1e-4, "first return: the most bound debris");
+        const double t = 3.0 * f.firstReturn;
+        const double want = std::pow(2.0 * kPi, 2.0 / 3.0) / (3.0 * 2.0 * dE) * std::pow(t, -5.0 / 3.0);
+        near(f.rate(t) / want, 1.0, 0.02, "fallback rate at 3 t_min against the t^(-5/3) law");
+        near(f.lateSlope, -5.0 / 3.0, 0.03, "fallback fades as t^(-5/3)");
+        near(f.returned(1e12), 0.5, 0.01, "all the bound half comes back");
+        truth(f.peakTime > f.firstReturn && f.peakTime < 1.6 * f.firstReturn, "peak shortly after the first return");
+    }
+
+    // The wind: closed-form travel time against a direct integral of dR / v(R).
+    {
+        const double vInf = 0.1, R0 = 15.0, R1 = 300.0;
+        const int n = 20000;
+        double sum = 0.0;
+        for (int i = 0; i <= n; ++i) {
+            const double R = R0 + (R1 - R0) * i / n;
+            sum += (i == 0 || i == n ? 1.0 : (i % 2 ? 4.0 : 2.0)) / windSpeed(1.0, vInf, R);
+        }
+        sum *= (R1 - R0) / n / 3.0;
+        near(windTravelTime(1.0, vInf, R0, R1) / sum, 1.0, 1e-8, "wind travel time in closed form");
+        near(windTravelTime(1.0, vInf, R0, windFront(1.0, vInf, R0, 1234.5)), 1234.5, 1e-6, "wind front inverts it");
+        near(windSpeed(1.0, vInf, 1e12), vInf, 1e-6, "the wind coasts at its terminal speed");
+        near(openingAngle(0.3, 0.9, 0.0), 0.9, 1e-15, "wide outflow before a disk forms");
+        near(openingAngle(0.3, 0.9, 0.2), 0.3 + 0.6 / std::exp(1.0), 1e-12, "collimation e-folds at a fifth returned");
+        near(openingAngle(0.3, 0.9, 5.0), 0.3, 1e-9, "narrow funnel once the disk has formed");
+    }
+
+    // A real disruption: a star 1.5 M in radius torn apart at pericenter (7.5 M) of a
+    // parabolic orbit around a hole of spin 0.7. The energy spread straddles E = 1:
+    // about half escapes, and the rest returns after roughly the period of the most
+    // bound debris, with a spread dE ~ M R* / r_p^2.
+    {
+        const double a = 0.7, rp = 7.5, rStar = 1.5;
+        const double A = rp - 2.0, B = 4.0 * a, C = -2.0 * (a * a + rp * rp);
+        const double L = (-B + std::sqrt(B * B - 4.0 * A * C)) / (2.0 * A);
+        const Constants c{1.0, L, 0.0, 1.0};
+        truth(std::abs(radialPotential(a, c, rp)) < 1e-9, "parabolic orbit turns at its pericenter");
+        double v[3];
+        zamoVelocity(a, c, State{0.0, rp, kPi / 2, 0.0, 0.0, 0.0}, v);
+        std::mt19937 rng(11);
+        const tidal::Mat3 F = {{{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}}};
+        const tidal::Mat3 Fdot = {{{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}}};
+        const auto gas = debris::deformedStar(a, rp, kPi / 2, 0.0, v, rStar, F, Fdot, 40000, 9000.0f, rng);
+        const auto start = std::chrono::steady_clock::now();
+        const Event ev = analyze(a, 100.0, gas);
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        truth(seconds < 1.0, "analysing a disruption takes well under a second");
+        near(ev.unboundFraction, 0.5, 0.08, "parabolic disruption: about half the debris escapes");
+        const double tMin = keplerPeriod(1.0, -rStar / (rp * rp));
+        truth(ev.fallback.firstReturn > 0.3 * tMin && ev.fallback.firstReturn < 1.5 * tMin,
+              "first return near the period of the most bound debris");
+        truth(ev.fallback.peakTime > ev.fallback.firstReturn, "fallback peaks after the first return");
+        near(ev.fallback.lateSlope, -5.0 / 3.0, 0.35, "fallback of real debris fades roughly as t^(-5/3)");
+    }
+
+    // Labels across the stretch: a star stretched along x (F = diag(5, 1, 1/2)) is
+    // labelled by where each parcel sat in y and z.
+    {
+        std::mt19937 rng(5);
+        const tidal::Mat3 F = {{{5.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 0.5}}};
+        const tidal::Mat3 Fdot = {{{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}}};
+        const double still[3] = {0.0, 0.0, 0.0};
+        const auto gas = debris::deformedStar(0.0, 50.0, kPi / 2, 0.0, still, 1.0, F, Fdot, 3000, 5000.0f, rng);
+        double worst = 0.0;
+        for (const ParticleInit& p : gas) {
+            const double y = p.r * std::sin(p.theta) * std::sin(p.phi), z = p.r * std::cos(p.theta);
+            const double want = y * y + (z / 0.5) * (z / 0.5);
+            worst = std::max(worst, std::abs(p.label[0] * p.label[0] + p.label[1] * p.label[1] - want));
+        }
+        near(worst, 0.0, 2e-4, "debris labels: position across the stretch, in star radii");
+    }
+}
+
 static void run(const char* name, void (*test)()) {
     const auto start = std::chrono::steady_clock::now();
     test();
@@ -1188,7 +1653,9 @@ static void run(const char* name, void (*test)()) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    run("testTidalFlare", testTidalFlare);
     run("testCentralUnits", testCentralUnits);
+    run("testSurfaceAppearance", testSurfaceAppearance);
     run("testSurfacePhysics", testSurfacePhysics);
     run("testSurfaceLightBending", testSurfaceLightBending);
     run("testSurfaceRays", testSurfaceRays);
@@ -1198,6 +1665,9 @@ int main() {
     run("testAccretionEfficiency", testAccretionEfficiency);
     run("testTidalScales", testTidalScales);
     run("testCollapse", testCollapse);
+    run("testRealWorld", testRealWorld);
+    run("testPulsarBeams", testPulsarBeams);
+    run("testCloseBinary", testCloseBinary);
     run("testTidalModel", testTidalModel);
     run("testMutualGravity", testMutualGravity);
     run("testKerrSchildMetric", testKerrSchildMetric);
