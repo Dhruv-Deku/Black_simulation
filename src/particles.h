@@ -5,6 +5,8 @@
 
 #include <glm/glm.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -48,6 +50,8 @@ public:
     // so its brightness does not depend on the particle count.
     static constexpr float kObjectMass = 100000.0f;
     static constexpr int kGridR = 160, kGridTheta = 96, kGridPhi = 256;
+    // The grid spans kGridRMin to gridRMax() (kGridRMax unless a scene needs more room:
+    // the unbound debris of a star on a parabolic orbit flies far out).
     static constexpr float kGridRMin = 1.0f, kGridRMax = 100.0f;
 
     bool init(const std::filesystem::path& shaderDir, std::string& error);
@@ -63,6 +67,11 @@ public:
     void reframe(double oldSpin, double newSpin, double oldScale, double newScale, double surface);
     // Advances every particle by dt of coordinate time and rebuilds the grids.
     void update(double spin, double dt, const GasParams& gas);
+
+    // Moves the grid's outer edge (render units). Parcels are dropped at 3 times it.
+    void setGridOuterRadius(float rMax) { m_gridRMax = std::max(rMax, 2.0f * kGridRMin); }
+    float gridRMax() const { return m_gridRMax; }
+    glm::vec2 gridLogR() const { return {std::log(kGridRMin), std::log(m_gridRMax)}; }
 
     bool active() const { return m_used > 0; }
     int alive() const { return m_alive; }
@@ -100,6 +109,7 @@ private:
     GLuint m_impacts = 0;    // SSBO: energy left on the surface this frame
     GLuint m_impactMap = 0;  // ... accumulated and fading (R32F, colatitude x longitude)
     double m_scale = 1.0;    // render unit in M
+    float m_gridRMax = kGridRMax;
     double m_accreted = 0.0;
     int m_used = 0;  // slots holding particles
     int m_next = 0;  // next slot to write

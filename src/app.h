@@ -52,6 +52,7 @@ struct LaunchOptions {
     bool noGasPhysics = false;
     std::optional<float> gasCollisions, gasCooling;
     bool noBodyGravity = false;
+    bool noFlare = false;
     int debugView = 0;  // 1 = step heat map, 2 = escape direction
 
     // Video: record this many seconds to recordPath, then exit.
@@ -85,6 +86,12 @@ private:
     int ridingIndex() const;  // index in m_bodies.bodies of the ridden body, or -1
     // Time runs this much slower while the camera falls in close to the hole.
     double approachSlowdown() const;
+    // Time runs this much faster while a torn-apart star's debris is far out on its first
+    // orbit, when little changes for hundreds of M.
+    double flarePace() const;
+    // Where the camera's distance goes while it follows a tidal disruption: close for the
+    // star's approach and the disruption, back out with the stream and then the outflow.
+    double flareCameraDistance() const;
     void updatePredictions();
     void buildPaths();
     void inspectPixel(double x, double y);
@@ -96,6 +103,8 @@ private:
     // scale, what the bodies, gas and camera need to know, bursts.
     void syncCentral(double simDt, float realDt);
     CentralView centralView() const;
+    // A tidal disruption's flare and outflow as the ray tracer draws them (src/tde.h).
+    FlareView flareView() const;
     // A surface-wide flash (X-ray burst, nova, flare), seen with light delay.
     void triggerFlash(double strength, double fadeScene, const std::string& message);
     double sceneScale() const { return m_settings.central.sceneScale(); }
@@ -137,8 +146,18 @@ private:
     double m_lastScale = 1.0;
     double m_flashTime = -1e30, m_flashStrength = 0.0, m_flashFade = 50.0;  // coordinate times (M)
     double m_burstFuel = 0.0;        // fraction of the way to the next thermonuclear flash
+    // White-light flares on an active star: where (rotating frame), when (M), how bright.
+    struct StarFlare {
+        glm::vec3 direction;
+        double time;
+        float strength;
+    };
+    std::vector<StarFlare> m_flares;
     double m_lastAccreted = 0.0;     // bodies and gas that had hit the surface at the last check
     float m_screenFlash = 0.0f;      // a collapse lights up the whole view for a moment
+    // The stream of a cataclysmic variable, cached (centralView): mass ratio, rim, path.
+    mutable double m_streamQ = -1.0, m_streamRim = -1.0;
+    mutable std::vector<std::array<double, 2>> m_streamPath;
     std::mt19937 m_rng{4242};
     bool m_vsync = true;
     double m_scroll = 0.0;

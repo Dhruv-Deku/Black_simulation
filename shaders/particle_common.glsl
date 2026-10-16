@@ -16,7 +16,13 @@ struct Particle {
     // it was created (-1e30 if it has always been there) and before it was lost.
     vec4 seen;
     vec4 seenVelocity;  // vr, vtheta, time created, time lost (1e30 while it lasts)
+    // Where the parcel sat in the star (or cloud) it came from, across the direction the
+    // tide stretched it, in that body's radii: the ray tracer draws fine strands from it.
+    vec4 label;
 };
+// Values summed per voxel of the grids: weight, four velocity (or temperature and
+// velocity) sums, temperature, and the two labels (see grid_resolve.comp).
+const int kGridChannels = 8;
 layout(std430, binding = 1) buffer Particles {
     Particle particles[];
 };

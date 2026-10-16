@@ -15,6 +15,10 @@ struct ParticleInit {
     float vr, vtheta;  // Mino-time velocities
     float E, L, Q;
     float temperature;  // K
+    // Where the parcel sat in what it came from, across the direction the tide or the
+    // shear stretches it (in units of that body's radius): a Lagrangian label that the
+    // ray tracer turns into fine strands moving with the gas.
+    float label[2] = {0.0f, 0.0f};
 };
 
 namespace debris {

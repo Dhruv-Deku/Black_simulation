@@ -15,6 +15,7 @@
 // with the Kerr quadrupole (a neutron star's real quadrupole is 2-10 times larger, a
 // small effect for spins below ~0.4).
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -30,8 +31,15 @@ constexpr double kLightYearKm = 9.4607304725808e12;
 constexpr double kSpeedOfLightKmS = 299792.458;
 constexpr double kChandrasekharMass = 1.44;           // M_sun (mu_e = 2)
 constexpr double kBuchdahlRadius = 9.0 / 4.0;         // no static star is smaller (in M)
+constexpr double kSunTemperature = 5772.0;            // K
+constexpr double kEarthRadiusKm = 6371.0;
+constexpr double kEarthMassSolar = 3.003e-6;
+constexpr double kJupiterRadiusKm = 69911.0;
+constexpr double kMoonRadiusKm = 1737.4;
 
 double lengthKm(double lengthM, double massSolar);
+// A length in km as a multiple of G M / c^2.
+double kmToM(double km, double massSolar);
 double timeSeconds(double timeM, double massSolar);
 double accelerationSI(double accelerationGeometric, double massSolar);  // m/s^2
 // "1,234 km", "3.2 AU", "4.1 ly"; "12 us", "3.4 s", "2.1 h", "5.2 yr".
@@ -89,6 +97,16 @@ struct Object {
 // know a spin and an optional surface radius.)
 double boundaryRadius(double a, double surface);
 
+// What sort of place the center makes, which decides what can really be found around
+// it (a Moon around the Earth, planets around the Sun, plasma around a neutron star).
+enum class Host { BlackHole, NeutronStar, WhiteDwarf, SunLike, RedDwarf, BrownDwarf, Giant, Earthlike, GasGiant };
+Host hostOf(const Object& object);
+constexpr unsigned hostBit(Host host) { return 1u << static_cast<unsigned>(host); }
+
+// Spin chi = c J / (G M^2) = I Omega / M^2 of a body turning once every periodSeconds,
+// with moment of inertia inertia * M R^2.
+double chiFromPeriod(double periodSeconds, double massSolar, double radiusKm, double inertia);
+
 // --- Catalogue ------------------------------------------------------------------
 
 struct CatalogEntry {
@@ -97,8 +115,24 @@ struct CatalogEntry {
     Object object;
     double cameraDistance;  // in scene units (sceneScale() M)
     bool disk;              // shows an accretion disk by default
+    double diskOuter = 0.0; // its outer edge in surface radii (0: the scene default)
+    double cameraInclinationDeg = 0.0;  // the view's angle from the spin axis (0: the default)
+    double timeScale = 0.0; // pace of the simulation, scene time per second (0: the default)
+    bool jets = false;      // shows jets by default (X-ray binaries launch them)
 };
 const std::vector<CatalogEntry>& catalog();
+
+// --- Sizes ---------------------------------------------------------------------------
+
+// A familiar thing of about the same size, for the readouts: "about the size of a city
+// (Manhattan is 22 km long)", "1.4 times the Earth", "100 times the Sun".
+std::string sizeComparison(double radiusKm);
+
+// --- Light -----------------------------------------------------------------------------
+
+// Sunlight falling on a body at distanceKm from a star of radius radiusKm and surface
+// temperature T, relative to the Sun's at the Earth: (R/R_sun)^2 (T/T_sun)^4 (1 AU / d)^2.
+double fluxRelativeToEarth(double radiusKm, double temperature, double distanceKm);
 
 // --- Surface physics (Schwarzschild exterior unless noted) ------------------------
 
@@ -149,6 +183,47 @@ SurfaceAccretion surfaceEfficiency(double a, double R, double omega);
 double alfvenRadiusKm(double fieldGauss, double radiusKm, double massSolar, double mdotGramsPerSecond);
 // Eddington accretion rate, L_Edd / (0.1 c^2), in g/s.
 double eddingtonRate(double massSolar);
+// Hottest point of a thin disk feeding mdot (g/s) onto a mass massSolar through an inner
+// edge rInnerKm (Shakura and Sunyaev): sigma T^4 = 3 G M mdot / (8 pi r^3) (1 - sqrt(r_in / r)),
+// highest at r = (49/36) r_in, where T = 0.488 [3 G M mdot / (8 pi sigma r_in^3)]^(1/4). In K.
+// About 1e7 K for a neutron star (X-rays), a few 1e4 K for a white dwarf (ultraviolet).
+double diskPeakTemperature(double massSolar, double mdotGramsPerSecond, double rInnerKm);
+
+// --- Pulsars -----------------------------------------------------------------------------
+
+// The light cylinder, where co-rotation would reach the speed of light: c P / (2 pi), km.
+// Field lines reaching past it are dragged open; the rest close back on the star.
+double lightCylinderKm(double periodSeconds);
+// Height of a pulsar's radio emission above the star, from the widths of pulse profiles
+// (Kijak and Gil 2003, at 1 GHz): ~400 km P^0.3 (P in seconds), at most the light cylinder.
+double radioEmissionHeightKm(double periodSeconds);
+// Half-opening angle of the beam (radians): the direction of the last open field line
+// where the radio is made. A dipole line at colatitude theta points theta + atan(tan(theta)/2)
+// from the axis (3/2 theta near the pole), and the last open line has
+// sin^2(theta) = r_em / R_LC; at most 90 deg. About 5.75 deg / sqrt(P / 1 s), as measured
+// (Rankin 1993).
+double beamHalfAngle(double periodSeconds);
+
+// --- Close binaries ------------------------------------------------------------------------
+
+// Eggleton's (1983) Roche-lobe radius (of a sphere of the lobe's volume) over the
+// separation, for the star whose mass is q times its companion's:
+// 0.49 q^(2/3) / (0.6 q^(2/3) + ln(1 + q^(1/3))), within 1% for any q.
+double rocheLobeFraction(double q);
+// The inner Lagrange point L1: its distance from the star of mass M1, over the
+// separation, for q = M2 / M1. The root between the stars of the Roche potential's
+// gradient, -1/x^2 + q/(1 - x)^2 + (1 + q) x - q = 0 (units a = 1, G (M1 + M2) = Omega^2).
+double innerLagrangeFraction(double q);
+// The largest disk the companion's tide lets the star of mass M1 keep, over the
+// separation: 0.6 / (1 + q) (Paczynski 1977, for 0.03 < q < 1).
+double tidalTruncationFraction(double q);
+// The gas stream from L1 toward the star of mass M1, ballistic in the rotating Roche
+// potential (Lubow and Shu 1975), leaving L1 from rest. Points (x, y) in units of the
+// separation, centered on M1, the companion on +x and the orbit turning counter-clockwise
+// (Coriolis bends the stream toward +y). It stops on reaching radius `stop` from M1, or at
+// its closest approach; `closest` returns that approach. At most `count` points, evenly
+// spaced in time.
+std::vector<std::array<double, 2>> rocheStream(double q, double stop, int count, double& closest);
 
 // --- Tidal disruption -----------------------------------------------------------------
 

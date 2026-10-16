@@ -1,4 +1,5 @@
 #include "renderer.h"
+#include <cstdio>
 
 #include "blackbody.h"
 #include "kerr.h"
@@ -21,7 +22,8 @@ namespace {
 constexpr int kBlackbodySamples = 1024;
 constexpr double kFlowPeriod = 300.0;  // M; how often the disk's turbulence pattern is renewed
 
-// Cells binning path segments for the ray tracer, over the debris grid's r range.
+// Cells binning path segments for the ray tracer, in log r from the debris grid's inner
+// radius out to its outer one, or farther when orbits reach farther (moons and planets).
 constexpr int kPathR = 64, kPathTheta = 48, kPathPhi = 96;
 constexpr int kPathCells = kPathR * kPathTheta * kPathPhi;
 
@@ -30,11 +32,12 @@ struct GpuPathSegment {
 };
 static_assert(sizeof(GpuPathSegment) == 64, "std430 layout");
 
-// The path cell containing a Cartesian point (render units), or -1 outside the grid.
-int pathCell(const glm::vec3& p, double spin) {
+// The path cell containing a Cartesian point (render units), or -1 outside the grid
+// (which reaches out to rMax).
+int pathCell(const glm::vec3& p, double spin, double rMax) {
     auto [r, theta, phi] = kerr::fromCartesian(spin, p.x, p.y, p.z);
     const double lr = (std::log(r) - std::log(ParticleSystem::kGridRMin)) /
-                      (std::log(ParticleSystem::kGridRMax) - std::log(ParticleSystem::kGridRMin));
+                      (std::log(rMax) - std::log(ParticleSystem::kGridRMin));
     if (lr < 0.0 || lr >= 1.0) return -1;
     double f = phi / (2.0 * kerr::kPi);
     f -= std::floor(f);
@@ -45,13 +48,17 @@ int pathCell(const glm::vec3& p, double spin) {
 }
 }  // namespace
 
-ShaderProgram& Renderer::traceProgram(bool centralBody, bool lenses) {
-    const int index = (centralBody ? 1 : 0) + (lenses ? 2 : 0);
+ShaderProgram& Renderer::traceProgram(int look, bool lenses, bool planets, bool outflow) {
+    // look 0: a black hole; 1-6 (surface::Look): a star or planet at the center.
+    look = std::clamp(look, 0, kTraceLooks - 1);
+    const int index = ((look * 2 + (lenses ? 1 : 0)) * 2 + (planets ? 1 : 0)) * 2 + (outflow ? 1 : 0);
     ShaderProgram& program = m_trace[index];
     if (!program.valid() && program.error().empty()) {
         std::string defines;
-        if (centralBody) defines += "#define CENTRAL_BODY 1\n";
+        if (look > 0) defines += "#define CENTRAL_BODY 1\n#define SURFACE_LOOK " + std::to_string(look) + "\n";
         if (lenses) defines += "#define LENSES 1\n";
+        if (planets) defines += "#define BODY_PLANETS 1\n";
+        if (outflow) defines += "#define OUTFLOW 1\n";
         program.build(m_shaderDir, "fullscreen.vert", "trace.frag", defines);
     }
     return program;
@@ -59,7 +66,7 @@ ShaderProgram& Renderer::traceProgram(bool centralBody, bool lenses) {
 
 bool Renderer::init(const std::filesystem::path& shaderDir, std::string& error) {
     m_shaderDir = shaderDir;
-    bool ok = traceProgram(false, false).valid();
+    bool ok = traceProgram(0, false, false, false).valid();
     ok &= m_bloomDown.build(shaderDir, "fullscreen.vert", "bloom_down.frag");
     ok &= m_bloomUp.build(shaderDir, "fullscreen.vert", "bloom_up.frag");
     ok &= m_tonemap.build(shaderDir, "fullscreen.vert", "tonemap.frag");
@@ -116,27 +123,35 @@ bool Renderer::init(const std::filesystem::path& shaderDir, std::string& error) 
     glTextureParameteri(m_pathOccupancy, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTextureParameteri(m_pathOccupancy, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     setPaths({}, 0.0, 1.0);
+    loadPlanetMaps();
+    m_sdoBake.build(shaderDir, "fullscreen.vert", "sdo_bake.frag");
     return ok;
 }
 
-void Renderer::setPaths(const std::vector<PathLine>& lines, double spin, double scale) {
+void Renderer::setPaths(const std::vector<PathLine>& lines, double spin, double scale, bool farOrbits) {
     std::vector<GpuPathSegment> segments;
     std::vector<std::vector<uint32_t>> cells(kPathCells);
     const float inv = static_cast<float>(1.0 / scale);
     const double spinRender = spin / scale;
+    double rMax = ParticleSystem::kGridRMax;
+    for (const PathLine& line : lines) {
+        if (!farOrbits) break;
+        for (const glm::vec3& point : line.points) rMax = std::max(rMax, 1.05 * glm::length(point * inv));
+    }
+    m_pathRMax = rMax;
     for (const PathLine& line : lines) {
         const size_t n = line.points.size();
         if (n < 2) continue;
         float along = 0.0f;
-        int prevCell = pathCell(line.points[0] * inv, spinRender);
+        int prevCell = pathCell(line.points[0] * inv, spinRender, rMax);
         for (size_t i = 1; i < n; ++i) {
             const glm::vec3 a = line.points[i - 1] * inv;
             const glm::vec3 b = line.points[i] * inv;
             const float len = glm::length(b - a);
             const float fa = static_cast<float>(i - 1) / static_cast<float>(n - 1);
             const float fb = static_cast<float>(i) / static_cast<float>(n - 1);
-            const int cell = pathCell(b, spinRender);
-            const int mid = pathCell(0.5f * (a + b), spinRender);
+            const int cell = pathCell(b, spinRender, rMax);
+            const int mid = pathCell(0.5f * (a + b), spinRender, rMax);
             const uint32_t index = static_cast<uint32_t>(segments.size());
             segments.push_back({glm::vec4(a, glm::mix(line.startOpacity, line.endOpacity, fa)),
                                 glm::vec4(b, glm::mix(line.startOpacity, line.endOpacity, fb)),
@@ -180,6 +195,9 @@ void Renderer::shutdown() {
     m_pathSegments = m_pathCells = m_pathIndex = 0;
     glDeleteTextures(1, &m_pathOccupancy);
     m_pathOccupancy = 0;
+    if (m_outflowTexture) glDeleteTextures(1, &m_outflowTexture);
+    m_outflowTexture = 0;
+    m_outflowRows = 0;
     GLuint textures[] = {m_blackbodyTexture, m_skyTexture, m_placeholderTexture, m_placeholderVolume,
                          m_placeholderOccupancy, m_historyTexture};
     glDeleteTextures(6, textures);
@@ -277,9 +295,24 @@ void Renderer::render(const FrameInputs& in) {
     const float tanHalfFov = std::tan(0.5f * glm::radians(cam.fovDeg));
     const float pixelAngle = 2.0f * tanHalfFov / static_cast<float>(th);
 
-    bool lenses = false;
-    for (int i = 0; i < in.bodies->info.x; ++i) lenses = lenses || in.bodies->bodies[i].params.z > 6.5f;
-    ShaderProgram& trace = traceProgram(cv.surface > 0.0, lenses);
+    // Compile in only what the scene needs (see traceProgram).
+    bool lenses = false, planets = false;
+    for (int i = 0; i < in.bodies->info.x; ++i) {
+        const auto kind = static_cast<BodyKind>(std::lround(in.bodies->bodies[i].params.z));
+        lenses = lenses || kind == BodyKind::MiniBlackHole;
+        planets = planets || kind == BodyKind::RockyPlanet || kind == BodyKind::GasGiant || kind == BodyKind::Moon;
+    }
+    // The Sun's 30.4 nm map: all of it the first time, then a band of rows a frame.
+    if (cv.sdoMap) {
+        bakeSdo(cv, !m_sdoReady);
+        m_sdoReady = true;
+    } else {
+        m_sdoReady = false;
+    }
+    const FlareView noFlare;
+    const FlareView& fv = in.flare ? *in.flare : noFlare;
+    const bool outflow = fv.active && cv.surface <= 0.0 && !fv.table.empty();
+    ShaderProgram& trace = traceProgram(cv.surface > 0.0 ? std::max(cv.look, 1) : 0, lenses, planets, outflow);
     glBindFramebuffer(GL_FRAMEBUFFER, m_hdr.fbo);
     glViewport(0, 0, tw, th);
     trace.use();
@@ -307,16 +340,28 @@ void Renderer::render(const FrameInputs& in) {
     trace.set("uPixelAngle", pixelAngle);
     trace.set("uMaxSteps", s.maxSteps);
     trace.set("uStepSize", s.stepSize);
-    trace.set("uEscapeRadius", std::max(s.escapeRadius, static_cast<float>(cam.r * inv) * 1.5f));
+    // Rays must get past everything that glows: the bodies, the far debris, the outflow.
+    float escape = std::max({s.escapeRadius, static_cast<float>(cam.r * inv) * 1.5f,
+                             static_cast<float>(in.reach * inv) * 1.2f});
+    if (in.particles && in.particles->active()) escape = std::max(escape, in.particles->gridRMax() * 1.02f);
+    if (outflow) escape = std::max(escape, static_cast<float>(fv.extent * inv) * 1.05f + 5.0f);
+    trace.set("uEscapeRadius", escape);
 
-    trace.set("uDiskEnabled", s.diskEnabled ? 1 : 0);
+    // With the disk off (a quiet hole), a tidal disruption's returning gas forms its own
+    // small disk, which shines as the flare does.
+    const bool flareDisk = !s.diskEnabled && fv.diskGlow > 1e-4f && cv.surface <= 0.0;
+    if (flareDisk) {
+        diskInner = kerr::iscoRadius(spin, true);
+        diskOuter = std::max(fv.diskOuter, diskInner * 1.5);
+    }
+    trace.set("uDiskEnabled", s.diskEnabled || flareDisk ? 1 : 0);
     trace.set("uDiskInner", static_cast<float>(diskInner * inv));
     trace.set("uDiskOuter", static_cast<float>(diskOuter * inv));
-    trace.set("uDiskTemp", s.diskTemperature);
-    trace.set("uDiskBrightness", s.diskBrightness);
-    trace.set("uDiskOpacity", s.diskOpacity);
+    trace.set("uDiskTemp", flareDisk ? fv.diskTemperature : s.diskTemperature);
+    trace.set("uDiskBrightness", flareDisk ? s.diskBrightness * fv.diskGlow : s.diskBrightness);
+    trace.set("uDiskOpacity", flareDisk ? s.diskOpacity * std::min(1.0f, 4.0f * fv.diskGlow) : s.diskOpacity);
     trace.set("uDiskTurbulence", s.diskTurbulence);
-    trace.set("uDiskDirection", prograde ? 1.0f : -1.0f);
+    trace.set("uDiskDirection", prograde || flareDisk ? 1.0f : -1.0f);
     // The disk's pattern is renewed every few dynamical times: kFlowPeriod M around a
     // hole, sqrt(scale) times that in render units around a bigger object.
     const double flowPeriod = kFlowPeriod * std::sqrt(unit);
@@ -326,12 +371,17 @@ void Renderer::render(const FrameInputs& in) {
 
     const bool debris = in.particles && in.particles->active();
     trace.set("uDebrisEnabled", debris ? 1 : 0);
-    trace.set("uGridLogR", glm::vec2(std::log(ParticleSystem::kGridRMin), std::log(ParticleSystem::kGridRMax)));
+    trace.set("uGridLogR", in.particles ? in.particles->gridLogR()
+                                        : glm::vec2(std::log(ParticleSystem::kGridRMin),
+                                                    std::log(ParticleSystem::kGridRMax)));
     trace.set("uDebrisBrightness", s.debrisBrightness);
     trace.set("uDebrisOpacity", s.debrisOpacity);
+    trace.set("uDebrisFilaments", s.debrisFilaments ? 1.0f : 0.0f);
+    trace.set("uDebrisGlowFloor", s.debrisGlowFloor);
 
     trace.set("uPathsEnabled", m_pathSegmentCount > 0 ? 1 : 0);
     trace.set("uPathGridDims", glm::ivec3(kPathR, kPathTheta, kPathPhi));
+    trace.set("uPathLogR", glm::vec2(std::log(ParticleSystem::kGridRMin), std::log(m_pathRMax)));
     trace.set("uPathWidth", s.pathWidth);
     trace.set("uSkipBody", in.skipBody);
     trace.set("uHistoryScale", static_cast<float>(inv));
@@ -354,10 +404,80 @@ void Renderer::render(const FrameInputs& in) {
     trace.set("uMagneticAxis", cv.magneticAxis);
     trace.set("uPulsar", cv.pulsar ? 1 : 0);
     trace.set("uMagnetar", cv.magnetar ? 1 : 0);
-    trace.set("uCoronaHeight", static_cast<float>(cv.coronaHeight * inv));
-    trace.set("uCoronaColor", cv.coronaColor * static_cast<float>(unit));  // per unit render length
+    trace.set("uSurfaceLook", cv.look);
+    trace.set("uSurfaceKm", static_cast<float>(std::max(cv.radiusKm, 1e-3)));
+    trace.set("uPlanetSeed", cv.planetSeed);
+    trace.set("uPlanetLight", cv.planetLight);
+    trace.set("uAtmosphere", cv.atmosphere ? 1 : 0);
+    trace.set("uCoronaScale", cv.coronaScale);
+    trace.set("uChromosphereScale", cv.chromosphereScale);
+    trace.set("uChromosphereHeight", cv.chromosphereHeight);
+    trace.set("uFilmColor", cv.filmColor ? 1 : 0);
+    trace.set("uEnvelope", cv.envelope);
+    trace.set("uFlowGlow", cv.flowGlow);
+    trace.set("uGranuleFreq", cv.granuleFrequency);
+    trace.set("uGranuleContrast", cv.granuleContrast);
+    trace.set("uGranuleLane", cv.granuleLane);
+    trace.set("uGranulePhase", cv.granulePhase);
+    trace.set("uGranuleRate", static_cast<float>(cv.granuleRate * unit));  // per unit render time
+    trace.set("uCapCos", cv.capCos);
+    {
+        glm::vec4 spots[32] = {};
+        float umbra[32] = {};
+        const int count = static_cast<int>(std::min<size_t>(cv.spots.size(), 32));
+        for (int k = 0; k < count; ++k) {
+            spots[k] = cv.spots[k];
+            umbra[k] = k < static_cast<int>(cv.spotUmbra.size()) ? cv.spotUmbra[k] : 0.4f;
+        }
+        trace.set("uSpotCount", count);
+        glProgramUniform4fv(trace.id(), trace.location("uSpots"), 32, &spots[0].x);
+        glProgramUniform1fv(trace.id(), trace.location("uSpotUmbra"), 32, umbra);
+        trace.set("uSpotDrop", cv.spotDrop);
+        glm::vec4 regions[8] = {};
+        const int regionCount = static_cast<int>(std::min<size_t>(cv.regions.size(), 8));
+        for (int k = 0; k < regionCount; ++k) regions[k] = cv.regions[k];
+        trace.set("uRegionCount", regionCount);
+        glProgramUniform4fv(trace.id(), trace.location("uRegions"), 8, &regions[0].x);
+        glm::vec4 flares[4] = {};
+        float flareAges[4] = {};
+        const int flareCount = static_cast<int>(std::min<size_t>(cv.flares.size(), 4));
+        for (int k = 0; k < flareCount; ++k) {
+            flares[k] = cv.flares[k];
+            flareAges[k] = static_cast<float>(cv.flareAges[k] * inv);
+        }
+        trace.set("uFlareCount", flareCount);
+        glProgramUniform4fv(trace.id(), trace.location("uFlares"), 4, &flares[0].x);
+        glProgramUniform1fv(trace.id(), trace.location("uFlareAges"), 4, flareAges);
+        trace.set("uFlareRise", static_cast<float>(std::max(cv.flareRise * inv, 1e-6)));
+        trace.set("uFlareDecay", static_cast<float>(std::max(cv.flareDecay * inv, 1e-6)));
+    }
     trace.set("uFunnelRadius", static_cast<float>(cv.funnelRadius * inv));
+    trace.set("uFieldGlow", cv.fieldGlow);
+    trace.set("uFieldTwist", cv.fieldTwist);
+    trace.set("uFieldReach", static_cast<float>(cv.fieldReach * inv));
+    trace.set("uPairGlow", cv.pairGlow);
+    trace.set("uBeamGlow", cv.beamGlow);
+    trace.set("uBeamWidth", std::max(cv.beamWidth, 1e-3f));
+    trace.set("uCompanion", glm::vec4(glm::vec3(cv.companion) * static_cast<float>(inv),
+                                      cv.companion.w * static_cast<float>(inv)));
+    trace.set("uCompanionAxis", cv.companionAxis);
+    trace.set("uCompanionTemp", cv.companionTemperature);
+    {
+        glm::vec3 stream[16] = {};
+        const int count = static_cast<int>(std::min<size_t>(cv.stream.size(), 16));
+        for (int k = 0; k < count; ++k) stream[k] = cv.stream[k] * static_cast<float>(inv);
+        trace.set("uStreamCount", count);
+        glProgramUniform3fv(trace.id(), trace.location("uStream"), 16, &stream[0].x);
+    }
+    trace.set("uStreamWidth", static_cast<float>(cv.streamWidth * inv));
+    trace.set("uBinaryPhase", cv.binaryPhase);
+    trace.set("uSpotPhase", cv.spotPhase);
     trace.set("uSunDirection", glm::normalize(cv.sunDirection));
+    trace.set("uBodyLight", cv.bodyLight);
+    trace.set("uBodyLightTemp", cv.bodyLightTemperature);
+    // Light falling off as 1/d^2: the scale carries a length squared.
+    trace.set("uBodyLightScale", static_cast<float>(cv.bodyLight == 1 ? cv.bodyLightScale * inv * inv
+                                                                       : cv.bodyLightScale));
     {
         const int count = static_cast<int>(std::min<size_t>(cv.impacts.size(), 8));
         glm::vec4 impacts[8] = {};
@@ -377,6 +497,54 @@ void Renderer::render(const FrameInputs& in) {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, m_pathSegments);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, m_pathCells);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, m_pathIndex);
+
+    if (outflow) {
+        // The history table (render units: times over the scale).
+        const int rows = static_cast<int>(fv.table.size());
+        if (rows != m_outflowRows) {
+            if (m_outflowTexture) glDeleteTextures(1, &m_outflowTexture);
+            glCreateTextures(GL_TEXTURE_1D, 1, &m_outflowTexture);
+            glTextureStorage1D(m_outflowTexture, 1, GL_RGBA32F, rows);
+            glTextureParameteri(m_outflowTexture, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTextureParameteri(m_outflowTexture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTextureParameteri(m_outflowTexture, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            m_outflowRows = rows;
+        }
+        glTextureSubImage1D(m_outflowTexture, 0, 0, rows, GL_RGBA, GL_FLOAT, fv.table.data());
+        glm::vec3 axis = glm::normalize(fv.axis);
+        glm::vec3 e1 = glm::normalize(glm::cross(axis, std::abs(axis.z) < 0.9f ? glm::vec3(0, 0, 1) : glm::vec3(1, 0, 0)));
+        glm::vec3 e2 = glm::cross(axis, e1);
+        trace.set("uOutflowAxis", axis);
+        trace.set("uOutflowE1", e1);
+        trace.set("uOutflowE2", e2);
+        trace.set("uOutflowClock", static_cast<float>(fv.clock * inv));
+        trace.set("uOutflowTable", glm::vec2(static_cast<float>(fv.tableStart * inv),
+                                             static_cast<float>(unit / std::max(fv.tableStep, 1e-9))));
+        trace.set("uOutflowRows", static_cast<float>(rows));
+        trace.set("uOutflowStart", static_cast<float>(fv.start * inv));
+        trace.set("uOutflowSpeed", static_cast<float>(std::clamp(fv.speed, 0.005, 0.9)));
+        trace.set("uOutflowLaunch", static_cast<float>(fv.launchRadius * inv));
+        trace.set("uOutflowExtent", static_cast<float>(fv.extent * inv));
+        trace.set("uOutflowTanMax", std::tan(static_cast<float>(std::min(fv.maxOpening * 1.6, 1.45))));
+        trace.set("uOutflowMaxAngle", static_cast<float>(std::min(fv.maxOpening * 1.6, 1.5)));
+        {
+            float cone[FlareView::kConeRows] = {};
+            for (int k = 0; k < FlareView::kConeRows && k < static_cast<int>(fv.cone.size()); ++k) cone[k] = fv.cone[k];
+            glProgramUniform1fv(trace.id(), trace.location("uOutflowCone"), FlareView::kConeRows, cone);
+            const double logR0 = std::log(fv.launchRadius * inv);
+            const double span = std::max(std::log(fv.extent / fv.launchRadius), 1e-3);
+            trace.set("uOutflowConeR", glm::vec2(static_cast<float>(logR0),
+                                                 static_cast<float>((FlareView::kConeRows - 1) / span)));
+        }
+        trace.set("uOutflowThickness", fv.thickness);
+        trace.set("uOutflowLight", fv.brightness);
+        trace.set("uOutflowFalloff", fv.falloff);
+        trace.set("uFlareTemp", fv.flareTemperature);
+        trace.set("uOutflowGlow", fv.glow);
+        trace.set("uOutflowEnvelope", fv.envelope);
+        trace.set("uOutflowSwirl", fv.swirl);
+        glBindTextureUnit(12, m_outflowTexture);
+    }
 
     const int skyMode = (s.skyMode == 2 && !hasSkyImage()) ? 0 : s.skyMode;
     trace.set("uSkyMode", skyMode);
@@ -401,6 +569,15 @@ void Renderer::render(const FrameInputs& in) {
     glBindTextureUnit(6, m_pathOccupancy);
     const GLuint impactMap = in.particles ? in.particles->impactTexture() : 0;
     glBindTextureUnit(7, impactMap ? impactMap : m_placeholderTexture);
+    glBindTextureUnit(11, cv.sdoMap && m_sdoMap ? m_sdoMap : m_placeholderTexture);
+    {
+        const bool earth = cv.look == 5 && cv.planetMaps && m_earthDay && m_earthClouds && m_earthNight;
+        const bool jupiter = cv.look == 6 && cv.planetMaps && m_jupiterMap;
+        glBindTextureUnit(8, earth ? m_earthDay : (jupiter ? m_jupiterMap : m_placeholderTexture));
+        glBindTextureUnit(9, earth ? m_earthClouds : m_placeholderTexture);
+        glBindTextureUnit(10, earth ? m_earthNight : m_placeholderTexture);
+        trace.set("uPlanetMaps", earth || jupiter ? 1 : 0);
+    }
     drawFullscreen();
 
     // --- 2. Bloom: progressive downsample, then tent-filtered upsample --------
@@ -502,6 +679,75 @@ bool Renderer::saveScreenshot(const std::string& path, std::string& error) const
     return true;
 }
 
+namespace {
+// An equirectangular map (row 0 north after the flip below: v = 0 is the south pole),
+// mipmapped and wrapping in longitude; 0 if the file is missing.
+GLuint loadMap(const std::filesystem::path& path, bool srgb) {
+    stbi_set_flip_vertically_on_load(1);
+    int w = 0, h = 0, channels = 0;
+    unsigned char* data = stbi_load(path.string().c_str(), &w, &h, &channels, 4);
+    if (!data) return 0;
+    GLuint texture = 0;
+    glCreateTextures(GL_TEXTURE_2D, 1, &texture);
+    glTextureStorage2D(texture, 1 + static_cast<int>(std::log2(std::max(w, h))), srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8, w,
+                       h);
+    glTextureSubImage2D(texture, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    stbi_image_free(data);
+    glGenerateTextureMipmap(texture);
+    glTextureParameteri(texture, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTextureParameteri(texture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTextureParameteri(texture, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTextureParameteri(texture, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    return texture;
+}
+}  // namespace
+
+void Renderer::bakeSdo(const CentralView& cv, bool all) {
+    if (!m_sdoBake.valid()) return;
+    if (!m_sdoMap) {
+        glCreateTextures(GL_TEXTURE_2D, 1, &m_sdoMap);
+        glTextureStorage2D(m_sdoMap, 1 + static_cast<int>(std::log2(kSdoWidth)), GL_R16F, kSdoWidth, kSdoHeight);
+        glTextureParameteri(m_sdoMap, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTextureParameteri(m_sdoMap, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTextureParameteri(m_sdoMap, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTextureParameteri(m_sdoMap, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glCreateFramebuffers(1, &m_sdoFbo);
+        glNamedFramebufferTexture(m_sdoFbo, GL_COLOR_ATTACHMENT0, m_sdoMap, 0);
+    }
+    m_sdoBake.use();
+    glm::vec4 regions[8] = {};
+    const int count = static_cast<int>(std::min<size_t>(cv.regions.size(), 8));
+    for (int k = 0; k < count; ++k) regions[k] = cv.regions[k];
+    m_sdoBake.set("uRegionCount", count);
+    glProgramUniform4fv(m_sdoBake.id(), m_sdoBake.location("uRegions"), 8, &regions[0].x);
+    m_sdoBake.set("uGranuleFreq", cv.granuleFrequency);
+    m_sdoBake.set("uTime", cv.granulePhase * 0.03f);
+    m_sdoBake.set("uMapSize", glm::vec2(kSdoWidth, kSdoHeight));
+    glBindFramebuffer(GL_FRAMEBUFFER, m_sdoFbo);
+    glViewport(0, 0, kSdoWidth, kSdoHeight);
+    glEnable(GL_SCISSOR_TEST);
+    const int rows = kSdoHeight / kSdoBands;
+    glScissor(0, all ? 0 : m_sdoBand * rows, kSdoWidth, all ? kSdoHeight : rows);
+    glBindVertexArray(m_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisable(GL_SCISSOR_TEST);
+    glGenerateTextureMipmap(m_sdoMap);
+    m_sdoBand = (m_sdoBand + 1) % kSdoBands;
+}
+
+void Renderer::loadPlanetMaps() {
+    // Next to the shaders' folder: the source tree while developing, the executable's
+    // folder otherwise (both hold assets/planets).
+    const std::filesystem::path dir = m_shaderDir.parent_path() / "assets" / "planets";
+    m_earthDay = loadMap(dir / "earth_day.jpg", true);
+    m_earthClouds = loadMap(dir / "earth_clouds.jpg", false);
+    m_earthNight = loadMap(dir / "earth_night.jpg", false);
+    m_jupiterMap = loadMap(dir / "jupiter.jpg", true);
+    std::printf("Planet maps: %s\n", m_earthDay && m_earthClouds && m_earthNight && m_jupiterMap
+                                         ? "loaded"
+                                         : ("not found in " + dir.string()).c_str());
+}
+
 bool Renderer::loadSkyImage(const std::string& path, std::string& error) {
     stbi_set_flip_vertically_on_load(1);
     int w = 0, h = 0, channels = 0;
@@ -542,6 +788,7 @@ bool Renderer::loadSkyImage(const std::string& path, std::string& error) {
 void Renderer::hotReload() {
     for (ShaderProgram& p : m_trace) p.reloadIfChanged();
     m_bloomDown.reloadIfChanged();
+    m_sdoBake.reloadIfChanged();
     m_bloomUp.reloadIfChanged();
     m_tonemap.reloadIfChanged();
 }
