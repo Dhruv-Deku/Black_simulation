@@ -76,6 +76,7 @@ takes a couple of minutes. The executable is `build\Release\blackhole.exe`. Edit
 | Scroll, W / S | Move closer / farther |
 | A / D, Q / E | Orbit sideways / up and down |
 | Ctrl+click or middle-click | Inspect the light reaching that pixel |
+| I | Turn the ray inspector on or off (also a checkbox at the top of the panel) |
 | Drag on the orbit map | Aim a launch (with the launch planner open) |
 | Enter | Launch the planned body |
 | Space | Pause or resume |

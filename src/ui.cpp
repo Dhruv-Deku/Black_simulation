@@ -61,6 +61,14 @@ void statsSection(UiContext& ctx) {
     ImGui::Text("t = %.1f M", ctx.bodies.time);
     ImGui::SameLine();
     ImGui::TextDisabled("(coordinate time of a distant observer)");
+    ImGui::Checkbox("Ray inspector", &ctx.settings.rayInspector);
+    help("When on, Ctrl+click or middle-click any pixel to trace the light that reached it: where it "
+         "came from, its frequency shift, how often it circled the hole and how long it travelled. "
+         "Off, clicks do nothing special and the inspector is hidden. Shortcut: I.");
+    if (ctx.settings.rayInspector) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Ctrl+click a pixel");
+    }
 }
 
 void blackHoleSection(UiContext& ctx) {
@@ -868,7 +876,7 @@ void orbitMap(UiContext& ctx) {
     }
 
     // The inspected light ray.
-    if (ui.inspectorOpen && ui.inspectValid) {
+    if (ctx.settings.rayInspector && ui.inspectorOpen && ui.inspectValid) {
         std::vector<ImVec2> pts;
         for (const auto& p : ui.inspect.path) pts.push_back(projectPoint(p));
         if (pts.size() > 1) dl->AddPolyline(pts.data(), static_cast<int>(pts.size()), kRayColor, 0, 1.5f);
@@ -899,6 +907,7 @@ void orbitMap(UiContext& ctx) {
 
 void inspectorWindow(UiContext& ctx) {
     UiState& ui = ctx.state;
+    if (!ctx.settings.rayInspector) ui.inspectorOpen = false;  // switched off: forget the last result
     if (!ui.inspectorOpen || !ui.inspectValid) return;
     const bool insideHorizon = ctx.camera.insideHorizon(ctx.settings.spin);
 
@@ -970,6 +979,7 @@ void helpWindow(UiState& ui) {
             "A / D, Q / E   orbit sideways / up and down\n"
             "Ctrl+click     inspect the light reaching a pixel\n"
             "  (or middle-click)\n"
+            "I              turn the ray inspector on or off\n"
             "Enter          launch the planned body\n"
             "Space          pause or resume orbits\n"
             "R              reset the camera\n"

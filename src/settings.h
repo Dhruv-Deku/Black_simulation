@@ -60,6 +60,9 @@ struct Settings {
     float timeScale = 15.0f;  // M of coordinate time per real second
     bool paused = false;
 
+    // Tools
+    bool rayInspector = true;  // Ctrl+click or middle-click traces the light reaching a pixel
+
     // Camera
     bool slowNearHole = true;  // slow time down while the camera falls in close to the hole
     bool autoOrbit = false;

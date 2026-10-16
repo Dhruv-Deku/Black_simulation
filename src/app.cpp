@@ -470,12 +470,17 @@ void App::handleInput(float dt) {
     const bool middle = glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
     const bool ctrl = glfwGetKey(m_window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
                       glfwGetKey(m_window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
-    // Ctrl+click or middle-click: inspect the light reaching that pixel.
-    if (!io.WantCaptureMouse && ((middle && !m_middleWas) || (left && !m_leftWas && ctrl))) inspectPixel(x, y);
+    // Ctrl+click or middle-click: inspect the light reaching that pixel (when the ray
+    // inspector is on; otherwise Ctrl+drag orbits like a plain drag).
+    const bool inspecting = m_settings.rayInspector && ctrl;
+    if (m_settings.rayInspector && !io.WantCaptureMouse &&
+        ((middle && !m_middleWas) || (left && !m_leftWas && ctrl))) {
+        inspectPixel(x, y);
+    }
     m_middleWas = middle;
     m_leftWas = left;
     if (!left) m_dragLeft = false;
-    else if (!m_dragLeft && !io.WantCaptureMouse && !ctrl) m_dragLeft = true;
+    else if (!m_dragLeft && !io.WantCaptureMouse && !inspecting) m_dragLeft = true;
     if (!right) m_dragRight = false;
     else if (!m_dragRight && !io.WantCaptureMouse) m_dragRight = true;
 
@@ -494,6 +499,7 @@ void App::handleInput(float dt) {
     if (pressed(GLFW_KEY_H)) m_ui.showHelp = !m_ui.showHelp;
     if (pressed(GLFW_KEY_R)) m_camera.reset();
     if (pressed(GLFW_KEY_G)) m_settings.skyMode = m_settings.skyMode == 1 ? 0 : 1;
+    if (pressed(GLFW_KEY_I)) m_settings.rayInspector = !m_settings.rayInspector;
     if (pressed(GLFW_KEY_F12)) saveScreenshot(timestampedPath("screenshots", ".png"));
     if (pressed(GLFW_KEY_ESCAPE) && m_recording.active) stopRecording();
 
