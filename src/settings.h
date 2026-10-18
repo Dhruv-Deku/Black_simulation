@@ -24,6 +24,7 @@ struct Settings {
     bool magnetosphere = true;     // magnetized stars truncate the disk and feed accretion columns
     bool fieldLines = true;        // a neutron star's magnetic field lines, glowing (false color)
     bool pulsarBeams = true;       // pulsars' beams, as if lighting a haze
+    bool starquakes = true;        // a young neutron star's crust slips now and then and rings
     float magnetosphereGlow = 1.0f;  // brightness of both
     bool surfaceDetail = true;     // spots, granulation, hot spots, flares
     float surfaceBrightness = 1.0f;

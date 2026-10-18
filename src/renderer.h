@@ -89,6 +89,15 @@ struct CentralView {
     std::vector<glm::vec4> impacts;
     std::vector<double> impactAges;
     double impactFade = 20.0;
+    // A young neutron star drawn as films show one (central::Object::beacon): the glow
+    // around it, and the starquakes ringing in its crust. For each quake: how long ago it
+    // began (M), how far the magnetic poles swing at first (radians), the crust mode's
+    // angular frequency (rad / M) and decay time (M); and which way it shakes the poles
+    // (the star's rotating frame) with the mode's degree l.
+    bool beacon = false;
+    float haloGlow = 0.0f;
+    std::vector<glm::vec4> quakes;
+    std::vector<glm::vec4> quakeAxes;
     // A surface-wide flash (an X-ray burst, a nova, a collapse): age, strength, fade time.
     double flashAge = 1e30, flashStrength = 0.0, flashFade = 50.0;
 };

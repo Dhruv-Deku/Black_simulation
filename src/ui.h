@@ -138,6 +138,7 @@ struct UiContext {
     bool einsteinRingRequested = false;
     int centralRequested = -1;       // a central::catalog() entry
     bool burstRequested = false;     // set off a thermonuclear flash on the surface
+    bool quakeRequested = false;     // a young neutron star's crust slips (a glitch)
 };
 
 // Turns the custom launch form into initial conditions (scene scale `scale`, central

@@ -374,6 +374,16 @@ void centralSection(UiContext& ctx) {
                      "positron pairs. False color: this plasma shines in X-rays and radio, not visible light.");
                 ImGui::SameLine();
                 ImGui::Checkbox("Beams", &s.pulsarBeams);
+                if (o.beacon) {
+                    ImGui::Checkbox("Starquakes", &s.starquakes);
+                    help("A young neutron star spins down, straining its crust until it slips: a glitch (Vela's spin "
+                         "jumps by ~2 parts in a million every ~3 years). The crust then rings in its torsional "
+                         "modes, at ~22 Hz and up (the oscillations seen after magnetar flares), shaking the field's "
+                         "footpoints: the beams wobble and the star shimmers. Here they come every few turns, and the "
+                         "swing is exaggerated, to be seen.");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Starquake now")) ctx.quakeRequested = true;
+                }
                 help("A pulsar's twin beams, from the open field lines over its magnetic poles, at the opening angle "
                      "the last open field line gives (28 degrees for the Crab, ~4 for a slow magnetar). Drawn as if "
                      "they lit a faint haze; light far out left when the star had turned less, so fast pulsars' "

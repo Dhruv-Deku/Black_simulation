@@ -457,6 +457,21 @@ void Renderer::render(const FrameInputs& in) {
     trace.set("uFieldReach", static_cast<float>(cv.fieldReach * inv));
     trace.set("uPairGlow", cv.pairGlow);
     trace.set("uBeamGlow", cv.beamGlow);
+    trace.set("uBeacon", cv.beacon ? 1 : 0);
+    trace.set("uHaloGlow", cv.haloGlow);
+    {
+        glm::vec4 quakes[4] = {}, axes[4] = {};
+        const int count = static_cast<int>(std::min<size_t>(std::min(cv.quakes.size(), cv.quakeAxes.size()), 4));
+        for (int k = 0; k < count; ++k) {
+            // Into render units: ages and decay times over the scale, frequency times it.
+            quakes[k] = glm::vec4(static_cast<float>(cv.quakes[k].x * inv), cv.quakes[k].y,
+                                  static_cast<float>(cv.quakes[k].z * unit), static_cast<float>(cv.quakes[k].w * inv));
+            axes[k] = cv.quakeAxes[k];
+        }
+        trace.set("uQuakeCount", count);
+        glProgramUniform4fv(trace.id(), trace.location("uQuakes"), 4, &quakes[0].x);
+        glProgramUniform4fv(trace.id(), trace.location("uQuakeAxes"), 4, &axes[0].x);
+    }
     trace.set("uBeamWidth", std::max(cv.beamWidth, 1e-3f));
     trace.set("uCompanion", glm::vec4(glm::vec3(cv.companion) * static_cast<float>(inv),
                                       cv.companion.w * static_cast<float>(inv)));

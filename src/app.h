@@ -53,6 +53,7 @@ struct LaunchOptions {
     std::optional<float> gasCollisions, gasCooling;
     bool noBodyGravity = false;
     bool noFlare = false;
+    bool starquake = false;  // a young neutron star's crust slips at the start
     int debugView = 0;  // 1 = step heat map, 2 = escape direction
 
     // Video: record this many seconds to recordPath, then exit.
@@ -153,6 +154,18 @@ private:
         float strength;
     };
     std::vector<StarFlare> m_flares;
+    // Starquakes on a young neutron star (central::Object::beacon): when, how far the
+    // magnetic poles swing at first (radians), the crust mode's degree, and which way it
+    // shakes them (the star's rotating frame, across the magnetic axis).
+    struct Quake {
+        double time;
+        float amplitude;
+        int l;
+        glm::vec3 direction;
+    };
+    std::vector<Quake> m_quakes;
+    // The crust slips now: a glitch, and the crust rings.
+    void starquake();
     double m_lastAccreted = 0.0;     // bodies and gas that had hit the surface at the last check
     float m_screenFlash = 0.0f;      // a collapse lights up the whole view for a moment
     // The stream of a cataclysmic variable, cached (centralView): mass ratio, rim, path.
