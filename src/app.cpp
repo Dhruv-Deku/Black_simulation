@@ -1292,6 +1292,7 @@ CentralView App::centralView() const {
         v.surface = o.radius;
         v.omega = o.surfaceOmega();
         v.phase = std::fmod(v.omega * m_bodies.time, 2.0 * kerr::kPi);
+        v.turns = std::fmod(v.omega * m_bodies.time / (2.0 * kerr::kPi), 4096.0);
         v.azimuthShift = kerr::azimuthShift(spin, o.radius);
         v.temperature = static_cast<float>(central::displayTemperature(o.surfaceTemperature));
         const double tilt = o.magneticTiltDeg * kerr::kPi / 180.0;

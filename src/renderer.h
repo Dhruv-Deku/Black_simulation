@@ -26,6 +26,7 @@ struct CentralView {
     double surface = 0.0;         // surface radius; 0 for a black hole
     double omega = 0.0;           // angular velocity of the surface
     double phase = 0.0;           // its rotation angle now (from phi_BL)
+    double turns = 0.0;           // turns it has made so far (counted on, modulo 4096)
     double azimuthShift = 0.0;    // phi - phi_BL at the surface
     float temperature = 6000.0f;  // display temperature of the surface, K
     float hotSpotTemperature = 0.0f;  // magnetic polar caps (0: none)

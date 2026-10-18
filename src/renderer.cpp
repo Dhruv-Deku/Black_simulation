@@ -396,6 +396,7 @@ void Renderer::render(const FrameInputs& in) {
     trace.set("uSurfaceR", static_cast<float>(cv.surface * inv));
     trace.set("uSurfaceOmega", static_cast<float>(cv.omega * unit));
     trace.set("uSurfacePhase", static_cast<float>(std::fmod(cv.phase, 2.0 * kerr::kPi)));
+    trace.set("uSurfaceTurns", static_cast<float>(cv.turns));
     trace.set("uSurfaceShift", static_cast<float>(cv.azimuthShift));
     trace.set("uSurfaceTemp", cv.temperature);
     trace.set("uHotSpotTemp", cv.hotSpotTemperature);

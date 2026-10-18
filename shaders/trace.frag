@@ -102,6 +102,7 @@ uniform int uCentralKind;       // 0 black hole, 1 neutron star, 2 white dwarf, 
 uniform float uSurfaceR;        // surface radius; 0 for a black hole
 uniform float uSurfaceOmega;    // angular velocity of the surface
 uniform float uSurfacePhase;    // its rotation angle now
+uniform float uSurfaceTurns;    // turns it has made so far (modulo 4096): which pulse is which
 uniform float uSurfaceShift;    // phi - phi_BL at the surface (the Kerr-Schild azimuth runs ahead)
 uniform float uSurfaceTemp;     // display temperature of the surface, K
 uniform float uHotSpotTemp;     // display temperature of the magnetic polar caps (0: none)

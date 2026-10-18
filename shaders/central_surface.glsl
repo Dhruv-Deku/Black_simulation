@@ -1084,7 +1084,7 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
                 profile = exp(-0.693 * psi * psi);
                 glowPart = 0.06 * exp(-0.173 * psi * psi);
                 if (profile + glowPart < 1e-3) continue;
-                float turns = (uSurfacePhase - uSurfaceOmega * delay) / (2.0 * PI);
+                float turns = uSurfaceTurns - uSurfaceOmega * delay / (2.0 * PI);
                 float side = along > 0.0 ? 0.0 : 17.0;
                 float k0 = floor(turns);
                 float pulse = mix(hash13(vec3(k0, side, 3.1)), hash13(vec3(k0 + 1.0, side, 3.1)),
@@ -1107,8 +1107,14 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
             // Films' beams: white-hot along the axis, electric blue at the edges.
             if (uFilmColor == 1) tint = 2.0 * mix(vec3(0.25, 0.6, 1.0), vec3(0.95, 0.98, 1.0), exp(-psi * psi * 6.0));
             // Films keep the needle bright far out: it fades as 1 / r, not 1 / r^2 (its
-            // soft glow as 1 / r^2).
+            // soft glow as 1 / r^2), and ends before it reaches the camera (14 radii out, or
+            // sooner when the camera is closer), so a beam turned toward you does not swell
+            // into a blob as it passes the lens.
             float dim = uBeacon == 1 && uFilmColor == 1 ? q : q * q;
+            if (uBeacon == 1) {
+                float reachR = min(14.0 * R, 0.8 * uCamPos.x);
+                dim *= 1.0 - smoothstep(0.7 * reachR, reachR, r);
+            }
             color += transmittance * tint * (uBeamGlow * (profile * dim + glowPart * q * q) * rise * dl / R);
         }
     }
