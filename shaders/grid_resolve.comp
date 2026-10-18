@@ -5,7 +5,8 @@
 // the gas in each voxel. Storing rho-weighted values means trilinear filtering
 // followed by a division by filtered rho gives a proper average even at the edge of
 // the debris, where neighbours are empty. Two layouts (uPhysics):
-//   drawing (particles_deposit.comp): rho, rho T / 1e4 K, rho u^t, rho u^r | rho u^theta, rho u^phi
+//   drawing (particles_deposit.comp): rho, rho T / 1e4 K, rho u^t, rho u^r | rho u^theta, rho u^phi,
+//                                     rho l1, rho l2 (the parcels' Lagrangian labels)
 //   physics (particles_update.comp):  rho, rho T / 1e4 K, rho v_r, rho v_theta | rho v_phi,
 //                                     with v the ZAMO-frame velocity
 
@@ -28,11 +29,12 @@ uniform vec2 uGridLogR;
 uniform float uDensityScale;
 
 const float PI = 3.14159265358979;
+const int kGridChannels = 8;  // as in particle_common.glsl
 
 void main() {
     ivec3 c = ivec3(gl_GlobalInvocationID);
     if (any(greaterThanEqual(c, uGridDims))) return;
-    int base = 6 * ((c.z * uGridDims.y + c.y) * uGridDims.x + c.x);
+    int base = kGridChannels * ((c.z * uGridDims.y + c.y) * uGridDims.x + c.x);
     int weight = cells[base];
     if (weight <= 0) {
         imageStore(uDensity, c, vec4(0.0));
@@ -59,7 +61,8 @@ void main() {
     vec4 u = vec4(float(cells[base + 1]), float(cells[base + 2]) / 16.0, float(cells[base + 3]) / 256.0,
                   float(cells[base + 4]) / 256.0) * inv;
     imageStore(uDensity, c, density * vec4(1.0, temperature * 1e-4, u.x, u.y));
-    imageStore(uVelocity, c, density * vec4(u.z, u.w, 0.0, 0.0));
+    vec2 label = vec2(float(cells[base + 6]), float(cells[base + 7])) * (inv * 256.0 / 16384.0);
+    imageStore(uVelocity, c, density * vec4(u.z, u.w, label));
 
     if (uMarkOccupancy == 0) return;
     // Mark this block and the blocks of neighbouring voxels: filtering reaches one

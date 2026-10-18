@@ -56,6 +56,10 @@ std::vector<float> makeTable(int n) {
     return table;
 }
 
+double luminance(double temperature) {
+    return planckXYZ(temperature).y / planckXYZ(6500.0).y;
+}
+
 glm::vec3 hue(double temperature) {
     glm::dvec3 rgb = xyzToLinearSrgb(planckXYZ(temperature));
     double peak = std::max({rgb.r, rgb.g, rgb.b, 1e-300});

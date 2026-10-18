@@ -7,6 +7,10 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
 include(FetchContent)
 
+# The C++ runtime is linked in statically (into the dependencies too), so the prebuilt
+# executables in bin\ run on machines without the Visual C++ redistributable.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # ---------------------------------------------------------------------------
 # Third-party dependencies (downloaded on first configure)
 # ---------------------------------------------------------------------------
@@ -71,11 +75,17 @@ endif()
 # Kerr physics: no graphics dependencies, shared by the app and the tests.
 add_library(bh_physics STATIC
     src/kerr.cpp src/kerr.h
+    src/central.cpp src/central.h
     src/debris.cpp src/debris.h
+    src/tde.cpp src/tde.h
     src/trajectory.cpp src/trajectory.h
     src/tidal.cpp src/tidal.h
-    src/gravity.cpp src/gravity.h)
+    src/gravity.cpp src/gravity.h
+    src/surface.cpp src/surface.h
+    src/bodies.cpp src/bodies.h
+    src/blackbody.cpp src/blackbody.h)
 target_include_directories(bh_physics PUBLIC src)
+target_link_libraries(bh_physics PUBLIC glm::glm)
 target_compile_options(bh_physics PRIVATE ${BH_WARNINGS})
 
 # Shaders are loaded from the source tree while developing so edits hot-reload,
@@ -86,8 +96,6 @@ configure_file(src/config.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/config.h @O
 add_executable(blackhole
     src/main.cpp
     src/app.cpp           src/app.h
-    src/bodies.cpp        src/bodies.h
-    src/blackbody.cpp     src/blackbody.h
     src/camera.cpp        src/camera.h
     src/gl_util.cpp       src/gl_util.h
     src/particles.cpp     src/particles.h
@@ -106,7 +114,9 @@ endif()
 add_custom_command(TARGET blackhole POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders" "$<TARGET_FILE_DIR:blackhole>/shaders"
-    COMMENT "Copying shaders next to the executable")
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets" "$<TARGET_FILE_DIR:blackhole>/assets"
+    COMMENT "Copying shaders and assets next to the executable")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT blackhole)
 set_target_properties(blackhole PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 

@@ -1,6 +1,11 @@
 // Shared by the debris compute shaders: the particle layout and the geodesic
 // equations for a massive particle (mu = 1), the GPU twin of kerr::derivatives,
 // plus conversions to and from the local ZAMO frame.
+//
+// The GPU works in render units of `scale` M (src/central.h, Object::sceneScale): 1 for
+// black holes and neutron stars, R/6 around bigger objects, so numbers stay of order
+// 1-1000 in single precision. The metric is then Kerr with mass m = 1 / scale and spin
+// a = chi m; every formula carries m explicitly (m = 1 is the original M = 1 form).
 
 struct Particle {
     vec4 state;      // r, theta, phi, and 1 = alive, 0.5 = gone but its light still on the way, 0 = dead
@@ -11,7 +16,13 @@ struct Particle {
     // it was created (-1e30 if it has always been there) and before it was lost.
     vec4 seen;
     vec4 seenVelocity;  // vr, vtheta, time created, time lost (1e30 while it lasts)
+    // Where the parcel sat in the star (or cloud) it came from, across the direction the
+    // tide stretched it, in that body's radii: the ray tracer draws fine strands from it.
+    vec4 label;
 };
+// Values summed per voxel of the grids: weight, four velocity (or temperature and
+// velocity) sums, temperature, and the two labels (see grid_resolve.comp).
+const int kGridChannels = 8;
 layout(std430, binding = 1) buffer Particles {
     Particle particles[];
 };
@@ -25,20 +36,20 @@ float inflowFactor(float P, float vr, float delta, float K) {
 }
 
 // Mino-time derivatives in Kerr-Schild coordinates: dt/dtau, dphi/dtau, d2r/dtau2,
-// d2theta/dtau2, for radial velocity vr = dr/dtau.
-void massiveRhs(float a, float E, float L, float Q, float r, float th, float vr,
+// d2theta/dtau2, for radial velocity vr = dr/dtau, around mass m with spin a.
+void massiveRhs(float m, float a, float E, float L, float Q, float r, float th, float vr,
                 out float tDot, out float phiDot, out float accR, out float accTh) {
     float s = sin(th), c = cos(th);
     float s2 = max(s * s, 1e-8);
     float s3 = s2 * max(abs(s), 1e-4) * (s < 0.0 ? -1.0 : 1.0);
     float a2 = a * a;
-    float delta = r * r - 2.0 * r + a2;
+    float delta = r * r - 2.0 * m * r + a2;
     float rra = r * r + a2;
     float P = E * rra - a * L;
     float x = L - a * E;
     float K = r * r + x * x + Q;
     float F = inflowFactor(P, vr, delta, K);
-    accR = 2.0 * E * r * P - (r - 1.0) * K - delta * r;
+    accR = 2.0 * E * r * P - (r - m) * K - delta * r;
     accTh = s * c * a2 * (1.0 - E * E) + L * L * c / s3;
     phiDot = a * F - a * E + L / s2;
     tDot = rra * F - a * (a * E * s * s - L) - vr;
@@ -46,9 +57,10 @@ void massiveRhs(float a, float E, float L, float Q, float r, float th, float vr,
 
 // Re-projects the velocities onto vr^2 = R(r) and vtheta^2 = Theta(theta) away from
 // turning points (see kerr::enforceConstraints).
-void enforceMassiveConstraints(float a, float E, float L, float Q, float r, float th, inout float vr, inout float vth) {
+void enforceMassiveConstraints(float m, float a, float E, float L, float Q, float r, float th, inout float vr,
+                               inout float vth) {
     float a2 = a * a;
-    float delta = r * r - 2.0 * r + a2;
+    float delta = r * r - 2.0 * m * r + a2;
     float P = E * (r * r + a2) - a * L;
     float x = L - a * E;
     float K = r * r + x * x + Q;
@@ -62,6 +74,11 @@ void enforceMassiveConstraints(float a, float E, float L, float Q, float r, floa
     if (Theta > 0.05 * (abs(Q) + abs(polarMass) + L * L * cot2)) vth = (vth < 0.0 ? -1.0 : 1.0) * sqrt(Theta);
 }
 
+// The outer horizon r+ = m + sqrt(m^2 - a^2).
+float horizonRadius(float m, float a) {
+    return m + sqrt(max(m * m - a * a, 0.0));
+}
+
 // --- The local ZAMO frame (outside the horizon only) ------------------------------
 
 struct Zamo {
@@ -70,14 +87,14 @@ struct Zamo {
     float varpi;  // sqrt(A / Sigma) sin(theta): circumference radius
 };
 
-Zamo zamoAt(float a, float r, float th) {
+Zamo zamoAt(float m, float a, float r, float th) {
     float s = max(abs(sin(th)), 1e-6), c = cos(th);
     Zamo z;
     z.sigma = r * r + a * a * c * c;
-    z.delta = r * r - 2.0 * r + a * a;
+    z.delta = r * r - 2.0 * m * r + a * a;
     float rra = r * r + a * a;
     z.bigA = rra * rra - a * a * z.delta * s * s;
-    z.omega = 2.0 * a * r / z.bigA;
+    z.omega = 2.0 * m * a * r / z.bigA;
     z.alpha = sqrt(max(z.sigma * z.delta / z.bigA, 1e-12));
     z.varpi = sqrt(z.bigA / z.sigma) * s;
     return z;

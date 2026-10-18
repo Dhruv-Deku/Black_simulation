@@ -1,29 +1,50 @@
 #version 460 core
 
-// Kerr black hole ray tracer.
+// Ray tracer for a black hole, neutron star, white dwarf, star or planet.
 //
 // Each pixel follows the photon that reaches the camera, traced backwards along an
 // exact null geodesic of the Kerr metric in ingoing Kerr-Schild coordinates
 // (src/kerr.h), which stay regular across the horizon: the camera can be inside it.
-// Units are G = c = M = 1. The photon is scaled so the camera measures unit energy;
-// its constants of motion are E, L and Q (E can be negative in the ergosphere).
+// The photon is scaled so the camera measures unit energy; its constants of motion
+// are E, L and Q (E can be negative in the ergosphere).
+//
+// Units: render units of `scale` M (src/central.h, Object::sceneScale), so the metric
+// is Kerr with mass m = uMass = 1 / scale and spin a = chi m. For black holes and
+// neutron stars scale = 1 and m = 1 (G = c = M = 1); around a big star or planet it
+// keeps the numbers of order 1-1000 in single precision.
+//
+// Outside any non-rotating body spacetime is Schwarzschild (Birkhoff), and a rotating
+// one is given the Kerr exterior with its mass and angular momentum: a star differs
+// from a black hole only in that rays end on its surface, at r = uSurfaceR.
 //
 // The equations are Carter's separated geodesic equations in Mino time tau
 // (d lambda = Sigma d tau), used in second-order form so that turning points need
 // no special handling (see src/kerr.h; src/kerr.cpp is the tested CPU reference):
-//     d^2 r / d tau^2     = R'(r) / 2
+//     d^2 r / d tau^2     = R'(r) / 2 = 2 E r P - (r - m) K
 //     d^2 theta / d tau^2 = Theta'(theta) / 2
 //     d phi / d tau       = a F - a E + L / sin^2(theta)
 //     d t / d tau         = (r^2 + a^2) F - a (a E sin^2(theta) - L) - dr/dtau
-// with F = (P + dr/dtau) / Delta, evaluated without the 0/0 at the horizon.
-// Because we trace backwards, s = -tau: the second derivatives keep their sign and
-// the first-order rates flip. Integrating dt/dtau along the way gives the
-// light-travel delay: how long ago the light was emitted at each point of the ray.
+// with Delta = r^2 - 2 m r + a^2 and F = (P + dr/dtau) / Delta, evaluated without the
+// 0/0 at the horizon. Because we trace backwards, s = -tau: the second derivatives
+// keep their sign and the first-order rates flip. Integrating dt/dtau along the way
+// gives the light-travel delay: how long ago the light was emitted at each point.
 
 layout(location = 0) out vec4 outColor;
 
+// Variants (src/renderer.cpp): CENTRAL_BODY for a star or planet at the center
+// (surfaces, coronae, accretion columns, any scene scale); without it, a black hole,
+// whose mass is the constant 1 (scene scale 1). LENSES when small black holes orbit.
+// Code a scene does not need is left out, because every register the main loop uses
+// costs speed.
+#ifdef CENTRAL_BODY
+uniform float uMass;        // m: the central mass in render units (1 / scene scale)
+#define MASS uMass
+#else
+#define MASS 1.0
+#endif
+
 uniform vec2 uResolution;
-uniform float uSpin;
+uniform float uSpin;        // a, in render units
 uniform vec3 uCamPos;       // camera (r, theta, phi)
 uniform mat3 uCamBasis;     // camera right/up/forward on the camera frame's (r, theta, phi) axes
 // The camera frame (4-velocity and three axes), each column holding one frame vector
@@ -60,17 +81,77 @@ uniform int uDebrisEnabled;
 uniform vec2 uGridLogR;  // log of the debris grid's inner and outer radius
 uniform float uDebrisBrightness;
 uniform float uDebrisOpacity;
+uniform float uDebrisFilaments;  // 0..1: fine strands drawn from the parcels' labels
+uniform float uDebrisGlowFloor;  // K: the debris glows at least this hot (display only)
 
 uniform int uPathsEnabled;      // draw orbit trails and predictions as lensed lines
 uniform ivec3 uPathGridDims;    // cells binning the line segments (log r, theta, phi)
+uniform vec2 uPathLogR;         // log of the path grid's inner and outer radius
 uniform float uPathWidth;       // line half-width in pixels
 uniform int uSkipBody;          // the body the camera rides with (not drawn), or -1
+uniform float uHistoryScale;    // the body history is stored in M: times this for render units
 
 uniform int uJetsEnabled;
 uniform float uJetPower;
 uniform float uJetSpeed;        // beta of the jet plasma
 uniform float uJetOpening;      // tan of the half opening angle
 uniform float uTime;            // coordinate time, for moving knots in the jets
+
+// --- The central object --------------------------------------------------------------
+uniform int uCentralKind;       // 0 black hole, 1 neutron star, 2 white dwarf, 3 star, 4 rocky planet, 5 gas giant
+uniform float uSurfaceR;        // surface radius; 0 for a black hole
+uniform float uSurfaceOmega;    // angular velocity of the surface
+uniform float uSurfacePhase;    // its rotation angle now
+uniform float uSurfaceShift;    // phi - phi_BL at the surface (the Kerr-Schild azimuth runs ahead)
+uniform float uSurfaceTemp;     // display temperature of the surface, K
+uniform float uHotSpotTemp;     // display temperature of the magnetic polar caps (0: none)
+uniform float uSurfaceBrightness;
+uniform int uSurfaceDetail;     // spots, granulation, flares
+uniform vec3 uMagneticAxis;     // in the star's rotating frame
+uniform int uPulsar;            // beams sweep from the magnetic poles
+uniform int uMagnetar;          // the crust flares
+uniform int uSurfaceLook;       // how the surface is drawn (kLook* in central_surface.glsl)
+uniform int uFilmColor;         // stars and their disks in film colors (filmHue, central_surface.glsl)
+uniform float uBinaryPhase;     // a cataclysmic variable's companion: its azimuth now
+uniform float uSpotPhase;       // and where its stream strikes the disk's rim
+uniform float uEnvelope;        // a red giant's extended atmosphere (film colors; 0: none)
+uniform float uSurfaceKm;       // surface radius in km (the planet's air is drawn at true scale)
+uniform float uPlanetSeed;      // which continents, storms, bands
+uniform float uPlanetLight;     // sunlight on a planet, relative to a star's disk
+uniform int uAtmosphere;        // 1: an Earth-like atmosphere
+uniform float uCoronaScale;     // corona brightness per unit electron column (0: none)
+uniform float uChromosphereScale;   // the chromosphere's pink rim (0: none)
+uniform float uChromosphereHeight;  // its scale height, in surface radii
+uniform float uGranuleFreq;     // convection cells per radian of the surface
+uniform float uGranuleContrast; // their rms temperature contrast
+uniform float uGranulePhase;    // their evolution now, in lifetimes
+uniform float uGranuleRate;     // lifetimes per unit of render time (for the light delay)
+uniform float uGranuleLane;     // width of the dark lanes between cells, relative to a cell
+uniform int uSpotCount;
+uniform vec4 uSpots[32];        // starspots: direction in the rotating frame, angular radius
+uniform float uSpotUmbra[32];   // umbra radius / spot radius (1: a pore, no penumbra)
+uniform float uSpotDrop;        // umbral temperature drop, as a fraction of the surface's
+uniform int uRegionCount;
+uniform vec4 uRegions[8];       // active regions: direction, angular radius (faculae, streamers)
+uniform float uCapCos;          // cos of the angular radius of the magnetic polar caps
+uniform int uFlareCount;
+uniform vec4 uFlares[4];        // white-light flares: direction in the rotating frame, strength
+uniform float uFlareAges[4];    // time since each began
+uniform float uFlareRise, uFlareDecay;  // their light curve
+uniform float uFunnelRadius;    // gas falls along dipole field lines from here to the poles; 0 = none
+uniform vec3 uSunDirection;     // a planet at the center is lit from here
+// What lights planets and moons among the bodies: 0, the disk at the center; 1, the star
+// at the center, its light at distance d being uBodyLightScale / d^2 of the Sun's at the
+// Earth; 2, the distant Sun along uSunDirection (uBodyLightScale), blocked in the central
+// planet's shadow.
+uniform int uBodyLight;
+uniform float uBodyLightTemp;
+uniform float uBodyLightScale;
+uniform int uImpactCount;
+uniform vec4 uImpacts[8];       // bodies that struck the surface: direction in the rotating frame, strength
+uniform float uImpactAges[8];   // time since each impact
+uniform float uImpactFade;      // e-folding time of the hot spots
+uniform vec3 uFlash;            // a surface-wide flash: time since it began, strength, fade time
 
 layout(binding = 0) uniform sampler2D uBlackbody;
 layout(binding = 1) uniform sampler2D uSkyTex;
@@ -79,11 +160,12 @@ layout(binding = 3) uniform sampler3D uDebrisDensity;   // rho, rho T / 1e4, rho
 layout(binding = 4) uniform sampler3D uDebrisVelocity;  // rho u^theta, rho u^phi
 layout(binding = 5) uniform usampler3D uDebrisOccupancy;  // nonzero where any debris is nearby
 layout(binding = 6) uniform usampler3D uPathOccupancy;    // nonzero for path cells holding any segment
+layout(binding = 7) uniform sampler2D uImpactMap;         // gas that struck the surface: colatitude x longitude
 
 struct Body {
     vec4 positionRadius;  // Cartesian center now, radius
     vec4 fourVelocity;    // u^t, u^r, u^theta, u^phi now
-    vec4 params;          // temperature, brightness, kind, seed
+    vec4 params;          // temperature (small black holes: mass), brightness, kind, seed
     vec4 motion;          // rotation angle now, rotation rate, history slot, history length
     vec4 range;           // r range over the light-delay window, time since lost (-1: it is not), bounding radius
     vec4 shapeA;          // S_xx, S_yy, S_zz, stretch: S maps the (tidally deformed) body onto a sphere
@@ -97,6 +179,9 @@ layout(std140, binding = 0) uniform Bodies {
 };
 
 const int kStar = 0, kRockyPlanet = 1, kGasGiant = 2, kPulsar = 3, kTidalStar = 4;
+const int kWhiteDwarf = 5, kNeutronStar = 6, kMiniHole = 7, kMoon = 8;
+const int kCentralHole = 0, kCentralNeutron = 1, kCentralDwarf = 2, kCentralStar = 3, kCentralRocky = 4,
+          kCentralGiant = 5;
 
 // Line segments of orbit trails and predicted paths, binned into a coarse grid.
 struct PathSegment {
@@ -132,28 +217,39 @@ float inflowFactor(float P, float vr, float delta, float K) {
     return (P + vr) / (abs(delta) > 1e-6 ? delta : (delta < 0.0 ? -1e-6 : 1e-6));
 }
 
+float deltaAt(float r) {
+    return r * r - 2.0 * MASS * r + spinA2;
+}
+
 // Rates along the backward ray at (r, theta) with backward radial velocity vr.
 void geodesicRhs(float r, float th, float vr, out float dPhi, out float accR, out float accTh, out float tDot) {
     float s = sin(th), c = cos(th);
     float s2 = max(s * s, 1e-8);
     float s3 = s2 * max(abs(s), 1e-4) * (s < 0.0 ? -1.0 : 1.0);
-    float delta = r * r - 2.0 * r + spinA2;
+    float delta = deltaAt(r);
     float rra = r * r + spinA2;
     float P = photonE * rra - spinA * photonL;
     float x = photonL - spinA * photonE;
     float K = photonQ + x * x;
     float F = inflowFactor(P, -vr, delta, K);
-    accR = 2.0 * photonE * r * P - (r - 1.0) * K;
+    accR = 2.0 * photonE * r * P - (r - MASS) * K;
     accTh = -spinA2 * photonE * photonE * s * c + photonL * photonL * c / s3;
     dPhi = -(spinA * F - spinA * photonE + photonL / s2);
     tDot = rra * F - spinA * (spinA * photonE * s * s - photonL) + vr;
+}
+
+// R(r) = P^2 - Delta K, the square of the radial Mino velocity.
+float radialPotential(float r) {
+    float P = photonE * (r * r + spinA2) - spinA * photonL;
+    float x = photonL - spinA * photonE;
+    return P * P - deltaAt(r) * (photonQ + x * x);
 }
 
 // Away from turning points, snap the velocities back onto vr^2 = R(r) and
 // vtheta^2 = Theta(theta). This stops rounding errors made far from the hole,
 // where R ~ r^4, from turning into fake turning points near it.
 void enforceConstraints(float r, float th, inout float vr, inout float vth) {
-    float delta = r * r - 2.0 * r + spinA2;
+    float delta = deltaAt(r);
     float P = photonE * (r * r + spinA2) - spinA * photonL;
     float x = photonL - spinA * photonE;
     float K = photonQ + x * x;
@@ -187,12 +283,22 @@ vec3 cartesianVelocity(float r, float th, float ph, float vr, float vth, float d
 // Covariant momentum: p_t = -E, p_phi = L, p_theta = -vth and p_r = F - E, from the
 // backward-traced velocities vr and vth.
 float frequencyRatio(vec4 u, float r, float vr, float vth) {
-    float delta = r * r - 2.0 * r + spinA2;
+    float delta = deltaAt(r);
     float P = photonE * (r * r + spinA2) - spinA * photonL;
     float x = photonL - spinA * photonE;
     float F = inflowFactor(P, -vr, delta, photonQ + x * x);
     float nuEmit = photonE * u.x - (F - photonE) * u.y + vth * u.z - photonL * u.w;
     return 1.0 / max(nuEmit, 1e-4);
+}
+
+// Boyer-Lindquist g_tt, g_tphi and g_phiphi at (r, theta). (Kerr-Schild ones agree for
+// anything at fixed r, such as a rotating surface or gas on circular orbits.)
+void blMetric(float r, float th, out float gtt, out float gtp, out float gpp) {
+    float s2 = sin(th) * sin(th);
+    float sigma = r * r + spinA2 * (1.0 - s2);
+    gtt = -(1.0 - 2.0 * MASS * r / sigma);
+    gtp = -2.0 * MASS * spinA * r * s2 / sigma;
+    gpp = (r * r + spinA2 + 2.0 * MASS * spinA2 * r * s2 / sigma) * s2;
 }
 
 // --- Color -----------------------------------------------------------------------
@@ -227,6 +333,8 @@ vec3 shiftedBlackbody(float T, float g, float Tref) {
     return blackbody(T) * norm;
 }
 
+#include "surfaces.glsl"
+
 // --- Accretion disk ---------------------------------------------------------------
 
 float diskPattern(float r, float psi, float seed) {
@@ -237,6 +345,11 @@ float diskPattern(float r, float psi, float seed) {
     return clamp(broad * 0.6 + fine * 0.25 + rings * 0.2, 0.0, 1.0);
 }
 
+#ifdef CENTRAL_BODY
+vec3 filmHue(float T);   // central_surface.glsl
+vec3 aia304(float t);
+#endif
+
 // Emission (rgb) and opacity (a) of the thin disk where a ray crosses it. delay is
 // how long ago the light left that point: the turbulence is shown as it was then.
 vec4 diskEmission(float r, float phi, float delay) {
@@ -246,11 +359,11 @@ vec4 diskEmission(float r, float phi, float delay) {
     float flux = max(pow(x, -3.0) * (1.0 - inversesqrt(x)), 0.0);
     float T = uDiskTemp * pow(flux / 0.0566524, 0.25);
 
-    // Gas on circular equatorial geodesics.
-    float omega = uDiskDirection / (pow(r, 1.5) + uDiskDirection * spinA);
-    float gtt = -(1.0 - 2.0 / r);
-    float gtp = -2.0 * spinA / r;
-    float gpp = r * r + spinA2 + 2.0 * spinA2 / r;
+    // Gas on circular equatorial geodesics: Omega = +-sqrt(m) / (r^1.5 +- a sqrt(m)).
+    float sm = sqrt(MASS);
+    float omega = uDiskDirection * sm / (pow(r, 1.5) + uDiskDirection * spinA * sm);
+    float gtt, gtp, gpp;
+    blMetric(r, 0.5 * PI, gtt, gtp, gpp);
     float norm = -(gtt + 2.0 * gtp * omega + gpp * omega * omega);
     if (norm <= 0.0) return vec4(0.0);  // no timelike circular orbit here
     float ut = inversesqrt(norm);
@@ -270,6 +383,51 @@ vec4 diskEmission(float r, float phi, float delay) {
     float alpha = clamp(uDiskOpacity * density * edges, 0.0, 1.0);
 
     vec3 emit = shiftedBlackbody(T, g, uDiskTemp) * uDiskBrightness * mix(1.0, 0.35 + 1.3 * n, uDiskTurbulence);
+#ifdef CENTRAL_BODY
+    if (uCentralKind == kCentralNeutron && uFilmColor == 1) {
+        // Films and simulations show the flow onto a neutron star as seething plasma in
+        // fire colors (as in renderings of magnetohydrodynamic simulations): hotter toward
+        // the star, clumped by the turbulence, and the approaching side brightened by the
+        // Doppler beaming the physics gives (~g^2 here).
+        float heat = clamp(T / uDiskTemp, 0.0, 1.2);
+        float t = (0.3 + 0.75 * heat) * (0.55 + 0.75 * n);
+        emit = aia304(t * sqrt(g)) * (1.3 * g * g);
+        // Only a faint midplane: the thick flow (traceThickFlow) carries the look.
+        alpha *= 0.12;
+    }
+    if (uCentralKind == kCentralDwarf) {
+        // A white dwarf's disk in a cataclysmic variable is smooth and optically thick
+        // (no black-hole-style clumps): its structure is set by the companion. Its tide
+        // raises two spiral shocks, open trailing arms in the outer disk, as Doppler
+        // tomography of IP Peg shows (Steeghs, Harlaftis and Horne 1997); and where the
+        // stream from the companion strikes the rim it makes a bright spot (the "hump" in
+        // the light curves of dwarf novae), ahead of the companion's line by ~40 deg. The
+        // pattern is fixed to the binary, which turns once in hours: still, here.
+        float lr = log(r / uDiskInner);
+        float outer = smoothstep(0.25 * uDiskOuter, 0.75 * uDiskOuter, r);
+        float arms = 0.5 + 0.5 * cos(2.0 * (phi - uBinaryPhase) - 2.6 * lr + 0.6);
+        float shocks = smoothstep(0.55, 1.0, arms) * outer;
+        float soft = 0.85 + 0.3 * n;  // a little of the flow's texture
+        float spotPhi = uSpotPhase;
+        float dPhi = atan(sin(phi - spotPhi), cos(phi - spotPhi));
+        float dr = (r - 0.93 * uDiskOuter) / (0.06 * uDiskOuter);
+        // The spot, and the shocked gas it sheds downstream along the rim.
+        float spot = exp(-dr * dr - dPhi * dPhi / 0.03) + 0.3 * exp(-2.0 * dr * dr - 6.0 * max(dPhi, 0.0)) * step(0.0, dPhi);
+        alpha = clamp(uDiskOpacity * edges * (0.9 + 0.1 * outer), 0.0, 1.0);
+        float Tspot = max(T, 12000.0) * 1.4;
+        vec3 base = shiftedBlackbody(T * (1.0 + 0.12 * shocks), g, uDiskTemp) * uDiskBrightness * soft * (1.0 + 1.2 * shocks);
+        vec3 hot = shiftedBlackbody(Tspot, g, uDiskTemp) * uDiskBrightness * 2.5 * spot;
+        if (uFilmColor == 1) {
+            // Exposed, as films and images of these binaries are, for the whole disk: its
+            // brightness compressed (square root) so the cool outer disk shows, its
+            // annuli (each turning at its own Kepler rate) drawn as rings.
+            float rings = 0.85 + 0.25 * smoothstep(-0.4, 0.7, sin(lr * 22.0 + 5.0 * n + 1.5 * gradientNoise(vec3(cos(phi), sin(phi), lr) * 3.0)));
+            base = filmHue(T * g) * (sqrt(luminance(base)) * 1.5 * rings);
+            hot = filmHue(Tspot * g) * sqrt(luminance(hot)) * 1.5;
+        }
+        emit = base + hot;
+    }
+#endif
     return vec4(emit, alpha);
 }
 
@@ -317,13 +475,23 @@ bool historyRef(int i, float delay, out HistoryRef h) {
     return true;
 }
 
+// A history sample (stored in M) in render units: positions and r scale with the
+// length unit, u^theta and u^phi (rates per unit length) inversely; the rest is
+// dimensionless.
+vec4 historySample(int column, int row, int offset) {
+    vec4 v = texelFetch(uHistory, ivec2(column, row + offset), 0);
+    if (offset == 0) return v * uHistoryScale;
+    if (offset == 1) return vec4(v.xy, v.zw / uHistoryScale);
+    return v;
+}
+
 // One history row of body i at that time (offset 0: position, 1: 4-velocity, 2 and 3:
 // shape), interpolated; `now` is its current value.
 vec4 historyRow(HistoryRef h, int offset, vec4 now) {
     if (h.c0 < 0) return now;
-    vec4 a = texelFetch(uHistory, ivec2(h.c0, h.row + offset), 0);
+    vec4 a = historySample(h.c0, h.row, offset);
     if (h.c1 < 0) return mix(now, a, h.f);
-    return mix(a, texelFetch(uHistory, ivec2(h.c1, h.row + offset), 0), h.f);
+    return mix(a, historySample(h.c1, h.row, offset), h.f);
 }
 
 // Per ray, for each body: how much farther the ray can go before it could possibly
@@ -337,7 +505,7 @@ float bodySlack[32];
 // time to it and delayStep its change along the segment. Each body is an ellipsoid (a
 // sphere unless tides deform it): mapped through its shape matrix, the test is
 // against a sphere. Only bodies whose bounding sphere the segment passes through are
-// looked at closely.
+// looked at closely. Small black holes are lenses, not spheres (see lensBodies).
 float hitBodies(vec3 p0, vec3 p1, float rLo, float rHi, float delay, float delayStep, out int which,
                 out BodySample hit) {
     vec3 d = p1 - p0;
@@ -349,6 +517,8 @@ float hitBodies(vec3 p0, vec3 p1, float rLo, float rHi, float delay, float delay
         bodySlack[i] -= chord + bodies[i].shapeB.w * abs(delayStep);
         if (bodySlack[i] > 0.0 || i == uSkipBody) continue;
         if (rHi < bodies[i].range.x || rLo > bodies[i].range.y) continue;
+        int kind = int(bodies[i].params.z + 0.5);
+        if (kind == kMiniHole) continue;
         HistoryRef h;
         if (!historyRef(i, delay, h)) continue;
         vec3 center = historyRow(h, 0, vec4(bodies[i].positionRadius.xyz, 0.0)).xyz;
@@ -360,7 +530,7 @@ float hitBodies(vec3 p0, vec3 p1, float rLo, float rHi, float delay, float delay
         if (dot(nearest, nearest) > bound * bound) continue;
 
         mat3 shape = mat3(1.0);
-        if (int(bodies[i].params.z + 0.5) == kTidalStar) {
+        if (kind == kTidalStar) {
             shape = shapeMatrix(historyRow(h, 2, bodies[i].shapeA), historyRow(h, 3, bodies[i].shapeB));
         }
         float radius = bodies[i].positionRadius.w;
@@ -384,30 +554,103 @@ float hitBodies(vec3 p0, vec3 p1, float rLo, float rHi, float delay, float delay
     return best;
 }
 
-vec3 rockySurface(vec3 n, float seed) {
-    float detail = fbm(n * 9.0 + seed * 1.7);
-    float height = fbm(n * 2.5 + seed) - 0.5 + 0.25 * (detail - 0.5);
-    vec3 ocean = mix(vec3(0.02, 0.06, 0.18), vec3(0.05, 0.18, 0.38), smoothstep(-0.2, 0.0, height));
-    vec3 land = mix(vec3(0.13, 0.3, 0.09), vec3(0.45, 0.36, 0.22), smoothstep(0.03, 0.18, height));
-    vec3 col = height < 0.0 ? ocean : land;
-    col = mix(col, vec3(0.88, 0.92, 0.96), smoothstep(0.74, 0.8, abs(n.z) + 0.1 * detail));  // ice caps
-    float clouds = smoothstep(0.55, 0.75, fbm(n * vec3(4.0, 4.0, 6.0) + seed * 3.1 + 11.0));
-    return mix(col, vec3(0.92), clouds * 0.8);
+// Body i as it was `delay` ago: where, its 4-velocity and shape (for shading a hit
+// after the main loop).
+BodySample bodySampleAt(int i, float delay) {
+    BodySample b;
+    HistoryRef h;
+    historyRef(i, delay, h);
+    b.center = historyRow(h, 0, vec4(bodies[i].positionRadius.xyz, 0.0)).xyz;
+    b.shape = mat3(1.0);
+    if (int(bodies[i].params.z + 0.5) == kTidalStar) {
+        b.shape = shapeMatrix(historyRow(h, 2, bodies[i].shapeA), historyRow(h, 3, bodies[i].shapeB));
+    }
+    b.u = historyRow(h, 1, bodies[i].fourVelocity);
+    return b;
 }
 
-vec3 gasGiantSurface(vec3 n, float seed) {
-    float swirl = fbm(n * vec3(3.0, 3.0, 12.0) + seed);
-    float bands = sin(n.z * 17.0 + swirl * 3.5);
-    vec3 col = mix(vec3(0.5, 0.32, 0.2), vec3(0.88, 0.78, 0.62), 0.5 + 0.5 * bands);
-    col *= 0.85 + 0.3 * fbm(n * 14.0 + seed * 2.0);
-    vec3 stormDir = normalize(vec3(cos(seed), sin(seed), -0.35));
-    float storm = smoothstep(0.93, 0.97, dot(normalize(n * vec3(1.0, 1.0, 2.2)), stormDir));
-    return mix(col, vec3(0.78, 0.32, 0.2), storm);
+#ifdef LENSES
+// Small black holes among the bodies (compiled in only when there are any: the extra
+// registers would slow every other scene down). Those that have already bent this ray
+// (each bends it once):
+uint lensedMask = 0u;
+
+// The first small black hole whose closest approach to the chord p0 -> p1 falls inside
+// it, within its reach: the fraction along the chord (2.0 for none), which body, and
+// where it was when the light passed.
+float lensBodies(vec3 p0, vec3 p1, float delay, out int which, out vec3 center) {
+    vec3 d = p1 - p0;
+    float dd = max(dot(d, d), 1e-12);
+    float best = 2.0;
+    which = -1;
+    center = vec3(0.0);
+    for (int i = 0; i < bodyInfo.x; ++i) {
+        if (int(bodies[i].params.z + 0.5) != kMiniHole || i == uSkipBody) continue;
+        if (((lensedMask >> uint(i)) & 1u) != 0u) continue;
+        HistoryRef h;
+        if (!historyRef(i, delay, h)) continue;
+        vec3 c = historyRow(h, 0, vec4(bodies[i].positionRadius.xyz, 0.0)).xyz;
+        float u = -dot(p0 - c, d) / dd;
+        if (u <= 0.0 || u >= 1.0 || u >= best) continue;
+        vec3 q = p0 + u * d - c;
+        float reach = bodies[i].range.w;
+        if (dot(q, q) > reach * reach) continue;
+        best = u;
+        which = i;
+        center = c;
+    }
+    return best;
 }
+
+// Bends the photon at (r, theta, phi), with backward-traced velocities vr and vth, by
+// 4m/b toward a small black hole of mass m at `center` (thin lens; the GPU twin of
+// trajectory::lensKick with backward = true). Its direction is turned in the local
+// ZAMO frame at fixed local frequency, and E, L, Q and the velocities follow. Beyond
+// the lens's reach the bend fades to zero (it is already below a pixel there).
+// Returns false if the photon passes within 3 sqrt(3) m: captured.
+bool lensKick(vec3 x, vec3 center, float m, float reach, float r, float th, float ph, inout float vr,
+              inout float vth) {
+    float s = max(abs(sin(th)), 1e-6), c = cos(th);
+    float sigma = r * r + spinA2 * c * c;
+    float delta = deltaAt(r);
+    float rra = r * r + spinA2;
+    float bigA = rra * rra - spinA2 * delta * s * s;
+    float alpha = sqrt(max(sigma * delta / bigA, 1e-12));
+    float omega = 2.0 * MASS * spinA * r / bigA;
+    float varpi = sqrt(bigA / sigma) * s;
+    float sd = sqrt(max(sigma * delta, 1e-12)), sq = sqrt(sigma);
+    // Forward-in-time velocities are minus the backward-traced ones.
+    float eLocal = (photonE - omega * photonL) / alpha;
+    vec3 n = vec3(-vr / (eLocal * sd), -vth / (eLocal * sq), photonL / (eLocal * varpi));
+    float az = ph + atan(spinA, r);
+    float sa = sin(az), ca = cos(az);
+    vec3 er = vec3(s * ca, s * sa, c), et = vec3(c * ca, c * sa, -s), ep = vec3(-sa, ca, 0.0);
+    vec3 dir = normalize(n.x * er + n.y * et + n.z * ep);
+    vec3 toLens = center - x;
+    vec3 perp = toLens - dot(toLens, dir) * dir;
+    float b = length(perp);
+    if (b < 3.0 * sqrt(3.0) * m) return false;
+    float bend = min(4.0 * m / b, 0.5 * PI) * (1.0 - smoothstep(0.7 * reach, reach, b));
+    // Traced backwards we hold the later direction and want the earlier one.
+    vec3 bent = cos(bend) * dir - sin(bend) * perp / b;
+    float nr = dot(bent, er), nt = dot(bent, et), np = dot(bent, ep);
+    photonL = eLocal * np * varpi;
+    photonE = alpha * eLocal + omega * photonL;
+    vr = -eLocal * nr * sd;
+    vth = -eLocal * nt * sq;
+    photonQ = vth * vth + c * c * (photonL * photonL / (s * s) - spinA2 * photonE * photonE);
+    if (abs(photonL) < 3e-4 * sqrt(max(photonQ + spinA2 * photonE * photonE, 0.0))) {
+        photonL = 0.0;  // through the axis rather than a hair from it (kerr::kAxisSnap)
+        photonQ = vth * vth - c * c * spinA2 * photonE * photonE;
+    }
+    return true;
+}
+#endif
 
 // Light leaving body i toward the camera. rayDir is the backward ray's direction,
-// so -rayDir is the direction the light travels; delay is how long ago it left.
-vec3 bodyRadiance(int i, vec3 hit, BodySample b, vec3 rayDir, float r, float vr, float vth, float delay) {
+// so -rayDir is the direction the light travels; delay is how long ago it left, and
+// dist how far it travelled (it sets the size of a pixel on the body).
+vec3 bodyRadiance(int i, vec3 hit, BodySample b, vec3 rayDir, float r, float vr, float vth, float delay, float dist) {
     // The ellipsoid's normal is the gradient of |S x|^2, S^2 x; the surface pattern
     // is painted on the undeformed sphere, S x.
     vec3 offset = hit - b.center;
@@ -424,18 +667,78 @@ vec3 bodyRadiance(int i, vec3 hit, BodySample b, vec3 rayDir, float r, float vr,
     float ca = cos(angle), sa = sin(angle);
     vec3 n0 = normalize(sphere);
     vec3 local = vec3(ca * n0.x + sa * n0.y, -sa * n0.x + ca * n0.y, n0.z);
+    float mu = clamp(dot(normal, toCamera), 0.0, 1.0);
+    // A pixel's size on the body in radians, stretched toward the limb.
+    float fp = dist * uPixelAngle / max(bodies[i].positionRadius.w, 1e-6) / max(mu, 0.12);
 
-    if (kind == kRockyPlanet || kind == kGasGiant) {
-        // Lit by the hot inner disk, treated as a light at the center falling off as 1/d^2.
-        vec3 albedo = kind == kRockyPlanet ? rockySurface(local, seed) : gasGiantSurface(local, seed);
-        float irradiance = uDiskEnabled == 1 ? uDiskBrightness * 36.0 / max(dot(center, center), 4.0) : 0.0;
-        float lambert = max(dot(normal, normalize(-center)), 0.0);
-        return albedo * shiftedBlackbody(uDiskTemp, g, uDiskTemp) * (irradiance * lambert + 0.01) * brightness;
+#ifdef BODY_PLANETS
+    if (kind == kRockyPlanet || kind == kGasGiant || kind == kMoon) {
+        // Reflected light. Around a black hole: the hot inner disk, a light at the center
+        // falling off as 1/d^2. Around a star: the star itself, at its real flux (relative
+        // to the Sun's at the Earth, which is daylight, as the central planet is drawn).
+        // Around a planet: the distant Sun, shut off in the planet's shadow (eclipses;
+        // the penumbra is as wide as the Sun's half-degree disk makes it).
+        vec3 L;
+        float irradiance;
+        vec3 light;
+        float ambient = 0.002;
+        if (uBodyLight == 2) {
+            L = uSunDirection;
+            irradiance = uBodyLightScale;
+            float along = dot(hit, L);
+            if (along < 0.0) {
+                float off = length(hit - along * L);
+                float penumbra = 0.0047 * -along + 1e-6;
+                irradiance *= smoothstep(uSurfaceR - penumbra, uSurfaceR + penumbra, off);
+            }
+            light = shiftedBlackbody(5772.0, g, 5772.0) * brightness;
+        } else if (uBodyLight == 1) {
+            L = normalize(-center);
+            irradiance = min(uBodyLightScale / max(dot(center, center), 1e-12), 30.0);
+            light = shiftedBlackbody(uBodyLightTemp, g, uBodyLightTemp) * brightness;
+        } else {
+            L = normalize(-center);
+            irradiance = uDiskEnabled == 1 ? uDiskBrightness * 36.0 / max(dot(center, center), 4.0) : 0.0;
+            light = shiftedBlackbody(uDiskTemp, g, uDiskTemp) * brightness;
+            ambient = 0.01;
+        }
+        float mu0 = dot(normal, L);
+        if (kind == kGasGiant) {
+            return jupiterAlbedo(local, fp, seed) * light * (irradiance * minnaert(mu0, mu, 0.9) + ambient);
+        }
+        if (kind == kMoon) {
+            // Airless regolith scatters light back the way it came: the Lommel-Seeliger
+            // law, 2 mu0 / (mu0 + mu), so a full Moon is evenly bright to its edge (Venus's
+            // clouds are closer to Lambert's mu0).
+            int palette = int(seed / 100.0);
+            vec3 albedo = rockyAlbedo(local, fp, mod(seed, 100.0), palette);
+            float m0 = max(mu0, 0.0);
+            float law = palette == kPaletteVenus ? m0 : 2.0 * m0 / (m0 + max(mu, 0.05));
+            return albedo * light * (irradiance * law + ambient);
+        }
+        vec3 Ll = vec3(ca * L.x + sa * L.y, -sa * L.x + ca * L.y, L.z);  // in the body's own frame
+        Ground gr = earthGround(local, fp, seed, Ll);
+        vec3 lit = light * (irradiance * max(mu0, 0.0) + ambient);
+        vec3 ground = gr.albedo * lit + gr.water * (1.0 - gr.clouds) * sunGlint(normal, L, toCamera, 0.17) * light * irradiance;
+        return mix(ground, vec3(0.86) * lit, gr.clouds);
     }
+#endif
 
+    // Thermal light, limb-darkened (Eddington-Barbier: the limb shows cooler layers).
     float T = bodies[i].params.x;
-    float limb = 0.4 + 0.6 * clamp(dot(normal, toCamera), 0.0, 1.0);  // linear limb darkening
-    vec3 color = shiftedBlackbody(T, g, T) * brightness * limb;
+    float tExp = T > 30000.0 ? 0.3 : 1.0;  // display temperatures of hot bodies go as T^0.3
+    float tFactor = 1.0;
+    if (kind == kStar || kind == kTidalStar) {
+        // Granulation (only where it is resolved) and a few starspots.
+        tFactor *= 1.0 + 0.029 * granulation(local, 400.0, uTime * 0.02 + seed, fp, 0.15);
+        vec3 w = worley(local * 3.0 + seed * 1.3, 0.0);
+        float belt = 1.0 - smoothstep(0.6, 0.85, abs(local.z));
+        float spot = (1.0 - smoothstep(0.1, 0.16, w.x)) * step(w.z, 0.35) * belt;
+        float umbra = 1.0 - smoothstep(0.03, 0.07, w.x);
+        tFactor *= 1.0 - spot * (0.06 + 0.2 * umbra);
+    }
+    float Tref = T * pow(kCenterTemperature, tExp);
+    vec3 color = shiftedBlackbody(T * pow(tFactor * limbTemperature(mu), tExp), g, Tref) * brightness;
     if (kind == kPulsar) {
         // Two beams along a magnetic axis tilted 50 degrees from the rotation axis.
         // We see a flash when one points along the light's direction of travel.
@@ -443,7 +746,68 @@ vec3 bodyRadiance(int i, vec3 hit, BodySample b, vec3 rayDir, float r, float vr,
         float beam = exp(-(1.0 - abs(dot(toCamera, axis))) / 0.012);
         return color * (1.5 + 60.0 * beam);
     }
-    return color * (0.8 + 0.4 * fbm(local * 7.0 + seed));  // granulation
+    if (kind == kWhiteDwarf || kind == kNeutronStar) return color * 1.2;
+    return color;
+}
+
+#include "central_surface.glsl"
+
+// Accretion curtains: inside the magnetosphere the gas leaves the disk's inner edge and
+// slides along the dipole field lines r = L sin^2(theta_m) onto the magnetic poles,
+// glowing as it falls. Only field lines that thread the disk near its inner edge carry
+// gas: for each point, follow its field line to where it crosses the disk plane and
+// keep it if that is near the truncation radius; the gas runs from there to the nearer
+// magnetic pole. The field turns with the star; delay0 and delay1 are the light-travel
+// times to the chord's ends. Drawn with the gravitational redshift of a static emitter
+// (the infall speed's Doppler shift is left out).
+void traceFunnels(vec3 X0, vec3 X1, float r0, float r1, float delay0, float delay1, inout vec3 color,
+                  float transmittance) {
+    float rIn = uFunnelRadius;
+    if (min(r0, r1) > rIn * 1.15) return;
+    float chord = length(X1 - X0);
+    int n = clamp(int(ceil(chord / (0.05 * rIn))), 2, 8);
+    float dl = chord / float(n);
+    for (int k = 0; k < n; ++k) {
+        float f = (float(k) + 0.5) / float(n);
+        vec3 x = mix(X0, X1, f);
+        float r = length(x);
+        if (r < uSurfaceR || r > rIn * 1.15) continue;
+        float delay = mix(delay0, delay1, f);
+        vec3 axis = magneticAxisAt(uSurfacePhase - uSurfaceOmega * delay + uSurfaceShift + atan(spinA, r));
+        vec3 xh = x / r;
+        float cm = dot(xh, axis);
+        vec3 eq = xh - cm * axis;  // toward this field line's magnetic meridian
+        float el = length(eq);
+        if (el < 1e-4) continue;
+        eq /= el;
+        float L = r / (el * el);  // the field line's apex distance (el = sin(theta_m))
+        // Where the field line crosses the disk plane: cos(t) axis.z + sin(t) eq.z = 0.
+        float thetaCross = atan(-axis.z, eq.z);
+        if (thetaCross < 0.0) thetaCross += PI;
+        float sc = sin(thetaCross);
+        float rCross = L * sc * sc;
+        float profile = exp(-pow((rCross / rIn - 1.04) / 0.04, 2.0));
+        if (profile < 1e-3) continue;
+        // From the disk to the nearer pole only.
+        float thetaM = acos(clamp(cm, -1.0, 1.0));
+        if (thetaCross < 0.5 * PI ? thetaM > thetaCross : thetaM < thetaCross) continue;
+        // Gas climbs out of the disk most readily where the disk lies farthest from the
+        // magnetic equator (under the pole tilted toward it): around a tilted dipole the
+        // curtains gather into two main streams, one to each pole (Romanova et al. 2003),
+        // threaded with filaments along the field lines.
+        float tilt = sqrt(max(1.0 - axis.z * axis.z, 0.0));  // sin of the dipole's tilt
+        float lift = abs(cos(thetaCross)) / max(tilt, 1e-3);
+        float streams = tilt > 1e-3 ? 0.12 + 0.88 * lift * lift : 1.0;
+        vec3 eqRot = toRotatingFrame(eq, delay, r);
+        float threads = 0.3 + 0.7 * smoothstep(-0.25, 0.45, gradientNoise(eqRot * 7.0 + vec3(0.0, 0.0, 3.1)));
+        profile *= streams * threads;
+        // Denser and hotter toward the star, where the curtains converge: most of the
+        // infall energy comes out here, so they outshine the disk near the poles.
+        float g = sqrt(max(1.0 - 2.0 * MASS / r, 0.01)) / max(photonE, 1e-3);
+        float T = uSurfaceTemp * (0.6 + 0.8 * uSurfaceR / r);
+        color += transmittance * shiftedBlackbody(T, g, uSurfaceTemp) * (5.0 * profile * pow(rIn / r, 1.5) * dl / rIn) *
+                 uSurfaceBrightness;
+    }
 }
 
 // --- Debris gas ----------------------------------------------------------------------
@@ -466,9 +830,9 @@ bool normalizeVelocity(inout vec4 u, float r, float th) {
     float s = sin(th), c = cos(th);
     float s2 = s * s;
     float sigma = r * r + spinA2 * c * c;
-    float f = 2.0 * r / sigma;
+    float f = 2.0 * MASS * r / sigma;
     float rra = r * r + spinA2;
-    float bigA = rra * rra - spinA2 * (r * r - 2.0 * r + spinA2) * s2;
+    float bigA = rra * rra - spinA2 * deltaAt(r) * s2;
     float uu = -(1.0 - f) * u.x * u.x + 2.0 * f * u.x * u.y - 2.0 * f * spinA * s2 * u.x * u.w +
                (1.0 + f) * u.y * u.y - 2.0 * spinA * s2 * (1.0 + f) * u.y * u.w + sigma * u.z * u.z +
                bigA * s2 / sigma * u.w * u.w;
@@ -497,7 +861,9 @@ void traceDebris(vec4 a, vec2 va, vec4 b, vec2 vb, float segLength, inout vec3 c
     if (!debrisNear(a) && !debrisNear(b) && !debrisNear(0.5 * (a + b))) return;
 
     float voxel = 0.025 * min(a.x, b.x);  // grid spacing at this radius
-    int n = clamp(int(ceil(segLength / (0.5 * voxel))), 1, 16);
+    // Strands finer than a voxel need finer steps.
+    float spacing = uDebrisFilaments > 0.0 ? 0.3 : 0.5;
+    int n = clamp(int(ceil(segLength / (spacing * voxel))), 1, uDebrisFilaments > 0.0 ? 24 : 16);
     float dl = segLength / float(n);
     for (int k = 0; k < n; ++k) {
         float s = (float(k) + 0.5) / float(n);
@@ -507,7 +873,7 @@ void traceDebris(vec4 a, vec2 va, vec4 b, vec2 vb, float segLength, inout vec3 c
         vec4 d0 = textureLod(uDebrisDensity, uvw, 0.0);
         float rho = d0.x;
         if (rho <= 1e-5) continue;
-        vec2 d1 = textureLod(uDebrisVelocity, uvw, 0.0).xy;
+        vec4 d1 = textureLod(uDebrisVelocity, uvw, 0.0);
         vec4 u = vec4(d0.z, d0.w, d1.x, d1.y) / rho;
         if (!normalizeVelocity(u, p.x, p.y)) continue;
         float T = d0.y / rho * 1e4;
@@ -515,8 +881,21 @@ void traceDebris(vec4 a, vec2 va, vec4 b, vec2 vb, float segLength, inout vec3 c
         // Beaming as strong as g = 4 needs gas moving at 0.9c straight at us; anything
         // more comes from mixing parcels moving in different directions.
         float g = min(frequencyRatio(u, p.x, v.x, v.y), 4.0);
+        if (uDebrisFilaments > 0.0) {
+            // The tide stretches whatever structure the star had into strands along the
+            // stream. Each parcel's label (where it sat in the star, across the stretch)
+            // averaged over the voxel varies smoothly across the stream, so a pattern
+            // drawn in label space gives strands finer than a voxel that move with the gas.
+            // Close to the hole, where the star has only just come apart, it spans a few
+            // voxels and its labels change too fast across each to draw strands from.
+            vec2 lab = d1.zw / rho;
+            float n1 = gradientNoise(vec3(lab * 4.5, 1.7));
+            float n2 = gradientNoise(vec3(lab * 11.0, 8.3));
+            float strands = 0.75 * pow(max(1.0 - abs(n1), 0.0), 5.0) + 0.55 * pow(max(1.0 - abs(n2), 0.0), 7.0);
+            rho *= mix(1.0, 0.2 + 2.3 * strands, uDebrisFilaments * smoothstep(12.0 * MASS, 30.0 * MASS, p.x));
+        }
         // Emission (glow) and absorption (thickness) are set separately.
-        color += transmittance * gasGlow(T, g) * (uDebrisBrightness * rho * dl);
+        color += transmittance * gasGlow(max(T, uDebrisGlowFloor), g) * (uDebrisBrightness * rho * dl);
         transmittance *= exp(-rho * uDebrisOpacity * dl);
         if (transmittance < 0.002) return;
     }
@@ -527,7 +906,7 @@ void traceDebris(vec4 a, vec2 va, vec4 b, vec2 vb, float segLength, inout vec3 c
 // The path cell holding p (grid coordinates), and whether it holds any segments (a
 // cheap texture lookup that spares most steps the reads of the segment lists).
 bool pathCell(vec4 p, out ivec3 c) {
-    vec3 g = gridCoord(p.x, p.y, p.z);
+    vec3 g = vec3((log(p.x) - uPathLogR.x) / (uPathLogR.y - uPathLogR.x), p.y / PI, p.z / (2.0 * PI));
     c = ivec3(-1000);
     if (g.x < 0.0 || g.x >= 1.0) return false;
     c = min(ivec3(floor(vec3(g.x, clamp(g.y, 0.0, 0.9999), fract(g.z)) * vec3(uPathGridDims))), uPathGridDims - 1);
@@ -612,10 +991,10 @@ void tracePaths(vec3 x0, vec3 x1, vec4 p0, vec4 p1, float pathLength, vec3 camer
 // delay0 and delay1 are the light-travel times to the chord's ends: the knots are
 // drawn where they were when the light left them, which makes a jet coming toward
 // us appear to move faster than light.
-void traceJets(vec3 x0, vec3 x1, vec4 p0, vec4 p1, vec2 v0, vec2 v1, float delay0, float delay1, float horizon,
+void traceJets(vec3 x0, vec3 x1, vec4 p0, vec4 p1, vec2 v0, vec2 v1, float delay0, float delay1, float base,
                inout vec3 color, float transmittance) {
     const float zMax = 90.0;
-    float z0 = horizon + 1.0;
+    float z0 = base + 1.0;
     float zm = max(abs(x0.z), abs(x1.z));
     if (min(abs(x0.z), abs(x1.z)) > zMax || zm < z0) return;
     float wMax = 0.4 + zm * uJetOpening;
@@ -628,6 +1007,9 @@ void traceJets(vec3 x0, vec3 x1, vec4 p0, vec4 p1, vec2 v0, vec2 v1, float delay
     int n = clamp(int(ceil(chord / (0.4 * (0.4 + 0.5 * zm * uJetOpening)))), 1, 12);
     float dl = chord / float(n);
     vec3 jetColor = vec3(0.55, 0.7, 1.0);
+#ifdef CENTRAL_BODY
+    if (uFilmColor == 1) jetColor = vec3(0.35, 0.85, 1.0);  // films' jets: electric cyan
+#endif
     for (int k = 0; k < n; ++k) {
         float s = (float(k) + 0.5) / float(n);
         vec3 x = mix(x0, x1, s);
@@ -641,6 +1023,10 @@ void traceJets(vec3 x0, vec3 x1, vec4 p0, vec4 p1, vec2 v0, vec2 v1, float delay
         // Knots of brighter plasma moving out along the jet.
         float emitted = uTime - mix(delay0, delay1, s);
         float knots = 0.55 + 0.45 * sin(z * 0.45 - emitted * uJetSpeed * 0.45);
+#ifdef CENTRAL_BODY
+        // A neutron star's or white dwarf's jet: steadier, knots only ripple it.
+        knots = sqrt(0.6 + 0.4 * knots);
+#endif
         profile *= knots * knots;
 
         // Plasma 4-velocity: speed beta along the axis, away from the hole, in the ZAMO frame.
@@ -651,7 +1037,7 @@ void traceJets(vec3 x0, vec3 x1, vec4 p0, vec4 p1, vec2 v0, vec2 v1, float delay
         vec2 vLocal = side * uJetSpeed * vec2(cth, -sth);  // (r, theta) components of +-z
         float r = p.x;
         float sigma = r * r + spinA2 * cth * cth;
-        float delta = r * r - 2.0 * r + spinA2;
+        float delta = deltaAt(r);
         float rra = r * r + spinA2;
         float bigA = rra * rra - spinA2 * delta * sth * sth;
         float gamma = inversesqrt(1.0 - uJetSpeed * uJetSpeed);
@@ -659,13 +1045,316 @@ void traceJets(vec3 x0, vec3 x1, vec4 p0, vec4 p1, vec2 v0, vec2 v1, float delay
         float ur = gamma * vLocal.x * sqrt(delta / sigma);
         // Boyer-Lindquist components, shifted to Kerr-Schild ones.
         vec4 u = vec4(ut + (rra / delta - 1.0) * ur, ur, gamma * vLocal.y / sqrt(sigma),
-                      ut * 2.0 * spinA * r / bigA + spinA / delta * ur);
+                      ut * 2.0 * MASS * spinA * r / bigA + spinA / delta * ur);
         vec2 v = mix(v0, v1, s);
         float g = frequencyRatio(u, r, v.x, v.y);
         float boost = uRelativity == 2 ? 1.0 : g * g * g;
         color += transmittance * jetColor * (uJetPower * 0.6 * profile * boost * dl);
     }
 }
+
+#ifdef OUTFLOW
+// --- The outflow of a tidal disruption (src/tde.h) ------------------------------------
+//
+// Gas blown out of the returning debris coasts radially away from the hole at
+// v(R)^2 = vInf^2 + 2M/R, in a cone around the debris's orbital axis that is wide at
+// first and narrows into a funnel once a disk has formed. Each point
+// (R, direction) seen at time te holds gas launched at tl = te - T(R), T the travel
+// time from R0 (tde::windTravelTime, in closed form), so its density follows the
+// launch rate then: rho = Mdot(tl) / (Omega R^2 v(R)). The flare lights it from the
+// center, as it was a light-travel time R earlier (a light echo); the gas between
+// shades it. Its billows are drawn on coordinates that ride with the gas: its
+// direction across the cone (in units of the cone's width, turned by the swirl the gas
+// carries out) and its launch time.
+
+uniform vec3 uOutflowAxis;       // unit, Kerr-Schild Cartesian
+uniform vec3 uOutflowE1;         // two unit vectors across it
+uniform vec3 uOutflowE2;
+uniform float uOutflowClock;     // coordinate time now, on the outflow's clock
+uniform vec2 uOutflowTable;      // clock time of the history's first row, rows per unit time
+uniform float uOutflowRows;
+uniform float uOutflowStart;     // clock time of the first launch
+uniform float uOutflowSpeed;     // terminal speed on the axis (c)
+uniform float uOutflowLaunch;    // launch radius R0
+uniform float uOutflowExtent;    // drawn out to here
+uniform float uOutflowTanMax;    // tan of the widest the cone (and its billows) reaches
+uniform float uOutflowMaxAngle;  // ... and that angle
+uniform float uOutflowCone[64];  // how far from the axis gas can be seen, at radii spaced in ln R
+uniform vec2 uOutflowConeR;      // ln R of the first, rows per unit of ln R
+uniform float uOutflowThickness; // opacity scale
+uniform float uOutflowLight;     // flare light at R0 when it peaks
+uniform float uOutflowFalloff;   // the light falls off as R^-falloff (2: as it does)
+uniform float uFlareTemp;        // display temperature of the flare light
+uniform float uOutflowGlow;      // the hot base's own glow
+uniform float uOutflowEnvelope;  // the slow, quasi-spherical part
+uniform float uOutflowSwirl;     // how far the gas turns about the axis on its way out (radians)
+layout(binding = 12) uniform sampler1D uOutflowHistory;  // launch rate, opening angle, flare luminosity
+// Opacity of the wind per launch radius at unit (normalized) density, with thickness 1:
+// enough for the billows to look solid out to a few hundred M.
+const float kOutflowOpacity = 120.0;
+// The envelope is drawn out to this many launch radii.
+const float kEnvelopeReach = 9.0;
+// Light from the flare leaks between the wind's clumps: the smooth optical depth toward
+// the center counts this much (porosity; the billows nearby are counted in full).
+const float kOutflowPorosity = 0.12;
+
+vec4 outflowHistory(float t) {
+    float row = (t - uOutflowTable.x) * uOutflowTable.y;
+    return texture(uOutflowHistory, (row + 0.5) / uOutflowRows);
+}
+
+// T(R) for a wind of terminal speed^2 k: T(R) - T(R0) is the travel time from R0.
+float windClock(float k, float R) {
+    float m2 = 2.0 * MASS;
+    float kr = k * R;
+    return sqrt(R * (kr + m2)) / k - m2 / (k * sqrt(k)) * log(sqrt(kr) + sqrt(kr + m2));
+}
+float gWindK, gWindT0;  // vInf^2 and T(R0), set once per pixel
+
+// The angle from the axis beyond which no gas can be seen at radius R (linear between rows).
+float outflowConeAngle(float R) {
+    float x = clamp((log(max(R, 1e-3)) - uOutflowConeR.x) * uOutflowConeR.y, 0.0, 63.0);
+    int i = min(int(x), 62);
+    return mix(uOutflowCone[i], uOutflowCone[i + 1], x - float(i));
+}
+
+float axisAngle(vec3 x) {
+    return acos(min(abs(dot(x, uOutflowAxis)) / max(length(x), 1e-6), 1.0));
+}
+
+// Solid angle of the twin cones of half-angle `open`, relative to their size when narrowest.
+float coneSolidAngle(float open) {
+    return 4.0 * PI * (1.0 - cos(open));
+}
+
+// The wind at Cartesian point x seen at clock time te: its density (1 = the launch
+// rate at the fallback's peak spread over the narrow cone at R0), speed, launch time
+// and the coordinates its billows are drawn on.
+struct OutflowPoint {
+    float rho;    // smooth density
+    float edge;   // distance from the axis in units of the cone's half-width
+    float front;  // 0 at the leading edge, 1 well behind it
+    float speed;
+    float tl;     // launch time
+    vec3 q;       // billow coordinates
+};
+
+OutflowPoint outflowPoint(vec3 x, float te) {
+    OutflowPoint o;
+    o.rho = 0.0;
+    o.edge = 9.0;
+    o.front = 0.0;
+    o.speed = uOutflowSpeed;
+    o.tl = -1e30;
+    o.q = vec3(0.0);
+    float R = length(x);
+    if (R < uOutflowLaunch || R > uOutflowExtent) return o;
+    vec3 d = x / R;
+    float mu = dot(d, uOutflowAxis);
+    float psi = acos(min(abs(mu), 1.0));
+    if (psi > outflowConeAngle(R)) return o;  // no gas this far from the axis here
+    float tl = te - (windClock(gWindK, R) - gWindT0);
+    // The first gas out leads the way; the billows (outflowBillows) break up the edge, so
+    // it reaches a little ahead of the smooth ballistic front.
+    float lead = 0.05 * max(te - uOutflowStart, 0.0) + 5.0 * MASS;
+    if (tl < uOutflowStart - lead) return o;
+    o.front = clamp((tl - uOutflowStart + lead) / (2.0 * lead), 0.0, 1.0);
+    vec4 h = outflowHistory(max(tl, uOutflowStart + lead));
+    float open = max(h.y, 0.03);
+    float c = psi / open;
+    if (c > 1.6) return o;
+    float vR = sqrt(gWindK + 2.0 * MASS / R);
+    float vR0 = sqrt(gWindK + 2.0 * MASS / uOutflowLaunch);
+    float R0R = uOutflowLaunch / R;
+    // Mass conservation, relative to a narrow cone at R0; it starts softly at R0.
+    o.rho = h.x * R0R * R0R * (vR0 / vR) * (coneSolidAngle(0.35) / coneSolidAngle(open)) *
+            smoothstep(1.0, 1.6, 1.0 / R0R);
+    o.edge = c;
+    o.speed = vR;
+    o.tl = tl;
+    // Billows: across the cone in units of its width, turned back by the swirl the gas
+    // has picked up since it left (angular momentum, ell / R^2), and along the flow by
+    // launch time over a span that grows with the outflow's age, so they swell as they rise.
+    float side = mu >= 0.0 ? 1.0 : -1.0;
+    vec2 across = vec2(dot(d, uOutflowE1), dot(d, uOutflowE2)) / max(sin(open), 0.02);
+    float turn = -uOutflowSwirl * (1.0 - R0R);
+    float ct = cos(turn), st = sin(turn);
+    across = vec2(ct * across.x - st * across.y, st * across.x + ct * across.y);
+    float age = max(te - uOutflowStart, 1.0);
+    float along = (tl - uOutflowStart) / (0.1 * age + 40.0 * MASS);
+    // Near the base the gas is still fast and launch time hardly changes with R: a term in
+    // ln R keeps the billows round there instead of drawn out into radial streaks.
+    o.q = vec3(across * 2.1, along * 1.2 - 1.6 * log(1.0 / R0R) + side * 17.3);
+    return o;
+}
+
+// Puffy cloud density in [0, 1] from billow coordinates q: a fractal of gradient
+// noise, thresholded so the cloud has edges, fuller toward the axis (edge 0) than at
+// the rim (edge 1). The "boil" term slowly changes the billows' shapes.
+float outflowBillows(vec3 q, float edge, float front, int octaves, float boil) {
+    vec3 p = q + vec3(0.0, 0.0, boil);
+    float n = 0.0, amplitude = 0.6;
+    for (int i = 0; i < octaves; ++i) {
+        float o = gradientNoise(p);
+        n += amplitude * o;
+        // Each octave displaces the next: blobs become cauliflower.
+        p = p * 2.13 + vec3(5.1, 1.7, 8.3) + 0.6 * o;
+        amplitude *= 0.47;
+    }
+    // More coverage toward the axis and behind the leading edge.
+    float fill = 0.55 - 0.8 * edge * edge - 1.1 * (1.0 - front);
+    return smoothstep(0.0, 0.22, n + fill) * (1.0 - smoothstep(1.0, 1.5, edge + 0.3 * n));
+}
+
+float outflowDensity(vec3 x, float te, int octaves, float boil) {
+    OutflowPoint o = outflowPoint(x, te);
+    if (o.rho <= 0.0) return 0.0;
+    return o.rho * outflowBillows(o.q, o.edge, o.front, octaves, boil);
+}
+
+// The slow, quasi-spherical part of the wind (the "reprocessing envelope" that TDE
+// spectra show), launched with the rest at a third of the speed.
+float envelopeDensity(vec3 x, float te) {
+    float R = length(x);
+    if (R < uOutflowLaunch || uOutflowEnvelope <= 0.0) return 0.0;
+    float v = 0.33 * uOutflowSpeed;
+    float k = v * v;
+    float tl = te - (windClock(k, R) - windClock(k, uOutflowLaunch));
+    if (tl < uOutflowStart) return 0.0;
+    float R0R = uOutflowLaunch / R;
+    return uOutflowEnvelope * outflowHistory(tl).x * R0R * R0R * exp(-R / (4.0 * uOutflowLaunch)) *
+           (1.0 - smoothstep(6.0 * uOutflowLaunch, kEnvelopeReach * uOutflowLaunch, R));
+}
+
+// 4-velocity (Kerr-Schild components) of gas moving radially at speed v in the ZAMO frame.
+vec4 radialFlowVelocity(float r, float th, float v) {
+    float sth = max(sin(th), 1e-4), cth = cos(th);
+    float sigma = r * r + spinA2 * cth * cth;
+    float delta = deltaAt(r);
+    float rra = r * r + spinA2;
+    float bigA = rra * rra - spinA2 * delta * sth * sth;
+    float gamma = inversesqrt(max(1.0 - v * v, 1e-4));
+    float ut = gamma * sqrt(bigA / (sigma * delta));
+    float ur = gamma * v * sqrt(delta / sigma);
+    return vec4(ut + (rra / delta - 1.0) * ur, ur, 0.0, ut * 2.0 * MASS * spinA * r / bigA + spinA / delta * ur);
+}
+
+// The outflow along one ray segment: light of the flare scattered toward the camera,
+// the hot base's glow, and the light it blocks.
+//
+// The wind scatters far more than it absorbs (electron scattering, and dust with an
+// albedo near 1), so light is not simply cut off by the gas toward the flare: it
+// diffuses through it. Through scattering optical depth tau a fraction ~1 / (1 + 3tau/4)
+// gets across (two-stream diffusion) on top of the unscattered exp(-tau). So the wind
+// glows all through, brightest on the side facing the flare, and puffs shade their
+// neighbours without going black.
+void traceOutflow(vec3 x0, vec3 x1, vec4 p0, vec4 p1, vec2 v0, vec2 v1, float delay0, float delay1, float jitter,
+                  inout vec3 color, inout float transmittance) {
+    // Skip segments far from both the cones and the envelope.
+    vec3 seg = x1 - x0;
+    float len2 = max(dot(seg, seg), 1e-12);
+    float tc = clamp(-dot(x0, seg) / len2, 0.0, 1.0);
+    float rClosest = length(x0 + tc * seg);
+    if (rClosest > uOutflowExtent) return;
+    float z0 = dot(x0, uOutflowAxis), z1 = dot(x1, uOutflowAxis);
+    vec3 q0 = x0 - z0 * uOutflowAxis, dq = (x1 - z1 * uOutflowAxis) - q0;
+    float ta = clamp(-dot(q0, dq) / max(dot(dq, dq), 1e-12), 0.0, 1.0);
+    float rho = length(q0 + ta * dq);
+    float zFar = max(abs(z0), abs(z1));
+    bool nearEnvelope = uOutflowEnvelope > 0.0 && rClosest < kEnvelopeReach * uOutflowLaunch;
+    if (rho > zFar * uOutflowTanMax + 2.0 && !nearEnvelope) return;
+    if (!nearEnvelope) {
+        // The angle from the axis at the chord's ends and nearest the axis, against how
+        // wide the cone can be there (the angle changes little along a chord).
+        vec3 xa = mix(x0, x1, ta);
+        float psiMin = min(min(axisAngle(x0), axisAngle(x1)), axisAngle(xa));
+        float allowed = max(max(outflowConeAngle(length(x0)), outflowConeAngle(length(x1))), outflowConeAngle(length(xa)));
+        if (psiMin > allowed + 0.03) return;
+    }
+
+    float chord = sqrt(len2);
+    float rMid = max(rClosest, uOutflowLaunch);
+    gWindK = uOutflowSpeed * uOutflowSpeed;
+    gWindT0 = windClock(gWindK, uOutflowLaunch);
+    // Finer steps near the base, where the wind is so dense that a step would cross
+    // several optical depths at once.
+    float spacing = mix(0.04, 0.1, smoothstep(1.5, 5.0, rMid / uOutflowLaunch)) * rMid;
+    int n = clamp(int(ceil(chord / max(spacing, 0.6 * MASS))), 1, 16);
+    float dl = chord / float(n);
+    vec3 toCamera = -seg / chord;
+    float kappa = uOutflowThickness * kOutflowOpacity / uOutflowLaunch;
+    float boil = uOutflowClock * 0.0025 / MASS;
+    float Rlit = 3.0 * uOutflowLaunch;  // inside this the flare's light no longer grows
+    for (int k = 0; k < n; ++k) {
+        float s = (float(k) + jitter) / float(n);
+        vec3 x = x0 + seg * s;
+        float te = uOutflowClock - mix(delay0, delay1, s);
+        OutflowPoint o = outflowPoint(x, te);
+        float env = envelopeDensity(x, te);
+        bool inCone = o.rho > 0.0 && o.edge < 1.45;  // the billows reach no farther out
+        if (!inCone && env * kappa * dl < 1e-4) continue;
+        // Behind gas that already hides most of what lies further, less detail will do.
+        bool fine = transmittance > 0.3;
+        float cloud = inCone ? o.rho * outflowBillows(o.q, o.edge, o.front, fine ? 4 : 3, boil) : 0.0;
+        float density = cloud + env;
+        float dTau = kappa * density * dl;
+        if (dTau < 1e-4) continue;
+        float R = length(x);
+        vec3 d = x / R;
+
+        // Optical depth toward the flare: the smooth wind between here and the center (two
+        // points along the light's path, each seen when the light passed it), and the
+        // billows just inward of here, which shade the far sides of the puffs.
+        float Rm = 0.5 * (uOutflowLaunch + R), tm = te - 0.5 * (R - uOutflowLaunch);
+        float tau = (0.45 * outflowPoint(d * Rm, tm).rho + envelopeDensity(d * Rm, tm)) * (R - uOutflowLaunch);
+        float step1 = 0.05 * R;
+        float local = fine ? outflowDensity(x - d * step1, te - step1, 2, boil) * step1 * 2.0 : 0.6 * cloud * step1;
+        tau = kappa * (kOutflowPorosity * tau + local);
+        float shade = exp(-tau) + 0.5 / (1.0 + 0.75 * tau);
+
+        // The flare as it was when the light now lighting this gas left the center (a
+        // light echo), fading as R^-falloff.
+        float lum = outflowHistory(te - R).z;
+        float light = uOutflowLight * lum * pow(Rlit / max(R, Rlit), uOutflowFalloff);
+        // Henyey-Greenstein forward scattering for the single-scattered part.
+        float cosA = dot(d, toCamera);
+        const float gHG = 0.4;
+        float hg = (1.0 - gHG * gHG) / pow(1.0 + gHG * gHG - 2.0 * gHG * cosA, 1.5);
+        float phase = mix(1.0, hg, 0.5 * exp(-tau));
+
+        // Doppler: the gas recedes from the flare (sqrt((1 - v) / (1 + v))) and moves
+        // relative to the camera (g).
+        vec4 p = mix(p0, p1, s);
+        vec2 v = mix(v0, v1, s);
+        float g = 1.0, gt = 1.0;
+        if (uRelativity != 2) {
+            g = min(frequencyRatio(radialFlowVelocity(p.x, p.y, o.speed), p.x, v.x, v.y), 3.0);
+            gt = g * sqrt((1.0 - o.speed) / (1.0 + o.speed));
+        }
+        vec3 hue = blackbody(uRelativity == 0 ? uFlareTemp * gt : uFlareTemp);
+        hue /= max(luminance(hue), 1e-30);
+        float beam = uRelativity == 2 ? 1.0 : gt * gt * gt;
+        vec3 scattered = hue * (0.95 * light * shade * phase * beam);
+        // The base is still hot from the shocks that launched it and cools as it expands
+        // (adiabatically, T ~ rho^(2/3) ~ R^(-4/3)): a warm glow near the hole.
+        float Tgas = uFlareTemp * 0.75 * pow(uOutflowLaunch / R, 1.333);
+        if (uOutflowGlow > 0.0 && Tgas > 600.0) {
+            vec3 gh = blackbody(uRelativity == 0 ? Tgas * g : Tgas);
+            gh /= max(luminance(gh), 1e-30);
+            float heat = (Tgas / 5000.0) * (Tgas / 5000.0) * smoothstep(600.0, 2600.0, Tgas);
+            // Hotter in the dense cores of the billows, which have had less room to expand.
+            scattered += gh * (uOutflowGlow * uOutflowLight * heat * lum * (0.35 + 0.65 * shade));
+        }
+        float absorbed = 1.0 - exp(-dTau);
+        color += transmittance * scattered * absorbed;
+        transmittance *= 1.0 - absorbed;
+        if (transmittance < 0.01) {
+            transmittance = 0.0;
+            return;
+        }
+    }
+}
+#endif
 
 // --- Sky ---------------------------------------------------------------------------
 
@@ -751,18 +1440,12 @@ vec3 heatMap(float x) {
 
 // --- Main ----------------------------------------------------------------------------
 
-void main() {
-    spinA = uSpin;
-    spinA2 = spinA * spinA;
-
-    // Direction of this pixel in the camera's rest frame, components (r, theta, phi).
-    vec2 ndc = (gl_FragCoord.xy - 0.5 * uResolution) / (0.5 * uResolution.y);
-    vec3 n = normalize(uCamBasis * vec3(ndc * uTanHalfFov, 1.0));
-
-    // The photon arriving from n, with unit energy in the camera frame (see
-    // kerr::photonFromFrame). A moving camera's frame is boosted, so the view crowds
-    // toward the direction of motion and is blueshifted there: aberration.
-    float r = uCamPos.x, th = uCamPos.y, ph = uCamPos.z;
+// The photon arriving from direction n (camera frame) with unit energy in the camera
+// frame (see kerr::photonFromFrame): sets the constants of motion and returns the
+// backward-traced velocities at the camera. A moving camera's frame is boosted, so the
+// view crowds toward the direction of motion and is blueshifted there: aberration.
+void launchPhoton(vec3 n, out float vr, out float vth) {
+    float r = uCamPos.x, th = uCamPos.y;
     vec4 q = uCamPhoton * vec4(1.0, -n);
     photonE = -q.x;
     photonL = q.y;
@@ -771,17 +1454,36 @@ void main() {
     float sigma = r * r + spinA2 * c * c;
     photonQ = pTheta * pTheta + c * c * (photonL * photonL / max(s * s, 1e-8) - spinA2 * photonE * photonE);
     // Backward-traced velocities: the photon moves toward the camera.
-    float vr = -sigma * q.w;
-    float vth = -pTheta;
+    vr = -sigma * q.w;
+    vth = -pTheta;
     if (abs(photonL) < 3e-4 * sqrt(max(photonQ + spinA2 * photonE * photonE, 0.0))) {
         // Would pass within ~3e-4 rad of the spin axis, where phi swings through pi
         // too fast to resolve; send it exactly through the axis (kerr::kAxisSnap).
         photonL = 0.0;
         photonQ = pTheta * pTheta - c * c * spinA2 * photonE * photonE;
     }
+}
+
+void main() {
+    spinA = uSpin;
+    spinA2 = spinA * spinA;
+
+    // Direction of this pixel in the camera's rest frame, components (r, theta, phi).
+    vec2 ndc = (gl_FragCoord.xy - 0.5 * uResolution) / (0.5 * uResolution.y);
+    vec3 n = normalize(uCamBasis * vec3(ndc * uTanHalfFov, 1.0));
+
+    float r = uCamPos.x, th = uCamPos.y, ph = uCamPos.z;
+    float vr, vth;
+    launchPhoton(n, vr, vth);
     float gSky = photonE > 1e-6 ? 1.0 / photonE : 1.0;
 
-    float horizon = 1.0 + sqrt(max(1.0 - spinA2, 0.0));
+#ifdef CENTRAL_BODY
+    const bool hole = false;
+#else
+    const bool hole = true;
+#endif
+    float horizon = MASS + sqrt(max(MASS * MASS - spinA2, 0.0));
+    float boundary = hole ? horizon : uSurfaceR;
     bool lightDelay = bodyInfo.z != 0;
     vec3 X = toCartesian(r, th, ph);
     vec3 cameraX = X;
@@ -789,16 +1491,34 @@ void main() {
     float transmittance = 1.0;
     float delay = 0.0;       // coordinate time since the light was at the current point
     float pathLength = 0.0;  // distance the light travelled from the current point to the camera
-    int fate = 0;       // 0 = undecided, 1 = escaped to the sky, 2 = captured or blocked
+    int fate = 0;       // 0 = undecided, 1 = escaped to the sky, 2 = captured or blocked,
+                        // 3 = ended on the central surface
     vec3 escapeDir = vec3(0.0, 0.0, 1.0);
     int steps = 0;
+    // The body the ray ended on, if any: shaded after the loop, since its many registers
+    // would slow every step.
+    int hitBody = -1;
+    vec3 bodyX = vec3(0.0), bodyDir = vec3(0.0);
+    float bodyR = 0.0, bodyVr = 0.0, bodyVth = 0.0, bodyDelay = 0.0, bodyDist = 0.0, bodyTrans = 0.0;
+#ifdef CENTRAL_BODY
+    // Where the ray ended on the surface: shaded once, after the loop, so that the
+    // shading code does not weigh on the loop (registers).
+    vec3 hitX, hitDir;
+    float hitTh, hitPh, hitDelay, hitTransmittance, hitDistance;
+    bool onCompanion = false;  // the ray ended on a white dwarf's companion
+#endif
 
     // Inside the horizon every ray, followed back in time, rises to the horizon. If it
-    // gets there with P(r+) = 2 r+ E - a L < 0 it entered from the far side of the
+    // gets there with P(r+) = 2 m r+ E - a L < 0 it entered from the far side of the
     // eternal Kerr spacetime, from which no light is drawn: dark.
-    if (r < horizon && 2.0 * horizon * photonE - spinA * photonL < 0.0) fate = 2;
+    if (hole && r < horizon && 2.0 * MASS * horizon * photonE - spinA * photonL < 0.0) fate = 2;
 
     for (int k = 0; k < 32; ++k) bodySlack[k] = -1.0;
+#ifdef OUTFLOW
+    // Offsets the outflow's samples from pixel to pixel (white noise), so its steps show
+    // as fine grain rather than bands or patterns.
+    float outflowJitter = hash13(vec3(gl_FragCoord.xy, 7.3));
+#endif
     ivec3 pathCellNow = ivec3(-1000);
     bool pathOccupiedNow = uPathsEnabled == 1 && pathCell(vec4(r, th, ph, 0.0), pathCellNow);
 
@@ -813,7 +1533,7 @@ void main() {
         // ray approaches the axis, before the swing starts. Far from the hole
         // spacetime is nearly flat, so the allowed change grows with r.
         float sn = abs(sin(th));
-        float tol = uStepSize * clamp(r / 8.0, 1.0, 4.0);
+        float tol = uStepSize * clamp(r / (8.0 * MASS), 1.0, 4.0);
         float h = tol / (abs(vr) / r + abs(vth) / max(sn, 1e-4) + abs(dPh1) + 1e-6);
         h = min(h, sqrt(tol * r / (abs(aR1) + 1e-6)));
         h = min(h, sqrt(tol * max(sn, 1e-4) / (abs(aTh1) + 1e-6)));
@@ -850,17 +1570,62 @@ void main() {
         enforceConstraints(r1, th1, vrNext, vthNext);
         vec3 X1 = toCartesian(r1, th1, ph1);
 
+#ifdef LENSES
+        // A small black hole passed within this step: end the step at the closest
+        // approach; the ray is bent there once the step's events are handled.
+        int lens = -1;
+        vec3 lensCenter = vec3(0.0);
+        if (!reflected) {
+            float u = lensBodies(X, X1, lightDelay ? 0.5 * (delay + delayNext) : 0.0, lens, lensCenter);
+            if (lens >= 0) {
+                r1 = mix(r, r1, u);
+                th1 = mix(th, th1, u);
+                ph1 = mix(ph, ph1, u);
+                vrNext = mix(vr, vrNext, u);
+                vthNext = mix(vth, vthNext, u);
+                delayNext = mix(delay, delayNext, u);
+                X1 = toCartesian(r1, th1, ph1);
+            }
+        }
+#endif
+
         // Glowing matter along the whole segment: debris gas, jets and path lines
-        // (not across a pole, where the coordinates jump).
+        // (not across a pole, where the coordinates jump), coronae and accretion columns.
         float chordLength = length(X1 - X);
         vec4 p0 = vec4(r, th, ph, 0.0), p1 = vec4(r1, th1, ph1, 0.0);
         if (uDebrisEnabled == 1 && !reflected) {
             traceDebris(p0, vec2(vr, vth), p1, vec2(vrNext, vthNext), chordLength, color, transmittance);
         }
+#ifdef OUTFLOW
+        if (!reflected) {
+            traceOutflow(X, X1, p0, p1, vec2(vr, vth), vec2(vrNext, vthNext), lightDelay ? delay : 0.0,
+                         lightDelay ? delayNext : 0.0, outflowJitter, color, transmittance);
+        }
+#endif
         if (uJetsEnabled == 1 && !reflected) {
             traceJets(X, X1, p0, p1, vec2(vr, vth), vec2(vrNext, vthNext), lightDelay ? delay : 0.0,
-                      lightDelay ? delayNext : 0.0, horizon, color, transmittance);
+                      lightDelay ? delayNext : 0.0, boundary, color, transmittance);
+#if SURFACE_LOOK == 4
+            if (uFilmColor == 1) traceJetHelices(X, X1, pathLength, color, transmittance);
+#endif
         }
+#ifdef CENTRAL_BODY
+        if (uFunnelRadius > 0.0) {
+            traceFunnels(X, X1, r, r1, lightDelay ? delay : 0.0, lightDelay ? delayNext : 0.0, color, transmittance);
+        }
+#if SURFACE_LOOK == 3
+        if (uCompanion.w > 0.0) traceStream(X, X1, pathLength, color, transmittance);
+#endif
+#if SURFACE_LOOK == 4
+        if (uFlowGlow > 0.0 && uDiskEnabled == 1) {
+            traceThickFlow(X, X1, lightDelay ? delay : 0.0, lightDelay ? delayNext : 0.0, color, transmittance);
+        }
+        if (uFieldGlow > 0.0 || uPairGlow > 0.0 || uBeamGlow > 0.0) {
+            traceMagnetosphere(X, X1, lightDelay ? delay : 0.0, lightDelay ? delayNext : 0.0, pathLength, color,
+                               transmittance);
+        }
+#endif
+#endif
         if (uPathsEnabled == 1) {
             ivec3 nextCell;
             bool nextOccupied;
@@ -875,7 +1640,22 @@ void main() {
         }
         pathLength += chordLength;
 
-        // Events along this segment, handled in order: disk crossing, body hit.
+        // Events along this segment, handled in order: the surface of a star, disk
+        // crossing, body hit.
+        float tSurface = 2.0;
+#ifdef CENTRAL_BODY
+        if (min(r, r1) < uSurfaceR + chordLength) tSurface = surfaceCrossing(X, X1, r1);
+#if SURFACE_LOOK == 3
+        // The companion is a second surface the ray can end on.
+        if (uCompanion.w > 0.0) {
+            float tc = companionCrossing(X, X1);
+            if (tc < tSurface) {
+                tSurface = tc;
+                onCompanion = true;
+            }
+        }
+#endif
+#endif
         float tDisk = 2.0;
         // Strictly across: a camera sitting exactly in the plane is not on the disk.
         if (uDiskEnabled == 1 && (th - 0.5 * PI) * (th1 - 0.5 * PI) < 0.0) {
@@ -891,7 +1671,7 @@ void main() {
         } else {
             for (int k = 0; k < bodyInfo.x; ++k) bodySlack[k] -= chordLength;
         }
-        if (tDisk <= 1.0 && tDisk < tBody) {
+        if (tDisk <= 1.0 && tDisk < tBody && tDisk < tSurface) {
             float rc = mix(r, r1, tDisk);
             if (rc >= uDiskInner && rc <= uDiskOuter) {
                 float diskDelay = lightDelay ? mix(delay, delayNext, tDisk) : 0.0;
@@ -900,13 +1680,33 @@ void main() {
                 transmittance *= 1.0 - e.a;
             }
         }
-        if (tBody <= 1.0) {
-            vec3 hit = mix(X, X1, tBody);
-            color += transmittance * bodyRadiance(body, hit, bodyHit, normalize(X1 - X),
-                                                  mix(r, r1, tBody), mix(vr, vrNext, tBody),
-                                                  mix(vth, vthNext, tBody), delayMid);
+        if (tBody <= 1.0 && tBody < tSurface) {
+            hitBody = body;
+            bodyX = mix(X, X1, tBody);
+            bodyDir = normalize(X1 - X);
+            bodyR = mix(r, r1, tBody);
+            bodyVr = mix(vr, vrNext, tBody);
+            bodyVth = mix(vth, vthNext, tBody);
+            bodyDelay = delayMid;
+            bodyDist = pathLength - chordLength * (1.0 - tBody);
+            bodyTrans = transmittance;
             transmittance = 0.0;
         }
+#ifdef CENTRAL_BODY
+        if (tSurface <= 1.0) {
+            // Where on the surface, from the exact crossing point (Kerr-Schild Cartesian:
+            // z = R cos(theta), x + i y = (R + i a) e^(i phi) sin(theta)).
+            hitX = mix(X, X1, tSurface);
+            hitTh = acos(clamp(hitX.z / uSurfaceR, -1.0, 1.0));
+            hitPh = atan(hitX.y, hitX.x) - atan(spinA, uSurfaceR);
+            hitDelay = lightDelay ? mix(delay, delayNext, tSurface) : 0.0;
+            hitDistance = pathLength - chordLength * (1.0 - tSurface);
+            hitDir = normalize(X1 - X);
+            hitTransmittance = transmittance;
+            fate = 3;
+            break;
+        }
+#endif
 
         r = r1;
         th = th1;
@@ -916,9 +1716,21 @@ void main() {
         delay = delayNext;
         X = X1;
 
+#ifdef LENSES
+        // Bend the ray at the small black hole it just passed, or end it there.
+        if (lens >= 0 && transmittance >= 0.002) {
+            lensedMask |= 1u << uint(lens);
+            if (!lensKick(X, lensCenter, bodies[lens].params.x, bodies[lens].range.w, r, th, ph, vr, vth)) {
+                fate = 2;  // captured: its shadow
+                break;
+            }
+            gSky = photonE > 1e-6 ? 1.0 / photonE : 1.0;
+        }
+#endif
+
         // Sinking back toward the horizon from outside: the light came out of the past
         // horizon, which shows as the black hole's shadow.
-        if (transmittance < 0.002 || (r < horizon + 0.01 && vr < 0.0)) {
+        if (transmittance < 0.002 || (hole && r < horizon + 0.01 * MASS && vr < 0.0)) {
             fate = 2;
             break;
         }
@@ -930,15 +1742,99 @@ void main() {
             break;
         }
     }
-    if (fate == 0 && r > 10.0) {
+    if (fate == 0 && r > 10.0 * MASS) {
         // Out of steps far from the hole: close enough to escaping.
         escapeDir = normalize(X);
         fate = 1;
     }
 
+    if (hitBody >= 0) {
+        color += bodyTrans * bodyRadiance(hitBody, bodyX, bodySampleAt(hitBody, bodyDelay), bodyDir, bodyR, bodyVr,
+                                          bodyVth, bodyDelay, bodyDist);
+    }
+
+    vec3 airTrans = vec3(1.0);  // what the planet's air lets through, of whatever lies behind it
+#ifdef CENTRAL_BODY
+    vec3 surfaceLight = vec3(0.0);
+    if (fate == 3) {
+#if SURFACE_LOOK == 3
+        if (onCompanion) surfaceLight = companionRadiance(hitX, hitDir, hitDistance);
+        else
+#endif
+        surfaceLight = surfaceRadiance(hitTh, hitPh, hitDelay, hitDir, hitX, hitDistance);
+    }
+    bool straight = true;
+#ifdef LENSES
+    straight = lensedMask == 0u;
+#endif
+    if (straight && (uAtmosphere == 1 || uCoronaScale > 0.0 || uChromosphereScale > 0.0 || uEnvelope > 0.0)) {
+        // The air or corona, integrated along the camera ray as a straight line: around a
+        // star or planet light bends by microradians or less. (Done after the loop: its
+        // registers would slow every step.)
+        float vr0, vth0, dPh0, unusedR, unusedTh, unusedT;
+        launchPhoton(n, vr0, vth0);
+        geodesicRhs(uCamPos.x, uCamPos.y, vr0, dPh0, unusedR, unusedTh, unusedT);
+        vec3 d = normalize(cartesianVelocity(uCamPos.x, uCamPos.y, uCamPos.z, vr0, vth0, dPh0));
+        float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        float tEnd = fate == 3 ? length(hitX - cameraX) : (fate == 2 ? pathLength : 1e30);
+        float front = fate == 3 ? hitTransmittance : (fate == 1 ? transmittance : 1.0);
+#if SURFACE_LOOK == 5
+        if (uAtmosphere == 1) {
+            float top = uSurfaceR * (1.0 + kAirTopSI / (uSurfaceKm * 1000.0));
+            vec2 span = sphereSpan(cameraX, d, top);
+            vec3 sun = shiftedBlackbody(5772.0, 1.0, 5772.0) * uSurfaceBrightness * uPlanetLight;
+            color += front * airGlow(cameraX, d, max(span.x, 0.0), min(span.y, tEnd), sun, jitter, airTrans);
+        }
+#elif SURFACE_LOOK == 3
+        if (uFilmColor == 1) {
+            // Films' white dwarfs blaze inside wisps of glowing gas: the corona's streamers
+            // and rays, in electric blue.
+            vec2 span = sphereSpan(cameraX, d, uSurfaceR * 5.0);
+            float glow = coronaGlow(cameraX, d, max(span.x, 0.0), min(span.y, tEnd), jitter, 0.0);
+            color += front * electricHue(0.62) * (glow * kElectricLevel * uSurfaceBrightness);
+        }
+#elif SURFACE_LOOK == 1
+        {
+            // Beyond ~5 R the corona is below 1e-9 of the disk even brightened 1e5 times.
+            vec2 span = sphereSpan(cameraX, d, uSurfaceR * 5.0);
+            vec3 white = shiftedBlackbody(uSurfaceTemp, 1.0, uSurfaceTemp * kCenterTemperature) * kPhotosphereLevel *
+                         uSurfaceBrightness;
+            if (uFilmColor == 1) white = aia304(0.5) * (kSdoLevel * uSurfaceBrightness);
+            if (uEnvelope > 0.0) {
+                // A red giant's glowing extended atmosphere and its plumes.
+                vec2 outer = sphereSpan(cameraX, d, uSurfaceR * 3.0);
+                float env = giantEnvelope(cameraX, d, max(outer.x, 0.0), min(outer.y, tEnd), jitter);
+                color += front * aia304(0.3 + 0.25 * min(env, 1.0)) * (min(env, 2.5) * uEnvelope * kSdoLevel *
+                                                                       uSurfaceBrightness);
+            }
+            if (uCoronaScale > 0.0) {
+                float glow = coronaGlow(cameraX, d, max(span.x, 0.0), min(span.y, tEnd), jitter, 0.0);
+                color += front * white * glow;
+            }
+            if (uChromosphereScale > 0.0) {
+                vec3 rim = chromosphere(cameraX, d, 0.0);
+                float loops = prominences(cameraX, d, tEnd, fate == 3) * uChromosphereScale;
+                if (uFilmColor == 1) {
+                    // The spicule fringe and prominences in the 30.4 nm color table: their
+                    // brightest parts orange-yellow.
+                    float c = rim.r * 2.2;
+                    color += front * aia304(0.3 + 0.6 * min(c, 1.0)) * (min(c, 1.5) * kSdoLevel * uSurfaceBrightness);
+                    color += front * aia304(0.4 + 0.35 * min(loops, 1.3)) * (min(loops, 1.5) * 0.55 * kSdoLevel *
+                                                                            uSurfaceBrightness);
+                } else {
+                    color += front * rim * kPhotosphereLevel * uSurfaceBrightness;
+                    color += front * vec3(1.0, 0.16, 0.3) * (loops * kPhotosphereLevel * uSurfaceBrightness);
+                }
+            }
+        }
+#endif
+    }
+    if (fate == 3) color += hitTransmittance * airTrans * surfaceLight;
+#endif
+
     // Evaluated outside the loop so screen-space derivatives (grid lines) are valid.
     vec3 sky = skyColor(escapeDir, gSky);
-    if (fate == 1) color += transmittance * sky;
+    if (fate == 1) color += transmittance * airTrans * sky;
 
     if (uDebugView == 1) color = heatMap(float(steps) / float(uMaxSteps));
     if (uDebugView == 2) color = fate == 1 ? escapeDir * 0.5 + 0.5 : vec3(0.0);

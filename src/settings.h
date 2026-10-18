@@ -1,7 +1,38 @@
 #pragma once
 
+#include "central.h"
+#include "tde.h"
+
 // Everything the user can tweak from the control panel.
+//
+// Sizes and times that lay out the scene (disk radii, escape radius, prediction time,
+// time scale) are in scene units: sceneScale() M of length (1 for black holes and
+// neutron stars, R/6 for bigger objects) and sceneScale()^1.5 M of time, the
+// dynamical time at that size. For a black hole they are simply M.
 struct Settings {
+    // The central object; `spin` below is the Kerr parameter it implies
+    // (central.metricSpin()), kept up to date by the app.
+    central::Object central = [] {
+        central::Object o;
+        o.chi = 0.94;
+        return o;
+    }();
+    bool physicalUnits = false;    // readouts also in km, AU, seconds, hours
+    bool radiusFollowsMass = true; // white dwarfs and neutron stars: radius from the mass-radius relation
+    bool autoStage = true;         // the compactness slider turns a star into a white dwarf, then a neutron star
+    float accretionRate = 0.01f;   // in Eddington units: sets the magnetospheric (Alfven) radius
+    bool magnetosphere = true;     // magnetized stars truncate the disk and feed accretion columns
+    bool fieldLines = true;        // a neutron star's magnetic field lines, glowing (false color)
+    bool pulsarBeams = true;       // pulsars' beams, as if lighting a haze
+    float magnetosphereGlow = 1.0f;  // brightness of both
+    bool surfaceDetail = true;     // spots, granulation, hot spots, flares
+    float surfaceBrightness = 1.0f;
+    bool corona = true;            // stellar coronae and planetary atmospheres
+    float coronaBoost = 1e5f;      // the corona's brightness, times the real one (a millionth of the disk)
+    bool companionStar = true;     // a white dwarf with a disk: its Roche-lobe-filling companion and stream
+    bool filmColor = true;
+    bool planetMaps = true;        // the Earth and Jupiter from spacecraft maps (assets/planets)         // stars in the warm colors of films and colorized solar images (else true color)
+
     // Black hole
     float spin = 0.94f;  // a = J/M, in [0, 0.999]
 
@@ -12,6 +43,9 @@ struct Settings {
     float diskInner = 2.0f;        // used when diskInnerAtIsco is off
     float diskOuter = 20.0f;
     float diskTemperature = 6500.0f;  // peak temperature in K
+    // Around a neutron star or white dwarf the app sets the disk's real peak temperature
+    // from the accretion rate (K; 0 otherwise), and diskTemperature to its display value.
+    double diskPhysicalTemperature = 0.0;
     float diskBrightness = 4.0f;
     float diskOpacity = 0.95f;
     float diskTurbulence = 0.75f;
@@ -26,6 +60,24 @@ struct Settings {
     float gasCollisions = 0.3f;     // how readily crossing streams shock (per M per unit density)
     float gasCoolingTime = 60.0f;   // M, at 10,000 K
     float gasFloorTemperature = 4500.0f;
+    // Display only: the debris glows at least as if it were this hot (0: as hot as it is).
+    // A disrupted star's stream is lit by its own leftover heat and then by the flare.
+    float debrisGlowFloor = 0.0f;
+
+    // After a tidal disruption (src/tde.h): the debris that comes back powers a flare,
+    // feeds a small new disk and blows out a billowing outflow along its orbit's axis.
+    bool tdeFlare = true;
+    float outflowFraction = 0.5f;   // share of the returning debris blown out (the rest is accreted)
+    float outflowSpeed = 0.1f;      // terminal speed on the axis, in c (AT2019qiz: ~0.03)
+    float outflowOpeningDeg = 14.0f;  // half-opening angle once the fallback has faded
+    float outflowWidening = 3.0f;   // ... times this at first, before the new disk collimates it
+    float outflowThickness = 1.0f;  // opacity (a real wind is far more opaque; see README)
+    float outflowBrightness = 1.0f; // how brightly the flare lights it
+    bool flareDisk = true;          // the returning gas forms a small disk that shines with the flare
+    bool flareCinematic = true;     // the flare light fades as R^-0.7, not R^-2, so the outflow's top shows
+    bool debrisFilaments = false;   // the star's structure, stretched by the tide into fine strands (costly)
+    bool flareFastForward = true;   // time runs faster while the bound debris is far out, until it returns
+    bool flareCamera = false;       // the camera's distance follows a tidal disruption (until you zoom)
 
     // Relativistic jets along the spin axis
     bool jetsEnabled = false;
@@ -68,3 +120,13 @@ struct Settings {
     bool autoOrbit = false;
     float autoOrbitSpeed = 0.06f;  // rad/s
 };
+
+// How a tidal disruption's outflow is launched, from the panel's settings.
+inline tde::OutflowParams outflowParams(const Settings& s) {
+    tde::OutflowParams p;
+    p.fraction = s.outflowFraction;
+    p.speed = s.outflowSpeed;
+    p.openingLate = s.outflowOpeningDeg * 3.14159265358979 / 180.0;
+    p.widening = s.outflowWidening;
+    return p;
+}

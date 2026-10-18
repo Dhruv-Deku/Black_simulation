@@ -47,8 +47,11 @@ double stepLimit(double a, const std::vector<Member>& members, double maxStep);
 bool interacting(const std::vector<Member>& members);
 
 // Advances all members together by dt (kick, drift, kick in substeps), recording
-// each one's path. Members that fall in or escape stop there.
+// each one's path. Members that fall in (through the horizon, or onto the surface of
+// radius `surface` if nonzero) or escape beyond escapeRadius stop there. maxStep caps
+// the substeps (scale it with the scene: dynamical times grow as scale^1.5).
 std::vector<trajectory::Path> predict(double a, std::vector<Member> members, double duration, double minSpacing,
-                                      size_t maxPoints = 3000);
+                                      size_t maxPoints = 3000, double surface = 0.0, double escapeRadius = 2000.0,
+                                      double maxStep = 1.0);
 
 }  // namespace gravity
