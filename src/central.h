@@ -122,6 +122,7 @@ struct CatalogEntry {
     double cameraInclinationDeg = 0.0;  // the view's angle from the spin axis (0: the default)
     double timeScale = 0.0; // pace of the simulation, scene time per second (0: the default)
     bool jets = false;      // shows jets by default (X-ray binaries launch them)
+    double cameraRollDeg = 0.0;  // the picture turned about the view (0: the spin axis upright)
 };
 const std::vector<CatalogEntry>& catalog();
 

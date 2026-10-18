@@ -24,6 +24,7 @@ struct Camera {
     double phi = 0.0;
     float yaw = 0.0f;
     float pitch = 0.0f;
+    float roll = 0.0f;  // turns the picture about the view direction (radians)
     float fovDeg = 60.0f;
 
     CameraMotion motion = CameraMotion::Hover;

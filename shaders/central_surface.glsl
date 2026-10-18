@@ -72,6 +72,21 @@ vec3 electricHue(float t) {
 }
 const float kElectricLevel = 1.5;
 
+// The saturated blues of films' spinning neutron stars: deep blue, blue, cyan, then
+// white only at the very top (a glowing rim).
+vec3 beaconHue(float t) {
+    const int N = 5;
+    const float stops[N] = float[N](0.0, 0.35, 0.65, 0.85, 1.0);
+    const vec3 cols[N] = vec3[N](vec3(0.0, 0.03, 0.22), vec3(0.0, 0.28, 0.9), vec3(0.01, 0.68, 1.0),
+                                 vec3(0.35, 0.92, 1.0), vec3(1.0));
+    t = max(t, 0.0);
+    if (t >= 1.0) return vec3(1.0 + 1.5 * (t - 1.0));
+    for (int k = 1; k < N; ++k) {
+        if (t <= stops[k]) return mix(cols[k - 1], cols[k], (t - stops[k - 1]) / (stops[k] - stops[k - 1]));
+    }
+    return cols[N - 1];
+}
+
 // SDO's 30.4 nm color table (black, dark red, orange, yellow, white), in which films and
 // NASA show the Sun; past white, brighter still (it blooms).
 vec3 aia304(float t) {
@@ -825,13 +840,27 @@ vec3 surfaceRadiance(float th, float ph, float delay, vec3 rayDir, vec3 hitX, fl
         // the rotation). The physics' brightness pattern (hot poles, hot spots) rides on it.
         float plasma = fbmFiltered(n * 5.0 + 1.7, 5, fp * 5.0) + 0.7 * ridgedFiltered(n * 9.0 + 3.0, 4, fp * 9.0);
         float I = pow(tFactor, 4.0) * (0.8 + 0.5 * plasma);
+        float level = kElectricLevel;
+        bool beacon = false;
 #if SURFACE_LOOK == 3
         // A white dwarf: the turbulence shows across a bluer disk.
         float t = 0.42 + 0.36 * sqrt(mu) * I + 0.3 * (I - 1.0);
 #else
         float t = 0.5 + 0.42 * sqrt(mu) * I + 0.12 * (I - 1.0);
+        if (uBeacon == 1) {
+            // As films show a spinning neutron star: a sphere of blue plasma crazed with
+            // glowing veins (fixed to the star, so they show its spin), brightening toward
+            // a white-blue rim where the line of sight grazes its glowing surface layer.
+            vec3 cells = worley(n * 7.0, 0.0);
+            float vein = 1.0 - smoothstep(0.0, 0.08 + 14.0 * fp, cells.y - cells.x);
+            float fine = fbmFiltered(n * 18.0 + 4.1, 3, fp * 18.0);
+            float rim = pow(1.0 - mu, 2.5);
+            t = 0.12 + 0.12 * plasma + 0.45 * vein * (0.75 + 0.25 * fine) + 0.7 * rim + 0.2 * (I - 1.0);
+            level = 1.15;
+            beacon = true;
+        }
 #endif
-        color = electricHue(t) * (kElectricLevel * uSurfaceBrightness);
+        color = (beacon ? beaconHue(t) : electricHue(t)) * (level * uSurfaceBrightness);
     }
 #endif
 
@@ -911,7 +940,8 @@ const float kFieldWidth = 0.022; // a line's half-width, in surface radii
 const vec3 kFieldColor = vec3(0.42, 0.62, 1.0);
 const vec3 kTwistedColor = vec3(0.62, 0.5, 1.0);
 const vec3 kBeamColor = vec3(0.62, 0.8, 1.0);
-const float kHaloLevel = 1.2;  // brightness of a young neutron star's glow, with uHaloGlow 1
+const float kHaloLevel = 0.12;  // brightness of a young neutron star's glow, with uHaloGlow 1
+const float kRimLevel = 1.6;   // ... and of the thin glowing layer that rings it
 
 // A point's place among the field lines: returns the azimuth of its line in units of
 // the spacing between lines, and L and cos(theta_m). A twisted line's azimuth runs from
@@ -1038,8 +1068,11 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
             float r = length(x);
             if (r < R) continue;
             float q = R / r;
-            vec3 tint = mix(vec3(0.12, 0.42, 1.0), vec3(0.85, 0.95, 1.0), q * q);
-            color += transmittance * tint * (uHaloGlow * kHaloLevel * (1.0 + 2.0 * flare) * q * q * q * chord / float(N) / R);
+            vec3 tint = mix(vec3(0.03, 0.3, 1.0), vec3(0.15, 0.7, 1.0), q * q);
+            // A thin glowing layer at the surface: seen edge-on it rings the star.
+            float shell = kRimLevel * exp(-(r - R) / (0.08 * R));
+            color += transmittance * (tint * kHaloLevel * q * q * q + vec3(0.2, 0.75, 1.0) * shell) *
+                     (uHaloGlow * (1.0 + 2.0 * flare) * chord / float(N) / R);
         }
     }
 
@@ -1063,6 +1096,7 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
                       (uQuakeCount > 0 ? 0.12 : 0.0);
         if (acos(min(closest, 1.0)) > reach) return;  // the beams come last
         int n = clamp(int(ceil(chord / (0.3 * rMid * uBeamWidth))), 1, 8);
+        vec3 cameraX = toCartesian(uCamPos.x, uCamPos.y, uCamPos.z);
         float dl = chord / float(n);
         for (int k = 0; k < n; ++k) {
             float f = (float(k) + 0.5) / float(n);
@@ -1081,7 +1115,8 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
                 // (as real pulsars' do; their radio light comes in bursts down to
                 // microseconds long). Set by when the light left the star, so each change
                 // runs out along the beam at the speed of light.
-                profile = exp(-0.693 * psi * psi);
+                // ... and a white-hot thread along its middle.
+                profile = exp(-0.693 * psi * psi) + 0.7 * exp(-12.0 * psi * psi);
                 glowPart = 0.06 * exp(-0.173 * psi * psi);
                 if (profile + glowPart < 1e-3) continue;
                 float turns = uSurfaceTurns - uSurfaceOmega * delay / (2.0 * PI);
@@ -1089,7 +1124,7 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
                 float k0 = floor(turns);
                 float pulse = mix(hash13(vec3(k0, side, 3.1)), hash13(vec3(k0 + 1.0, side, 3.1)),
                                   smoothstep(0.0, 1.0, turns - k0));
-                float flicker = 0.85 + 0.15 * sin(2.0 * PI * 23.0 * turns + side) * sin(2.0 * PI * 37.0 * turns + 1.3);
+                float flicker = 0.85 + 0.15 * sin(2.0 * PI * 3.1 * turns + side) * sin(2.0 * PI * 4.7 * turns + 1.3);
                 float strength = (0.45 + 1.1 * pulse) * flicker;
                 profile *= strength;
                 glowPart *= strength;
@@ -1106,16 +1141,23 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
             vec3 tint = kBeamColor;
             // Films' beams: white-hot along the axis, electric blue at the edges.
             if (uFilmColor == 1) tint = 2.0 * mix(vec3(0.25, 0.6, 1.0), vec3(0.95, 0.98, 1.0), exp(-psi * psi * 6.0));
+            // A beacon's needle: cyan-white, its edges deep blue.
+            if (uFilmColor == 1 && uBeacon == 1) {
+                tint = 2.0 * mix(vec3(0.05, 0.45, 1.0), vec3(0.55, 0.95, 1.0), exp(-psi * psi * 2.0));
+                tint = mix(tint, vec3(2.2), exp(-psi * psi * 14.0));
+            }
             // Films keep the needle bright far out: it fades as 1 / r, not 1 / r^2 (its
-            // soft glow as 1 / r^2), and ends before it reaches the camera (14 radii out, or
-            // sooner when the camera is closer), so a beam turned toward you does not swell
-            // into a blob as it passes the lens.
+            // soft glow as 1 / r^2), out to 30 radii; it fades near the camera, so a beam
+            // turned toward you does not swell into a blob as it passes the lens.
             float dim = uBeacon == 1 && uFilmColor == 1 ? q : q * q;
             if (uBeacon == 1) {
-                float reachR = min(14.0 * R, 0.8 * uCamPos.x);
-                dim *= 1.0 - smoothstep(0.7 * reachR, reachR, r);
+                dim *= smoothstep(0.15 * uCamPos.x, 0.4 * uCamPos.x, length(x - cameraX)) *
+                       (1.0 - smoothstep(25.0 * R, 30.0 * R, r));
             }
-            color += transmittance * tint * (uBeamGlow * (profile * dim + glowPart * q * q) * rise * dl / R);
+            // Its soft glow with a violet fringe, as in films.
+            vec3 glowTint = uFilmColor == 1 ? vec3(0.9, 0.8, 2.0) : tint;
+            color += transmittance * (tint * profile * dim + glowTint * glowPart * q * q * smoothstep(0.0, 1.0, dim / max(q, 1e-6))) *
+                     (uBeamGlow * rise * dl / R);
         }
     }
 }

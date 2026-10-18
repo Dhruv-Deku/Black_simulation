@@ -41,7 +41,7 @@ constexpr double kCrustQ = 60.0;
 // A glitch's flash of X-rays: how bright, and its fade time (M).
 constexpr double kQuakeFlash = 1.2, kQuakeFlashFade = 6000.0;
 // Brightness of a beacon neutron star's needle beams.
-constexpr float kBeaconBeamGlow = 0.8f;
+constexpr float kBeaconBeamGlow = 2.4f;
 
 const std::map<std::string, Preset>& presetNames() {
     static const std::map<std::string, Preset> names = {
@@ -1086,8 +1086,8 @@ void App::applyCentral(int index) {
     m_settings.starBrightness = star ? 0.04f : (planet ? 0.06f : defaults.starBrightness);
     m_settings.galaxyBrightness = star ? 0.15f : (planet ? 0.15f : defaults.galaxyBrightness);
     const bool neutron = kind == central::Kind::NeutronStar;
-    m_settings.bloomStrength = star ? 0.1f : (neutron ? 0.14f : defaults.bloomStrength);
-    if (neutron) m_settings.starBrightness = 0.6f;
+    m_settings.bloomStrength = star ? 0.1f : (neutron ? (e.object.beacon ? 0.06f : 0.14f) : defaults.bloomStrength);
+    if (neutron) m_settings.starBrightness = e.object.beacon ? 0.3f : 0.6f;
     m_flashTime = -1e30;
     m_burstFuel = 0.0;
     m_quakes.clear();
@@ -1105,6 +1105,7 @@ void App::applyCentral(int index) {
         m_settings.diskOuter = static_cast<float>(e.diskOuter * e.object.radius / sceneScale());
     }
     if (e.cameraInclinationDeg > 0.0) m_camera.theta = e.cameraInclinationDeg * kerr::kPi / 180.0;
+    m_camera.roll = static_cast<float>(e.cameraRollDeg * kerr::kPi / 180.0);
     // A star's disk and its surface are both blackbodies: at the same temperature they
     // are equally bright. The black hole's disk brightness is a free, visual choice;
     // here it follows from the disk's temperature against the surface's (the surface is

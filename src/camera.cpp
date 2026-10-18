@@ -15,7 +15,9 @@ glm::mat3 Camera::basis() const {
     const glm::vec3 right = cy * right0 - sy * forward0;
     const glm::vec3 forward = cp * yawed + sp * up0;
     const glm::vec3 up = glm::cross(right, forward);
-    return glm::mat3(right, up, forward);
+    // Roll turns right and up about the view direction.
+    const float cr = std::cos(roll), sr = std::sin(roll);
+    return glm::mat3(cr * right + sr * up, cr * up - sr * right, forward);
 }
 
 kerr::Frame Camera::frame(double spin) const {

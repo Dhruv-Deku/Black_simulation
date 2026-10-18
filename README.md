@@ -73,11 +73,14 @@ whole event: [docs/tidal-disruption-flare.mp4](docs/tidal-disruption-flare.mp4) 
     pulsar), sweeping round with the star and curving back into a spiral by light-travel
     time. Accreting neutron stars launch jets at half the speed of light, as Sco X-1 does.
   - **A spinning, quaking neutron star, as in films:** the *Neutron star* is a young pulsar
-    like Vela (89 ms, 3e12 G tilted 70 degrees): a blazing blue-white core in its glow, two
-    needle-thin beams (its core beams, 4 degrees wide) sweeping round like a lighthouse's
-    and flashing as they cross you, each pulse brighter or fainter than the last. Now and
-    then its crust slips (a glitch) and rings in its torsional modes at 22 and 35 Hz,
-    shaking the magnetic poles: the beams wobble and the star shimmers.
+    spinning 11 times a second (as Vela does), its 3e12 G field nearly aligned with its spin
+    (10 degrees): a sphere of blue plasma crazed with glowing veins, ringed by a bright rim,
+    whirling round three times a second on screen, while its two beams (its 4-degree core
+    beams, a white-hot thread in a blue glow) stay almost still, wobbling about the spin
+    axis, each pulse brighter or fainter than the last. Now and then its crust slips (a
+    glitch) and rings in its torsional modes at 22 and 35 Hz, shaking the magnetic poles:
+    the beams quiver and the star shimmers. Raise its *Magnetic tilt* and the beams sweep
+    round like a lighthouse's.
   - **White dwarfs:** a cataclysmic variable: a red dwarf filling its Roche lobe (Eggleton's
     radius, 57 white-dwarf radii away, turning every 1.9 hours), its gas falling from the L1
     point along the ballistic path of the Roche potential onto a disk truncated by its tide;
@@ -237,12 +240,13 @@ takes a couple of minutes. The executable is `build\Release\blackhole.exe`. Edit
 - **Famous black holes → M87\*:** a one-sided jet nearly toward you.
 - **Central object → Sun**, then drag **Compactness M/R** to the right: the Sun becomes as
   dense as a white dwarf, then a neutron star, until it collapses into a black hole.
-- **Central object → Neutron star**: watch its beams sweep all the way round (a turn every
-  2.6 s, time slowed 28 times) and press **Starquake now**; the beams wobble as the crust
-  rings. Drag the camera down toward its equator (*Inclination* past 70 degrees, outside the
-  beams' cone) and the same 360-degree turn looks like beams swinging to and fro. Then
-  **Camera → Free fall**: you land at about 0.55c, and the horizon around you is lifted by
-  light bending.
+- **Central object → Neutron star**: its crackled surface whirls round three times a second
+  (time slowed ~4 times) under two nearly still beams; press **Starquake now** and they
+  quiver as the crust rings. Drag *Magnetic tilt* to 70 degrees for a lighthouse: seen from
+  inside the beams' cone (*Inclination* under 70) they circle the star; from outside it they
+  swing to and fro, though the star turns just the same. *Roll* (Camera) turns the picture.
+  Then **Camera → Free fall**: you land at about 0.55c, and the horizon around you is lifted
+  by light bending.
 - **Central object → Millisecond pulsar** seen from 70 degrees: the disk stops at the
   magnetosphere and the gas falls along the field onto the poles.
 - **Central object → Pulsar** (the Crab): its beams sweep round every few seconds (time is
@@ -529,13 +533,18 @@ runs out along each beam), and the shearing crust brightens and dims in the mode
 Legendre pattern. Each quake rings down with Q = 60 (the core's field drains the crust's
 oscillations within seconds) and flashes the star's glow.
 
-The *Neutron star* is drawn as films show one: its beams are the narrow core beam,
-1.22 deg / sqrt(P) at half maximum (Rankin 1990), in a soft glow, fading as 1/r instead of
-1/r² so that they reach across the view; no field lines (tick *Field lines* for them). Each
+The *Neutron star* is drawn as films show one: a sphere of blue plasma crazed with glowing
+veins (cells of Worley noise fixed to the star, so they show its spin), brightening to a
+rim where the line of sight grazes a thin glowing layer; its beams are the narrow core
+beam, 1.22 deg / sqrt(P) at half maximum (Rankin 1990), with a white-hot thread along the
+middle, in a soft violet-fringed glow, fading as 1/r instead of 1/r² so that they reach
+across the view, and fading near the camera; no field lines (tick *Field lines* for
+them). It is framed with the picture turned (*Roll*), its spin axis diagonal. Each
 pulse is randomly brighter or fainter than the last and flickers within, as real pulsars'
 do; the change is set by when the light left the star, so it runs out along the beam.
 
-The catalogue's neutron stars: a young pulsar like Vela (89.3 ms, 3.4e12 G tilted 70
+The catalogue's neutron stars: a young pulsar with Vela's spin and field (89.3 ms,
+3.4e12 G) nearly aligned (tilted 10
 degrees, no disk); the Crab
 pulsar (33.7 ms, 3.8e12 G tilted 60 degrees, no disk); an accreting millisecond X-ray pulsar
 like SAX J1808.4-3658 (401 Hz, 2e8 G: the disk stops at ~26 km); a magnetar (7.5 s,
@@ -996,8 +1005,9 @@ tests/             physics tests
   companion that feeds it, ~50,000 radii away, is not drawn.
 - A red giant's extended atmosphere and plumes are drawn in film colors only.
 - The young neutron star's starquakes come every ~18 turns (Vela's every ~3 years) and swing
-  its poles by up to ~3 degrees (a real crust moves by centimetres); its beams are drawn as
-  if lighting a haze, so when one points at you the whole view flashes.
+  its poles by up to ~3 degrees (a real crust moves by centimetres). Its veined plasma
+  surface, glowing rim and the white thread in its beams are drawn as films show them; a
+  real neutron star's crust is smooth and its beams invisible except as flashes.
 - Neutron stars' jets are the black hole's analytic jets at 0.5 c, with smoother knots;
   their helical field is a fixed winding, not a simulated one.
 
