@@ -849,13 +849,15 @@ vec3 surfaceRadiance(float th, float ph, float delay, vec3 rayDir, vec3 hitX, fl
         float t = 0.5 + 0.42 * sqrt(mu) * I + 0.12 * (I - 1.0);
         if (uBeacon == 1) {
             // As films show a spinning neutron star: a sphere of blue plasma crazed with
-            // glowing veins (fixed to the star, so they show its spin), brightening toward
-            // a white-blue rim where the line of sight grazes its glowing surface layer.
+            // glowing veins (fixed to the star, so they show its spin), white-hot at the
+            // middle of its face (as Sirius B is drawn), cyan farther out, brightening again
+            // to a white-blue rim where the line of sight grazes its glowing surface layer.
             vec3 cells = worley(n * 7.0, 0.0);
             float vein = 1.0 - smoothstep(0.0, 0.08 + 14.0 * fp, cells.y - cells.x);
             float fine = fbmFiltered(n * 18.0 + 4.1, 3, fp * 18.0);
             float rim = pow(1.0 - mu, 2.5);
-            t = 0.12 + 0.12 * plasma + 0.45 * vein * (0.75 + 0.25 * fine) + 0.7 * rim + 0.2 * (I - 1.0);
+            float core = mu * mu;
+            t = 0.12 + 0.12 * plasma + 0.45 * vein * (0.75 + 0.25 * fine) + 0.7 * rim + 0.8 * core + 0.2 * (I - 1.0);
             level = 1.15;
             beacon = true;
         }

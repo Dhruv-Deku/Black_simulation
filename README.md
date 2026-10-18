@@ -74,7 +74,8 @@ whole event: [docs/tidal-disruption-flare.mp4](docs/tidal-disruption-flare.mp4) 
     time. Accreting neutron stars launch jets at half the speed of light, as Sco X-1 does.
   - **A spinning, quaking neutron star, as in films:** the *Neutron star* is a young pulsar
     spinning 11 times a second (as Vela does), its 3e12 G field nearly aligned with its spin
-    (10 degrees): a sphere of blue plasma crazed with glowing veins, ringed by a bright rim,
+    (10 degrees): a sphere of blue plasma crazed with glowing veins, white-hot at the middle
+    of its face like Sirius B and ringed by a bright rim,
     whirling round three times a second on screen, while its two beams (its 4-degree core
     beams, a white-hot thread in a blue glow) stay almost still, wobbling about the spin
     axis, each pulse brighter or fainter than the last. Now and then its crust slips (a
@@ -534,8 +535,9 @@ Legendre pattern. Each quake rings down with Q = 60 (the core's field drains the
 oscillations within seconds) and flashes the star's glow.
 
 The *Neutron star* is drawn as films show one: a sphere of blue plasma crazed with glowing
-veins (cells of Worley noise fixed to the star, so they show its spin), brightening to a
-rim where the line of sight grazes a thin glowing layer; its beams are the narrow core
+veins (cells of Worley noise fixed to the star, so they show its spin), white-hot at the
+middle of its face (brightness rising as the square of the cosine of the view angle, as
+Sirius B is drawn), cyan farther out, and brightening again to a rim where the line of sight grazes a thin glowing layer; its beams are the narrow core
 beam, 1.22 deg / sqrt(P) at half maximum (Rankin 1990), with a white-hot thread along the
 middle, in a soft violet-fringed glow, fading as 1/r instead of 1/r² so that they reach
 across the view, and fading near the camera; no field lines (tick *Field lines* for
