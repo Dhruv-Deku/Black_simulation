@@ -268,9 +268,11 @@ const std::vector<CatalogEntry>& catalog() {
              o.beacon = true;
              return o;
          }(),
-         // 12,950 M per turn: about 2.6 seconds at 5,000 M a second. Seen 72 degrees from
-         // the spin axis, so one beam sweeps right across the camera each turn.
-         75.0, false, 0.0, 72.0, 5000.0},
+         // 12,950 M per turn: about 2.6 seconds at 5,000 M a second. Seen 55 degrees from
+         // the spin axis, nearer to it than the beams (70 degrees): from there each beam
+         // goes all the way round on screen. (From outside their cone, the camera would
+         // see them swing to and fro like wipers, though the star turns just the same.)
+         75.0, false, 0.0, 55.0, 5000.0},
         {"Pulsar", "The Crab pulsar: a neutron star born in the supernova of 1054, turning 30 times a second, with a "
                    "4e12 G field tilted 60 degrees from its spin. Alone: no disk. Its hot polar caps flash each "
                    "time a beam sweeps past you.",

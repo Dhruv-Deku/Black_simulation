@@ -237,8 +237,10 @@ takes a couple of minutes. The executable is `build\Release\blackhole.exe`. Edit
 - **Famous black holes → M87\*:** a one-sided jet nearly toward you.
 - **Central object → Sun**, then drag **Compactness M/R** to the right: the Sun becomes as
   dense as a white dwarf, then a neutron star, until it collapses into a black hole.
-- **Central object → Neutron star**: watch its beams sweep round (a turn every 2.6 s, time
-  slowed 28 times) and press **Starquake now**; the beams wobble as the crust rings. Then
+- **Central object → Neutron star**: watch its beams sweep all the way round (a turn every
+  2.6 s, time slowed 28 times) and press **Starquake now**; the beams wobble as the crust
+  rings. Drag the camera down toward its equator (*Inclination* past 70 degrees, outside the
+  beams' cone) and the same 360-degree turn looks like beams swinging to and fro. Then
   **Camera → Free fall**: you land at about 0.55c, and the horizon around you is lifted by
   light bending.
 - **Central object → Millisecond pulsar** seen from 70 degrees: the disk stops at the
