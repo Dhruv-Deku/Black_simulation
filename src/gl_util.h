@@ -10,7 +10,8 @@
 
 // A GLSL program built from files. Supports `#include "file"` relative to the
 // shader directory and rebuilds itself when any source file changes on disk.
-// A failed rebuild keeps the previous working program.
+// A failed rebuild keeps the previous working program. `defines` (whole lines such
+// as "#define LENSES 1") go right after the #version line: variants of one source.
 class ShaderProgram {
 public:
     ShaderProgram() = default;
@@ -18,7 +19,8 @@ public:
     ShaderProgram& operator=(const ShaderProgram&) = delete;
     ~ShaderProgram();
 
-    bool build(const std::filesystem::path& dir, const std::string& vertexFile, const std::string& fragmentFile);
+    bool build(const std::filesystem::path& dir, const std::string& vertexFile, const std::string& fragmentFile,
+               const std::string& defines = {});
     bool buildCompute(const std::filesystem::path& dir, const std::string& computeFile);
     bool reloadIfChanged();  // true if a new program was built
 
@@ -33,6 +35,7 @@ public:
     void set(const char* name, float v) { glProgramUniform1f(m_program, location(name), v); }
     void set(const char* name, const glm::vec2& v) { glProgramUniform2f(m_program, location(name), v.x, v.y); }
     void set(const char* name, const glm::vec3& v) { glProgramUniform3f(m_program, location(name), v.x, v.y, v.z); }
+    void set(const char* name, const glm::ivec2& v) { glProgramUniform2i(m_program, location(name), v.x, v.y); }
     void set(const char* name, const glm::ivec3& v) { glProgramUniform3i(m_program, location(name), v.x, v.y, v.z); }
     void set(const char* name, const glm::vec4& v) {
         glProgramUniform4f(m_program, location(name), v.x, v.y, v.z, v.w);
@@ -50,6 +53,7 @@ private:
 
     std::filesystem::path m_dir;
     std::string m_vertexFile, m_fragmentFile;
+    std::string m_defines;
     GLuint m_program = 0;
     std::string m_error;
     std::vector<Source> m_sources;  // files that went into the last build attempt

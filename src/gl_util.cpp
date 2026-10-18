@@ -50,10 +50,12 @@ ShaderProgram::~ShaderProgram() {
     if (m_program) glDeleteProgram(m_program);
 }
 
-bool ShaderProgram::build(const fs::path& dir, const std::string& vertexFile, const std::string& fragmentFile) {
+bool ShaderProgram::build(const fs::path& dir, const std::string& vertexFile, const std::string& fragmentFile,
+                          const std::string& defines) {
     m_dir = dir;
     m_vertexFile = vertexFile;
     m_fragmentFile = fragmentFile;
+    m_defines = defines;
     return compile();
 }
 
@@ -99,6 +101,7 @@ bool ShaderProgram::expand(const fs::path& file, std::string& out, int depth) {
         out += line;
         out += '\n';
         if (lineNo == 1 && line.rfind("#version", 0) == 0) {
+            out += m_defines;
             out += "#line 2 " + std::to_string(fileIndex) + "\n";
         }
     }

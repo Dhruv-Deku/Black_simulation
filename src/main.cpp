@@ -18,17 +18,21 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 namespace fs = std::filesystem;
 
 // Prefers the source tree's shaders (so edits hot-reload while developing), then
-// the copy next to the executable.
+// the copy next to the executable, then the folder above it (the prebuilt bin// executables find the repository's shaders\ and assets\ there).
 static fs::path findShaderDir() {
     fs::path source = BH_SHADER_DIR;
     if (fs::exists(source / "trace.frag")) return source;
 #ifdef _WIN32
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    return fs::path(exe).parent_path() / "shaders";
+    const fs::path here = fs::path(exe).parent_path();
 #else
-    return fs::current_path() / "shaders";
+    const fs::path here = fs::current_path();
 #endif
+    if (!fs::exists(here / "shaders" / "trace.frag") && fs::exists(here.parent_path() / "shaders" / "trace.frag")) {
+        return here.parent_path() / "shaders";
+    }
+    return here / "shaders";
 }
 
 int main(int argc, char** argv) {

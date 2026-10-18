@@ -1,34 +1,62 @@
 #version 460 core
 
-// When the spin changes, keeps every particle's position and locally measured
-// velocity and recomputes its constants of motion (GPU twin of
+// When the spin or the scene scale changes, keeps every particle's position and
+// locally measured velocity and recomputes its constants of motion (GPU twin of
 // BodySystem::respin: kerr::zamoVelocity followed by kerr::launchFromZamo).
+//
+// A new scene scale only changes the units: lengths r, L and v_theta scale by
+// k = old scale / new scale, Q and v_r by k^2, coordinate times by k, and the physics
+// is unchanged. uOldSpin is the old spin already in the new units.
 
 layout(local_size_x = 256) in;
 
 #include "particle_common.glsl"
 
 uniform int uCount;
-uniform float uOldSpin;
+uniform float uRescale;   // k: old render unit / new render unit
+uniform float uOldSpin;   // in the new units
 uniform float uSpin;
+uniform float uMass;      // central mass in the new units
+uniform float uSurfaceR;  // surface radius in the new units (0 for a black hole)
+
+float scaleTime(float t, float k) {
+    // Created -1e30 (always existed) and lost 1e30 (still there) stay as they are.
+    return abs(t) < 1e29 ? t * k : t;
+}
 
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (index >= uint(uCount)) return;
     Particle p = particles[index];
     if (p.state.w <= 0.0) return;
-    float r = p.state.x, th = p.state.y;
 
-    float newHorizon = 1.0 + sqrt(max(1.0 - uSpin * uSpin, 0.0));
-    float oldHorizon = 1.0 + sqrt(max(1.0 - uOldSpin * uOldSpin, 0.0));
-    if (r < max(newHorizon, oldHorizon) + 0.1) {
-        // No ZAMO to measure against at or inside the horizon.
+    if (uRescale != 1.0) {
+        float k = uRescale;
+        p.state.x *= k;
+        p.velocity.xy *= vec2(k * k, k);
+        p.constants.yz *= vec2(k, k * k);
+        p.seen.x *= k;
+        p.seen.w = scaleTime(p.seen.w, k);
+        p.seenVelocity.xy *= vec2(k * k, k);
+        p.seenVelocity.z = scaleTime(p.seenVelocity.z, k);
+        p.seenVelocity.w = scaleTime(p.seenVelocity.w, k);
+    }
+
+    float r = p.state.x, th = p.state.y;
+    float newHorizon = horizonRadius(uMass, uSpin);
+    float oldHorizon = horizonRadius(uMass, uOldSpin);
+    if (r < max(newHorizon, oldHorizon) + 0.1 * uMass || r < uSurfaceR) {
+        // No ZAMO to measure against at or inside the horizon; nothing inside a star.
         particles[index].state.w = 0.0;
         return;
     }
-    vec3 v = zamoVelocity(zamoAt(uOldSpin, r, th), p.constants.x, p.constants.y, p.velocity.x, p.velocity.y);
-    float E, L, Q, vr, vth;
-    launchMassive(uSpin, zamoAt(uSpin, r, th), th, v, E, L, Q, vr, vth);
-    particles[index].velocity.xy = vec2(vr, vth);
-    particles[index].constants.xyz = vec3(E, L, Q);
+    if (uOldSpin != uSpin) {
+        vec3 v = zamoVelocity(zamoAt(uMass, uOldSpin, r, th), p.constants.x, p.constants.y, p.velocity.x,
+                              p.velocity.y);
+        float E, L, Q, vr, vth;
+        launchMassive(uSpin, zamoAt(uMass, uSpin, r, th), th, v, E, L, Q, vr, vth);
+        p.velocity.xy = vec2(vr, vth);
+        p.constants.xyz = vec3(E, L, Q);
+    }
+    particles[index] = p;
 }

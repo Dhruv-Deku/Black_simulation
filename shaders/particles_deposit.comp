@@ -14,6 +14,7 @@ layout(std430, binding = 2) buffer Grid {
 
 uniform int uCount;
 uniform float uSpin;
+uniform float uMass;  // central mass in render units (see particle_common.glsl)
 uniform int uSeen;  // deposit the light-delayed copies
 uniform ivec3 uGridDims;
 uniform vec2 uGridLogR;
@@ -22,17 +23,20 @@ uniform vec2 uGridLogR;
 const float kWeightScale = 256.0;
 const vec4 kVelocityScale = vec4(256.0, 4096.0, 65536.0, 65536.0);
 const float kTemperatureScale = 256.0 / 100.0;
+const float kLabelScale = 16384.0;
 
-void deposit(int x, int y, int z, float w, vec4 u, float temperature) {
+void deposit(int x, int y, int z, float w, vec4 u, float temperature, vec2 label) {
     if (x < 0 || x >= uGridDims.x || y < 0 || y >= uGridDims.y || w <= 0.0) return;
     z = (z % uGridDims.z + uGridDims.z) % uGridDims.z;
-    int base = 6 * ((z * uGridDims.y + y) * uGridDims.x + x);
+    int base = kGridChannels * ((z * uGridDims.y + y) * uGridDims.x + x);
     atomicAdd(cells[base + 0], int(round(w * kWeightScale)));
     atomicAdd(cells[base + 1], int(round(w * u.x * kVelocityScale.x)));
     atomicAdd(cells[base + 2], int(round(w * u.y * kVelocityScale.y)));
     atomicAdd(cells[base + 3], int(round(w * u.z * kVelocityScale.z)));
     atomicAdd(cells[base + 4], int(round(w * u.w * kVelocityScale.w)));
     atomicAdd(cells[base + 5], int(round(w * temperature * kTemperatureScale)));
+    atomicAdd(cells[base + 6], int(round(w * label.x * kLabelScale)));
+    atomicAdd(cells[base + 7], int(round(w * label.y * kLabelScale)));
 }
 
 void main() {
@@ -50,7 +54,7 @@ void main() {
         ph = p.seen.z;
         // The copy follows today's constants of motion (the gas may have nudged them
         // since): put its velocities back on vr^2 = R, vtheta^2 = Theta.
-        float delta = r * r - 2.0 * r + a * a;
+        float delta = r * r - 2.0 * uMass * r + a * a;
         float P = E * (r * r + a * a) - a * L;
         float x = L - a * E;
         float R = P * P - delta * (r * r + x * x + Q);
@@ -68,7 +72,7 @@ void main() {
     }
 
     float tDot, phiDot, accR, accTh;
-    massiveRhs(a, E, L, Q, r, th, vr, tDot, phiDot, accR, accTh);
+    massiveRhs(uMass, a, E, L, Q, r, th, vr, tDot, phiDot, accR, accTh);
     float sigma = r * r + a * a * cos(th) * cos(th);
     vec4 u = vec4(clamp(tDot / sigma, 0.0, 50.0), vr / sigma, vth / sigma, phiDot / sigma);
 
@@ -81,6 +85,7 @@ void main() {
     for (int corner = 0; corner < 8; ++corner) {
         ivec3 o = ivec3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
         vec3 wt = mix(1.0 - f, f, vec3(o));
-        deposit(b.x + o.x, b.y + o.y, b.z + o.z, p.velocity.w * wt.x * wt.y * wt.z, u, p.velocity.z);
+        deposit(b.x + o.x, b.y + o.y, b.z + o.z, p.velocity.w * wt.x * wt.y * wt.z, u, p.velocity.z,
+                clamp(p.label.xy, vec2(-8.0), vec2(8.0)));
     }
 }
