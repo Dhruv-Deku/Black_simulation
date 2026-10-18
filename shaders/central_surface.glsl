@@ -94,6 +94,55 @@ vec3 magneticAxisAt(float turn) {
     return vec3(c * uMagneticAxis.x - s * uMagneticAxis.y, s * uMagneticAxis.x + c * uMagneticAxis.y, uMagneticAxis.z);
 }
 
+#if SURFACE_LOOK == 4
+// --- A young neutron star's starquakes ----------------------------------------------------
+//
+// After a glitch the crust rings in its torsional modes (horizontal shear, at ~22 Hz and
+// up; central::crustTorsionalFrequency). The field is anchored in the crust, so its
+// footpoints, the magnetic poles, swing back and forth: the beams wobble. For each quake:
+// how long ago it began, the poles' swing at first (radians), the mode's angular
+// frequency and decay time; which way it shakes them (rotating frame) and its degree l.
+uniform int uQuakeCount;
+uniform vec4 uQuakes[4];
+uniform vec4 uQuakeAxes[4];
+uniform int uBeacon;       // a young neutron star drawn as films show one (central::Object::beacon)
+uniform float uHaloGlow;   // the glow around it (0: none)
+
+// How far the magnetic poles were displaced (rotating frame) `delay` ago.
+vec3 quakeShift(float delay) {
+    vec3 shift = vec3(0.0);
+    for (int k = 0; k < uQuakeCount; ++k) {
+        float age = uQuakes[k].x - delay;
+        if (age < 0.0) continue;  // its light has not reached us yet
+        shift += uQuakeAxes[k].xyz * (uQuakes[k].y * exp(-age / uQuakes[k].w) * sin(uQuakes[k].z * age));
+    }
+    return shift;
+}
+
+// The magnetic axis (Kerr-Schild Cartesian) when the star had turned through `turn`,
+// shaken by the starquakes ringing then (`delay` ago).
+vec3 magneticAxisShaken(float turn, float delay) {
+    vec3 m = uQuakeCount > 0 ? normalize(uMagneticAxis + quakeShift(delay)) : uMagneticAxis;
+    float c = cos(turn), s = sin(turn);
+    return vec3(c * m.x - s * m.y, s * m.x + c * m.y, m.z);
+}
+
+// The ringing crust is heated where it shears: its surface brightens and dims in the
+// mode's pattern, a Legendre polynomial P_l about the direction it shakes.
+float quakeShimmer(vec3 n, float delay) {
+    float f = 1.0;
+    for (int k = 0; k < uQuakeCount; ++k) {
+        float age = uQuakes[k].x - delay;
+        if (age < 0.0) continue;
+        float swing = uQuakes[k].y * exp(-age / uQuakes[k].w) * sin(uQuakes[k].z * age);
+        float x = dot(n, uQuakeAxes[k].xyz);
+        float shape = uQuakeAxes[k].w < 2.5 ? 0.5 * (3.0 * x * x - 1.0) : 0.5 * x * (5.0 * x * x - 3.0);
+        f *= 1.0 + 2.0 * swing * shape;
+    }
+    return max(f, 0.3);
+}
+#endif
+
 // A direction in Kerr-Schild Cartesian space, carried into the body's rotating frame
 // (where its surface pattern is painted) as it was `delay` ago.
 vec3 toRotatingFrame(vec3 d, float delay, float r) {
@@ -714,6 +763,7 @@ vec3 surfaceRadiance(float th, float ph, float delay, vec3 rayDir, vec3 hitX, fl
             float cm = dot(n, uMagneticAxis);
             float cos2B = 4.0 * cm * cm / (1.0 + 3.0 * cm * cm);
             tFactor *= pow((0.13 + 0.87 * cos2B) / 0.5885, 0.25);
+            if (uQuakeCount > 0) tFactor *= quakeShimmer(n, delay);
             if (uMagnetar == 1) {
                 // A magnetar's twisted field drives currents that heat one patch of the
                 // crust: X-ray spectra show a hot spot ~twice the surface temperature
@@ -798,7 +848,11 @@ vec3 surfaceRadiance(float th, float ph, float delay, vec3 rayDir, vec3 hitX, fl
                 float beam = 0.0;
                 if (uPulsar == 1) {
                     // The beam points along the magnetic axis: a flash when it sweeps the camera.
+#if SURFACE_LOOK == 4
+                    vec3 axis = magneticAxisShaken(turned + uSurfaceShift + atan(spinA, R), delay);
+#else
                     vec3 axis = magneticAxisAt(turned + uSurfaceShift + atan(spinA, R));
+#endif
                     beam = exp(-(1.0 - abs(dot(-rayDir, axis))) / 0.01);
                 }
                 float Tcap = uHotSpotTemp * pow(limbTemperature(mu), tExp);
@@ -857,6 +911,7 @@ const float kFieldWidth = 0.022; // a line's half-width, in surface radii
 const vec3 kFieldColor = vec3(0.42, 0.62, 1.0);
 const vec3 kTwistedColor = vec3(0.62, 0.5, 1.0);
 const vec3 kBeamColor = vec3(0.62, 0.8, 1.0);
+const float kHaloLevel = 1.2;  // brightness of a young neutron star's glow, with uHaloGlow 1
 
 // A point's place among the field lines: returns the azimuth of its line in units of
 // the spacing between lines, and L and cos(theta_m). A twisted line's azimuth runs from
@@ -971,6 +1026,23 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
         }
     }
 
+    if (uHaloGlow > 0.0 && rClosest < 12.0 * R) {
+        // The glow round a young neutron star: its X-rays scattered by the plasma held
+        // in its magnetosphere and streaming off its poles, falling off as r^-3, white
+        // near the star and blue farther out; a glitch's flash brightens it.
+        float since = uFlash.x - delayMid;
+        float flare = since >= 0.0 ? uFlash.y * exp(-since / uFlash.z) : 0.0;
+        const int N = 4;
+        for (int k = 0; k < N; ++k) {
+            vec3 x = X0 + ((float(k) + 0.5) / float(N)) * d;
+            float r = length(x);
+            if (r < R) continue;
+            float q = R / r;
+            vec3 tint = mix(vec3(0.12, 0.42, 1.0), vec3(0.85, 0.95, 1.0), q * q);
+            color += transmittance * tint * (uHaloGlow * kHaloLevel * (1.0 + 2.0 * flare) * q * q * q * chord / float(N) / R);
+        }
+    }
+
     if (uBeamGlow > 0.0) {
         // The beams, shown as if they lit a faint haze around the star (a searchlight in
         // fog): flux ~ 1 / r^2 inside a cone of half-angle uBeamWidth about each magnetic
@@ -986,7 +1058,9 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
         vec3 u0 = normalize(X0), u1 = normalize(X1), um = normalize(X0 + 0.5 * d);
         float span = acos(clamp(dot(u0, u1), -1.0, 1.0));
         float closest = max(abs(dot(u0, axisMid)), max(abs(dot(u1, axisMid)), abs(dot(um, axisMid))));
-        float reach = 1.3 * uBeamWidth + 0.5 * span + abs(uSurfaceOmega) * chord;
+        // A beacon's needle sits in a glow; starquakes swing the poles.
+        float reach = (uBeacon == 1 ? 5.3 : 1.3) * uBeamWidth + 0.5 * span + abs(uSurfaceOmega) * chord +
+                      (uQuakeCount > 0 ? 0.12 : 0.0);
         if (acos(min(closest, 1.0)) > reach) return;  // the beams come last
         int n = clamp(int(ceil(chord / (0.3 * rMid * uBeamWidth))), 1, 8);
         float dl = chord / float(n);
@@ -996,21 +1070,46 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
             float r = length(x);
             if (r < R) continue;
             float delay = mix(delay0, delay1, f) + (r - R);
-            vec3 beamAxis = magneticAxisAt(uSurfacePhase - uSurfaceOmega * delay + uSurfaceShift + atan(spinA, r));
-            float c = abs(dot(x, beamAxis)) / r;
+            vec3 beamAxis = magneticAxisShaken(uSurfacePhase - uSurfaceOmega * delay + uSurfaceShift + atan(spinA, r), delay);
+            float along = dot(x, beamAxis);
+            float c = abs(along) / r;
             float psi = acos(min(c, 1.0)) / uBeamWidth;
-            // A core inside a hollow cone, as in most radio pulsars: the core's half width
-            // at half maximum is 1.22 deg / sqrt(P), a fifth of the cone's 5.75 deg / sqrt(P)
-            // (Rankin 1990, 1993); the cone's ring lies just inside the beam's edge.
-            float cone = (psi - 0.85) / 0.12;
-            float profile = exp(-psi * psi * 15.7) + 0.35 * exp(-cone * cone);
-            if (profile < 1e-3) continue;
+            float profile, glowPart = 0.0;
+            if (uBeacon == 1) {
+                // The core beam, a needle of half width uBeamWidth at half maximum, in a soft
+                // glow. Each pulse is brighter or fainter than the last, and flickers within
+                // (as real pulsars' do; their radio light comes in bursts down to
+                // microseconds long). Set by when the light left the star, so each change
+                // runs out along the beam at the speed of light.
+                profile = exp(-0.693 * psi * psi);
+                glowPart = 0.06 * exp(-0.173 * psi * psi);
+                if (profile + glowPart < 1e-3) continue;
+                float turns = (uSurfacePhase - uSurfaceOmega * delay) / (2.0 * PI);
+                float side = along > 0.0 ? 0.0 : 17.0;
+                float k0 = floor(turns);
+                float pulse = mix(hash13(vec3(k0, side, 3.1)), hash13(vec3(k0 + 1.0, side, 3.1)),
+                                  smoothstep(0.0, 1.0, turns - k0));
+                float flicker = 0.85 + 0.15 * sin(2.0 * PI * 23.0 * turns + side) * sin(2.0 * PI * 37.0 * turns + 1.3);
+                float strength = (0.45 + 1.1 * pulse) * flicker;
+                profile *= strength;
+                glowPart *= strength;
+            } else {
+                // A core inside a hollow cone, as in most radio pulsars: the core's half width
+                // at half maximum is 1.22 deg / sqrt(P), a fifth of the cone's 5.75 deg / sqrt(P)
+                // (Rankin 1990, 1993); the cone's ring lies just inside the beam's edge.
+                float cone = (psi - 0.85) / 0.12;
+                profile = exp(-psi * psi * 15.7) + 0.35 * exp(-cone * cone);
+                if (profile < 1e-3) continue;
+            }
             float q = R / r;
             float rise = smoothstep(R, 1.6 * R, r);
             vec3 tint = kBeamColor;
             // Films' beams: white-hot along the axis, electric blue at the edges.
             if (uFilmColor == 1) tint = 2.0 * mix(vec3(0.25, 0.6, 1.0), vec3(0.95, 0.98, 1.0), exp(-psi * psi * 6.0));
-            color += transmittance * tint * (uBeamGlow * profile * q * q * rise * dl / R);
+            // Films keep the needle bright far out: it fades as 1 / r, not 1 / r^2 (its
+            // soft glow as 1 / r^2).
+            float dim = uBeacon == 1 && uFilmColor == 1 ? q : q * q;
+            color += transmittance * tint * (uBeamGlow * (profile * dim + glowPart * q * q) * rise * dl / R);
         }
     }
 }

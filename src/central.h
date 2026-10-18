@@ -70,6 +70,9 @@ struct Object {
     double magneticTiltDeg = 30.0;    // angle between magnetic and spin axes
     bool pulsar = false;              // beams along the magnetic axis
     bool magnetar = false;            // surface flares
+    // A young neutron star drawn as films show one: a blazing core in its glow, two
+    // needle-thin beams sweeping round, and starquakes that set its crust ringing.
+    bool beacon = false;
 
     bool hasHorizon() const { return kind == Kind::BlackHole; }
     // The spin parameter a = J / M of the Kerr metric used outside: chi itself for a
@@ -203,6 +206,15 @@ double radioEmissionHeightKm(double periodSeconds);
 // sin^2(theta) = r_em / R_LC; at most 90 deg. About 5.75 deg / sqrt(P / 1 s), as measured
 // (Rankin 1993).
 double beamHalfAngle(double periodSeconds);
+// Half-width at half maximum of a pulsar's core beam, the bright needle at its center
+// (radians): 1.22 deg / sqrt(P / 1 s) (Rankin 1990), a fifth of the cone's.
+double beamCoreHalfWidth(double periodSeconds);
+// Torsional oscillations of a neutron star's crust (shear waves, no radial motion), set
+// ringing by a starquake: fundamental frequency of degree l, in Hz,
+// f_l = f_2 sqrt((l - 1)(l + 2) / 4) with f_2 = 22 Hz for a 1.4 solar-mass star
+// (Hansen and Cioffi 1980; Samuelsson and Andersson 2007), as seen in the 18-30 Hz
+// oscillations after SGR 1806-20's giant flare (Israel et al. 2005).
+double crustTorsionalFrequency(int l);
 
 // --- Close binaries ------------------------------------------------------------------------
 

@@ -256,14 +256,21 @@ const std::vector<CatalogEntry>& catalog() {
         {"Sirius B", "The companion of Sirius: 1.02 solar masses in 5,840 km (smaller than the Earth), 25,000 K. Its "
                      "gravitational redshift (80 km/s) was measured with the Hubble Space Telescope.",
          makeBody(Kind::WhiteDwarf, "Sirius B", 1.02, 5840.0, 0.002, 0.15, 25000.0), 32.0, false},
-        {"Neutron star", "1.4 solar masses in 12 km (R = 5.8 M), the size of a city: smaller than its own ISCO. "
-                         "Light from the back of the star bends round to you, and the disk, X-ray hot (~1e7 K), "
-                         "stops at the ISCO, not the surface. An old star in a binary with a weak field (1e7 G), too "
-                         "weak to hold the disk off.",
-         // Seen from 150 M, 65 degrees from the axis: the star small inside its disk's
-         // inner 75 M (a real disk runs on ~1e4 times farther).
-         makeBody(Kind::NeutronStar, "Neutron star", 1.4, 12.0, 0.1, 0.35, 1.0e6, 1e7, 30.0), 150.0, true, 13.0, 65.0,
-         0.0, true},
+        {"Neutron star", "A young neutron star like the Vela pulsar: 1.4 solar masses in 12 km (R = 5.8 M), the size "
+                         "of a city, turning 11 times a second with a 3e12 G field tilted 70 degrees from its spin. "
+                         "Its two beams sweep round like a lighthouse's (time slowed 28 times), flickering from pulse "
+                         "to pulse. Now and then its crust slips (a glitch) and rings at ~22 Hz, shaking the beams.",
+         [] {
+             // Vela: P = 89.3 ms, B = 3.4e12 G, ~0.7-1e6 K at the surface (Pavlov et al. 2001).
+             Object o = makeBody(Kind::NeutronStar, "Neutron star", 1.4, 12.0, chiFromPeriod(0.0893, 1.4, 12.0, 0.35),
+                                 0.35, 1.0e6, 3.4e12, 70.0);
+             o.pulsar = true;
+             o.beacon = true;
+             return o;
+         }(),
+         // 12,950 M per turn: about 2.6 seconds at 5,000 M a second. Seen 72 degrees from
+         // the spin axis, so one beam sweeps right across the camera each turn.
+         75.0, false, 0.0, 72.0, 5000.0},
         {"Pulsar", "The Crab pulsar: a neutron star born in the supernova of 1054, turning 30 times a second, with a "
                    "4e12 G field tilted 60 degrees from its spin. Alone: no disk. Its hot polar caps flash each "
                    "time a beam sweeps past you.",
@@ -473,6 +480,15 @@ double beamHalfAngle(double periodSeconds) {
     // Past theta = 54.7 deg (tan^2 = 2) the lines' tangents tip past the magnetic equator:
     // the beam then covers the whole hemisphere.
     return std::min(theta + std::atan(0.5 * std::tan(std::min(theta, 0.5 * kPi - 1e-9))), 0.5 * kPi);
+}
+
+double beamCoreHalfWidth(double periodSeconds) {
+    return 1.22 * kPi / 180.0 / std::sqrt(std::max(periodSeconds, 1e-6));
+}
+
+double crustTorsionalFrequency(int l) {
+    constexpr double kF2 = 22.0;  // Hz
+    return kF2 * std::sqrt((l - 1.0) * (l + 2.0) / 4.0);
 }
 
 double rocheLobeFraction(double q) {

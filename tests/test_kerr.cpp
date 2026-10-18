@@ -1234,6 +1234,32 @@ static void testPulsarBeams() {
     // 90 deg where tan^2(theta) = 2; when more lines are open the beam fills the hemisphere.
     near(central::beamHalfAngle(1e-6), 0.5 * 3.14159265358979, 1e-12,
          "when every line is open the beam reaches the magnetic equator");
+
+    // The core beam: 1.22 deg / sqrt(P) at half maximum (Rankin 1990), a fifth of the cone.
+    near(central::beamCoreHalfWidth(1.0) / deg, 1.22, 1e-12, "a 1 s pulsar's core beam: 1.22 deg");
+    near(central::beamCoreHalfWidth(0.0893) / deg, 4.08, 0.01, "Vela's core beam: 4.1 deg");
+    // Torsional modes of the crust: f_l = f_2 sqrt((l - 1)(l + 2) / 4), f_2 = 22 Hz.
+    near(central::crustTorsionalFrequency(2), 22.0, 1e-12, "the crust's fundamental torsional mode rings at 22 Hz");
+    near(central::crustTorsionalFrequency(3) / central::crustTorsionalFrequency(2), std::sqrt(2.5), 1e-12,
+         "l = 3 rings sqrt(5/2) times faster (35 Hz)");
+    truth(central::crustTorsionalFrequency(2) > 18.0 && central::crustTorsionalFrequency(3) < 40.0,
+          "within the 18-30+ Hz oscillations after SGR 1806-20's giant flare");
+
+    // The catalogue's neutron star is a young pulsar like Vela: 89 ms, its beams drawn.
+    const central::CatalogEntry* ns = nullptr;
+    for (const central::CatalogEntry& e : central::catalog()) {
+        if (std::string(e.label) == "Neutron star") ns = &e;
+    }
+    truth(ns != nullptr && ns->object.beacon && ns->object.pulsar && !ns->disk,
+          "the neutron star is a young, isolated pulsar with its beams");
+    if (ns) {
+        const double period = 2.0 * 3.14159265358979 / ns->object.surfaceOmega() *
+                              central::timeSeconds(1.0, ns->object.massSolar);
+        near(period, 0.0893, 1e-6, "it turns in Vela's 89.3 ms");
+        // Shown 28 times slowed: a turn every ~2.6 s at its time scale.
+        near(period / central::timeSeconds(1.0, ns->object.massSolar) / ns->timeScale, 2.6, 0.1,
+             "a turn every ~2.6 seconds on screen");
+    }
 }
 
 // A cataclysmic variable's geometry (src/central.h) against published fits.

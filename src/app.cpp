@@ -31,6 +31,17 @@ constexpr float kOutflowLightLevel = 1.1f;
 constexpr int kOutflowRows = 2048;
 // How much faster time runs while a disrupted star's debris is far out (flarePace).
 constexpr double kFastForward = 6.0;
+// Starquakes on a young neutron star come every this many turns on average (Vela's
+// glitches come every ~3 years: ~1e9 turns), swing its magnetic poles by up to this many
+// radians at first (exaggerated: the crust moves by centimetres), and ring down with
+// this quality factor (the core's field drains the crust's oscillations within seconds).
+constexpr double kQuakeTurns = 18.0;
+constexpr double kQuakeSwing = 0.05;
+constexpr double kCrustQ = 60.0;
+// A glitch's flash of X-rays: how bright, and its fade time (M).
+constexpr double kQuakeFlash = 1.2, kQuakeFlashFade = 6000.0;
+// Brightness of a beacon neutron star's needle beams.
+constexpr float kBeaconBeamGlow = 0.8f;
 
 const std::map<std::string, Preset>& presetNames() {
     static const std::map<std::string, Preset> names = {
@@ -162,6 +173,7 @@ void printUsage() {
         "  --gas-cooling T        gas cooling time in M at 10,000 K (default 60)\n"
         "  --no-gravity           bodies do not pull on each other or on the gas\n"
         "  --no-flare             a torn-apart star's returning debris powers no flare or outflow\n"
+        "  --starquake            a young neutron star's crust slips at the start and rings\n"
         "  --disk-temp K          peak disk temperature in kelvin\n"
         "  --disk-brightness B    disk brightness multiplier\n"
         "  --debris-glow B        debris brightness multiplier\n"
@@ -369,6 +381,8 @@ bool parseArguments(int argc, char** argv, LaunchOptions& out, std::string& erro
         } else if (arg == "--gas-cooling") {
             if (!number(v)) return false;
             out.gasCooling = static_cast<float>(std::max(v, 1.0));
+        } else if (arg == "--starquake") {
+            out.starquake = true;
         } else if (arg == "--no-flare") {
             out.noFlare = true;
         } else if (arg == "--no-gravity") {
@@ -509,6 +523,7 @@ void App::applyOptions(const LaunchOptions& o) {
     if (o.ride && *o.ride >= 0 && *o.ride < static_cast<int>(m_bodies.bodies.size())) {
         rideWith(m_bodies.bodies[*o.ride].slot);
     }
+    if (o.starquake) starquake();
     // --advance is in M around a black hole, in scene time (scale^1.5 M) around a bigger object.
     const double tScale = sceneScale() * std::sqrt(sceneScale());
     for (double t = 0.0; t < o.advance; t += 1.0) {
@@ -1075,6 +1090,9 @@ void App::applyCentral(int index) {
     if (neutron) m_settings.starBrightness = 0.6f;
     m_flashTime = -1e30;
     m_burstFuel = 0.0;
+    m_quakes.clear();
+    // Films show a spinning neutron star without its field's cage of lines.
+    m_settings.fieldLines = !e.object.beacon;
     m_ui.compactnessOrigin = -1;
     // Rescale everything first, then put the camera where this object wants it.
     syncCentral(0.0, 0.0f);
@@ -1108,6 +1126,32 @@ void App::triggerFlash(double strength, double fadeScene, const std::string& mes
         m_bodies.logEvent(message);
         m_ui.centralStatus = message;
     }
+}
+
+void App::starquake() {
+    const central::Object& o = m_settings.central;
+    if (o.kind != central::Kind::NeutronStar) return;
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    Quake q;
+    q.time = m_bodies.time;
+    q.l = uni(m_rng) < 0.6 ? 2 : 3;
+    q.amplitude = static_cast<float>(kQuakeSwing * (0.6 + 0.6 * uni(m_rng)));
+    // Any direction across the magnetic axis, in the star's rotating frame.
+    const double tilt = o.magneticTiltDeg * kerr::kPi / 180.0;
+    const glm::vec3 m(static_cast<float>(std::sin(tilt)), 0.0f, static_cast<float>(std::cos(tilt)));
+    const glm::vec3 e1 = glm::normalize(glm::cross(m, std::abs(m.z) < 0.9f ? glm::vec3(0, 0, 1) : glm::vec3(1, 0, 0)));
+    const glm::vec3 e2 = glm::cross(m, e1);
+    const float angle = static_cast<float>(2.0 * kerr::kPi * uni(m_rng));
+    q.direction = std::cos(angle) * e1 + std::sin(angle) * e2;
+    m_quakes.push_back(q);
+    if (m_quakes.size() > 4) m_quakes.erase(m_quakes.begin());
+    char text[400];
+    std::snprintf(text, sizeof(text),
+                  "Starquake: the crust slipped (a glitch: the spin jumps by ~2 parts in a million) and rings at %.0f Hz "
+                  "(l = %d), shaking the magnetic poles and the beams. Vela glitches every ~3 years; here every few "
+                  "turns, to be seen.",
+                  central::crustTorsionalFrequency(q.l), q.l);
+    triggerFlash(kQuakeFlash, kQuakeFlashFade, text);
 }
 
 void App::syncCentral(double simDt, float realDt) {
@@ -1196,6 +1240,12 @@ void App::syncCentral(double simDt, float realDt) {
     if (o.magnetar && simDt > 0.0 &&
         std::uniform_real_distribution<double>(0.0, 1.0)(m_rng) < simDt / (1500.0 * tScale)) {
         triggerFlash(6.0, 20.0, "Magnetar flare: the crust cracked under the magnetic stress.");
+    }
+    // A young neutron star's crust is strained as its spin slows; now and then it gives
+    // (a glitch) and rings in its torsional modes.
+    if (neutron && o.beacon && m_settings.starquakes && simDt > 0.0) {
+        const double period = 2.0 * kerr::kPi / std::max(std::abs(o.surfaceOmega()), 1e-12);
+        if (std::uniform_real_distribution<double>(0.0, 1.0)(m_rng) < simDt / (kQuakeTurns * period)) starquake();
     }
 
     // White-light flares on active stars (red dwarfs like Proxima flare every few hours):
@@ -1392,6 +1442,28 @@ CentralView App::centralView() const {
                 constexpr double kReferenceBeam = 0.25;  // radians
                 const double narrowing = std::clamp(std::pow(kReferenceBeam / v.beamWidth, 2.0), 0.15, 6.0);
                 v.beamGlow = static_cast<float>(3.0 * narrowing) * glow;
+                if (o.beacon) {
+                    // Films show the bright needle at the beam's center: the core.
+                    v.beamWidth = static_cast<float>(central::beamCoreHalfWidth(period));
+                    v.beamGlow = kBeaconBeamGlow * glow;
+                }
+            }
+            if (o.beacon) {
+                // Its glow, and the starquakes ringing in its crust (each fading within a
+                // few hundred oscillations, Q = kCrustQ).
+                v.beacon = true;
+                v.haloGlow = glow;
+                const double secondsPerM = central::timeSeconds(1.0, o.massSolar);
+                for (const Quake& q : m_quakes) {
+                    const double f = central::crustTorsionalFrequency(q.l);
+                    const double decay = kCrustQ / (kerr::kPi * f) / secondsPerM;
+                    const double age = m_bodies.time - q.time;
+                    if (age > 6.0 * decay) continue;
+                    v.quakes.push_back(glm::vec4(static_cast<float>(age), q.amplitude,
+                                                 static_cast<float>(2.0 * kerr::kPi * f * secondsPerM),
+                                                 static_cast<float>(decay)));
+                    v.quakeAxes.push_back(glm::vec4(q.direction, static_cast<float>(q.l)));
+                }
             }
         }
         // Bodies that struck the surface, where they hit in the rotating frame (long faded
@@ -1809,6 +1881,7 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
         if (ui.sceneRequested >= 0) applyScene(ui.sceneRequested);
         if (ui.einsteinRingRequested) addEinsteinRing();
         if (ui.centralRequested >= 0) applyCentral(ui.centralRequested);
+        if (ui.quakeRequested) starquake();
         if (ui.burstRequested) {
             const bool dwarf = m_settings.central.kind == central::Kind::WhiteDwarf;
             triggerFlash(dwarf ? 10.0 : 4.0, dwarf ? 300.0 : 30.0, dwarf ? "Nova." : "Type I X-ray burst.");

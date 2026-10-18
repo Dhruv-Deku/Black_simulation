@@ -1620,7 +1620,7 @@ void main() {
         if (uFlowGlow > 0.0 && uDiskEnabled == 1) {
             traceThickFlow(X, X1, lightDelay ? delay : 0.0, lightDelay ? delayNext : 0.0, color, transmittance);
         }
-        if (uFieldGlow > 0.0 || uPairGlow > 0.0 || uBeamGlow > 0.0) {
+        if (uFieldGlow > 0.0 || uPairGlow > 0.0 || uBeamGlow > 0.0 || uHaloGlow > 0.0) {
             traceMagnetosphere(X, X1, lightDelay ? delay : 0.0, lightDelay ? delayNext : 0.0, pathLength, color,
                                transmittance);
         }
