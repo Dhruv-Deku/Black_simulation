@@ -256,23 +256,24 @@ const std::vector<CatalogEntry>& catalog() {
         {"Sirius B", "The companion of Sirius: 1.02 solar masses in 5,840 km (smaller than the Earth), 25,000 K. Its "
                      "gravitational redshift (80 km/s) was measured with the Hubble Space Telescope.",
          makeBody(Kind::WhiteDwarf, "Sirius B", 1.02, 5840.0, 0.002, 0.15, 25000.0), 32.0, false},
-        {"Neutron star", "A young neutron star like the Vela pulsar: 1.4 solar masses in 12 km (R = 5.8 M), the size "
-                         "of a city, turning 11 times a second with a 3e12 G field tilted 70 degrees from its spin. "
-                         "Its two beams sweep round like a lighthouse's (time slowed 28 times), flickering from pulse "
-                         "to pulse. Now and then its crust slips (a glitch) and rings at ~22 Hz, shaking the beams.",
+        {"Neutron star", "A young neutron star: 1.4 solar masses in 12 km (R = 5.8 M), the size of a city, spinning "
+                         "11 times a second as the Vela pulsar does, with a 3e12 G field nearly aligned with its spin "
+                         "(10 degrees). Its crackling plasma surface whirls round three times a second (time slowed "
+                         "~4 times) while its two beams stay almost still, wobbling about the spin axis. Now and then "
+                         "its crust slips (a glitch) and rings at ~22 Hz, shaking the beams. Raise its magnetic tilt "
+                         "and they sweep round like a lighthouse's.",
          [] {
-             // Vela: P = 89.3 ms, B = 3.4e12 G, ~0.7-1e6 K at the surface (Pavlov et al. 2001).
+             // Vela's spin and field: P = 89.3 ms, B = 3.4e12 G, ~0.7-1e6 K at the surface
+             // (Pavlov et al. 2001); its axes here nearly aligned (an aligned rotator).
              Object o = makeBody(Kind::NeutronStar, "Neutron star", 1.4, 12.0, chiFromPeriod(0.0893, 1.4, 12.0, 0.35),
-                                 0.35, 1.0e6, 3.4e12, 70.0);
+                                 0.35, 1.0e6, 3.4e12, 10.0);
              o.pulsar = true;
              o.beacon = true;
              return o;
          }(),
-         // 12,950 M per turn: about 2.6 seconds at 5,000 M a second. Seen 55 degrees from
-         // the spin axis, nearer to it than the beams (70 degrees): from there each beam
-         // goes all the way round on screen. (From outside their cone, the camera would
-         // see them swing to and fro like wipers, though the star turns just the same.)
-         75.0, false, 0.0, 55.0, 5000.0},
+         // 12,950 M per turn: three turns a second at 39,000 M a second. Close up, 65 degrees
+         // from the spin axis, the picture turned so that the axis runs diagonally.
+         42.0, false, 0.0, 65.0, 39000.0, false, -25.0},
         {"Pulsar", "The Crab pulsar: a neutron star born in the supernova of 1054, turning 30 times a second, with a "
                    "4e12 G field tilted 60 degrees from its spin. Alone: no disk. Its hot polar caps flash each "
                    "time a beam sweeps past you.",

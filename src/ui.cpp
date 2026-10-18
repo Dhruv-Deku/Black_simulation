@@ -353,6 +353,11 @@ void centralSection(UiContext& ctx) {
                                     ImGuiSliderFlags_Logarithmic)) {
                 o.magneticField = B;
             }
+            float tilt = static_cast<float>(o.magneticTiltDeg);
+            if (ImGui::SliderFloat("Magnetic tilt", &tilt, 0.0f, 90.0f, "%.0f deg")) o.magneticTiltDeg = tilt;
+            help("Angle between the magnetic axis and the spin axis. Nearly aligned, the beams stay almost still "
+                 "while the star spins under them; tilted far, they sweep round like a lighthouse's (seen from "
+                 "inside their cone they circle the star; from outside, they swing to and fro).");
             ImGui::SliderFloat("Accretion rate", &s.accretionRate, 1e-4f, 1.0f, "%.3g Eddington", ImGuiSliderFlags_Logarithmic);
             help("How fast the disk feeds the star, in units of the Eddington rate (where radiation pressure would "
                  "balance gravity). With the field, it sets where the magnetosphere stops the disk.");
@@ -568,6 +573,11 @@ void cameraSection(UiContext& ctx) {
         if (ImGui::SliderFloat("Azimuth", &az, 0.0f, 360.0f, "%.1f deg")) cam.phi = az * kDeg;
     }
     ImGui::SliderFloat("Field of view", &cam.fovDeg, 15.0f, 120.0f, "%.0f deg");
+    {
+        float roll = cam.roll / kDeg;
+        if (ImGui::SliderFloat("Roll", &roll, -180.0f, 180.0f, "%.0f deg")) cam.roll = roll * kDeg;
+        help("Turns the picture about the view direction (0: the spin axis upright).");
+    }
     if (motion == CameraMotion::Hover) {
         ImGui::Checkbox("Auto orbit", &s.autoOrbit);
         ImGui::SameLine();

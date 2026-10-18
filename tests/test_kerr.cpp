@@ -1256,14 +1256,11 @@ static void testPulsarBeams() {
         const double period = 2.0 * 3.14159265358979 / ns->object.surfaceOmega() *
                               central::timeSeconds(1.0, ns->object.massSolar);
         near(period, 0.0893, 1e-6, "it turns in Vela's 89.3 ms");
-        // Seen from nearer the spin axis than the beams, so that they go all the way round
-        // on screen: a beam's projected tip circles the star only if the camera lies inside
-        // the cone it sweeps (tan(tilt) > tan(inclination)).
-        truth(ns->cameraInclinationDeg > 0.0 && ns->cameraInclinationDeg < ns->object.magneticTiltDeg,
-              "the camera sits inside the beams' cone: they circle all the way round on screen");
-        // Shown 28 times slowed: a turn every ~2.6 s at its time scale.
-        near(period / central::timeSeconds(1.0, ns->object.massSolar) / ns->timeScale, 2.6, 0.1,
-             "a turn every ~2.6 seconds on screen");
+        // Nearly aligned: its beams stay close to the spin axis while the star turns under
+        // them, a full turn three times a second on screen.
+        truth(ns->object.magneticTiltDeg <= 15.0, "its magnetic axis is nearly aligned with its spin");
+        near(ns->timeScale * central::timeSeconds(1.0, ns->object.massSolar) / period, 3.0, 0.05,
+             "three turns a second on screen");
     }
 }
 
