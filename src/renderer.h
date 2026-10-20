@@ -73,6 +73,7 @@ struct CentralView {
     glm::vec4 companion{0.0f};
     glm::vec3 companionAxis{1.0f, 0.0f, 0.0f};
     float companionTemperature = 3100.0f;
+    float companionQ = 0.25f;  // its mass over the white dwarf's (sets its Roche lobe's shape)
     std::vector<glm::vec3> stream;
     double streamWidth = 0.0;
     float binaryPhase = 0.0f, spotPhase = 2.3f;
@@ -177,6 +178,17 @@ public:
     // The last image as top-down BGRA bytes (the layout video encoders take).
     void readOutput(std::vector<unsigned char>& bgra, int& width, int& height) const;
 
+    // A scene drawn by another shader (the neutron star merger, src/merger_view.*):
+    // beginExternal sizes the targets and binds the cleared HDR target (traceWidth() x
+    // traceHeight()) to draw into; finishExternal adds bloom and tone maps it into the
+    // output image, which bindOutput() then binds for drawing on top.
+    void beginExternal(int width, int height, float renderScale);
+    void finishExternal(const Settings& s, float exposureBoost);
+    void drawFullscreen() const;
+    GLuint blackbodyTexture() const { return m_blackbodyTexture; }
+    int outputWidth() const { return m_ldr.width; }
+    int outputHeight() const { return m_ldr.height; }
+
     bool loadSkyImage(const std::string& path, std::string& error);
     // Loads the Earth's and Jupiter's maps from assets/planets beside the shaders.
     void loadPlanetMaps();
@@ -185,6 +197,11 @@ public:
     void hotReload();
     std::string shaderErrors() const;
     float gpuMilliseconds() const { return m_gpuMs; }
+    // The GPU's time per pass (ms): the ray tracing, the bloom, and the tone map with the
+    // upscale and sharpening.
+    float traceMilliseconds() const { return m_passMs[0]; }
+    float bloomMilliseconds() const { return m_passMs[1]; }
+    float outputMilliseconds() const { return m_passMs[2]; }
     int traceWidth() const { return m_hdr.width; }
     int traceHeight() const { return m_hdr.height; }
 
@@ -192,8 +209,9 @@ private:
     static constexpr int kBloomLevels = 6;
     static constexpr int kQueries = 4;
 
-    void drawFullscreen() const;
     void readTimer();
+    // Bloom and tone mapping of the HDR image (tw x th) into the 8-bit output.
+    void postProcess(const Settings& s, int tw, int th, int outWidth, int outHeight, float exposureBoost);
     // The ray tracer for a black hole or a body at the center (one variant per kind of
     // surface), with or without small black holes or planets among the bodies
     // (shaders/trace.frag variants), built when first needed: code a scene does not use
@@ -205,7 +223,7 @@ private:
     GLuint m_outflowTexture = 0;  // FlareView::table (1D, RGBA32F)
     int m_outflowRows = 0;
     std::filesystem::path m_shaderDir;
-    ShaderProgram m_bloomDown, m_bloomUp, m_tonemap;
+    ShaderProgram m_bloomDown, m_bloomUp, m_tonemap, m_easu, m_rcas;
     // The Sun's baked 30.4 nm map (shaders/sdo_bake.frag): a band of rows refreshed each
     // frame, all of it when it is first needed.
     ShaderProgram m_sdoBake;
@@ -215,6 +233,7 @@ private:
     static constexpr int kSdoWidth = 2048, kSdoHeight = 1024, kSdoBands = 16;
     void bakeSdo(const CentralView& cv, bool all);
     RenderTarget m_hdr, m_ldr;
+    RenderTarget m_ldrLow, m_upscaled;  // FSR: the tone-mapped image at the traced size, and enlarged
     RenderTarget m_bloom[kBloomLevels];
     int m_bloomCount = 0;
 
@@ -239,4 +258,8 @@ private:
     GLuint m_queries[kQueries] = {};
     int m_queryFrame = 0;
     float m_gpuMs = 0.0f;
+    // Timestamps per frame: before the trace, after it, after the bloom, at the end.
+    GLuint m_stamps[kQueries][4] = {};
+    float m_passMs[3] = {0.0f, 0.0f, 0.0f};
+    void stamp(int k) { glQueryCounter(m_stamps[m_queryFrame % kQueries][k], GL_TIMESTAMP); }
 };

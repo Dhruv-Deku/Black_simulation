@@ -2,6 +2,7 @@
 
 #include "debris.h"
 #include "gl_util.h"
+#include "json.h"
 
 #include <glm/glm.hpp>
 
@@ -10,6 +11,10 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+
+namespace scene {
+class Blob;
+}
 
 // How the debris gas behaves (see shaders/particles_update.comp).
 struct GasParams {
@@ -90,6 +95,30 @@ public:
     // A summary of the particles (reads them back from the GPU: slow, for diagnostics).
     std::string describe() const;
 
+    // Saving and loading scenes (src/scene_file.h): the parcels and the surface's hot
+    // spots go into the blob, read back from the GPU; the counters come back as JSON.
+    json::Value save(scene::Blob& blob) const;
+    // Puts them back (with checkOnly, only checks that it could). The next update first
+    // rebuilds the gas grids from them as they were when saved, so the gas carries on
+    // exactly as it would have.
+    bool load(const json::Value& state, const scene::Blob& blob, std::string& error, bool checkOnly = false);
+
+    // Timeline checkpoints (src/timeline.h): the parcels, the hot spots and the counters
+    // copied into a buffer of their own on the GPU, without reading anything back. The
+    // caller owns the buffer (and deletes it with glDeleteBuffers).
+    struct GpuCopy {
+        bool allocated = false;  // there was any gas (or hot spots) at all
+        GLuint buffer = 0;
+        size_t bytes = 0;
+        int used = 0, next = 0, alive = 0, frame = 0;
+        double accreted = 0.0, scale = 1.0;
+        float gridRMax = kGridRMax;
+    };
+    GpuCopy copyOnGpu() const;
+    void restoreFromGpu(const GpuCopy& copy);
+    // Changes made to the gas from outside its own steps (spawned, cleared, restored).
+    int edits() const { return m_edits; }
+
     void hotReload();
     std::string errors() const;
 
@@ -116,4 +145,6 @@ private:
     int m_alive = 0;
     int m_frame = 0;
     bool m_dirty = false;  // grid needs rebuilding even if no time passed
+    bool m_restored = false;  // loaded from a scene: the grids must be rebuilt from the parcels first
+    int m_edits = 0;
 };

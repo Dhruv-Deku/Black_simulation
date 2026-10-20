@@ -29,6 +29,12 @@ namespace kerr {
 constexpr double kPi = 3.14159265358979323846;
 
 // --- Characteristic radii --------------------------------------------------
+//
+// Spun past a = 1 there is no horizon: Delta = (r - 1)^2 + b^2 > 0 everywhere, b = sqrt(a^2 - 1),
+// and a naked ring singularity sits at r = 0 in the equator (Sigma = 0). Rays through the
+// ring's disk (r = 0, theta != pi/2) go on to r < 0, another region, where gravity repels.
+// The functions below then return 0 for the horizons, and find the ISCO and photon orbits
+// numerically (there is no prograde equatorial photon orbit: 0).
 
 double horizonRadius(double a);                      // outer event horizon r+
 double innerHorizonRadius(double a);                 // inner (Cauchy) horizon r-

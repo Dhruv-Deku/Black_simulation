@@ -2,6 +2,7 @@
 
 #include "bodies.h"
 #include "camera.h"
+#include "keyframes.h"
 #include "particles.h"
 #include "settings.h"
 #include "trajectory.h"
@@ -10,12 +11,14 @@
 #include <vector>
 
 class Renderer;
+class MergerScene;
 
 // Camera paths for video recording.
 enum RecordPath {
     RecordAsFlown = 0,  // whatever you do with the mouse and keys
     RecordOrbit = 1,    // one full turn around the hole
     RecordPushIn = 2,   // a slow approach toward the hole
+    RecordKeyframes = 3,  // along the camera's keyframes (src/keyframes.h)
 };
 
 struct VideoSize {
@@ -82,6 +85,27 @@ struct UiState {
     std::string videoStatus;
     std::string cameraStatus;
     std::string centralStatus;     // what just happened to the central object
+    std::string sceneName;         // the scene file last saved or opened
+    std::string sceneStatus;       // what saving or opening it did
+    bool showTimeline = true;      // the bar at the bottom
+    float panelRight = 0.0f;       // where the control panel ended last frame (the bar stays clear of it)
+    // The telescope's view (src/eht_view.h).
+    bool ehtOpen = false;
+    int ehtTarget = 0;             // EhtView::Target
+    // Spin, hot electrons and a moderately thick flow: a ring 42 uas across with a dark
+    // center, as the EHT saw M87* (see the panel's help).
+    float ehtSpin = 0.5f;          // for M87* and Sgr A* (this black hole: its own)
+    float ehtInclination[2] = {163.0f, 30.0f};  // M87*, Sgr A* (this black hole: the camera's angle)
+    int ehtFrequency = 1;          // 86, 230 or 345 GHz
+    // The electrons' T0 and the flow's H/R, for M87*, Sgr A* and this black hole. Sgr A*'s
+    // flow must be cooler: calibrated to its 2.4 Jy around a hole 1,500 times smaller, the
+    // hotter flow glows too far out.
+    float ehtTemperature[3] = {1.5e12f, 7e11f, 1.5e12f};
+    float ehtBeta = 10.0f;
+    float ehtHeight[3] = {0.5f, 1.0f, 0.5f};
+    int ehtResolution = 1;         // 96, 160 or 256 pixels
+    float ehtBeam = 20.0f;         // uas
+    bool ehtCurve = true;
     int compactnessOrigin = -1;    // the kind the compactness slider started from (-1: not sliding)
     double compactnessTemperature = 0.0;
     bool radiusInKm = true;
@@ -127,6 +151,17 @@ struct UiContext {
     const std::vector<trajectory::Path>* predictions = nullptr;
     double slowdown = 1.0;  // time runs this much slower (approaching the hole)
     double pace = 1.0;      // ... and this much faster while a disrupted star's debris is far out
+    MergerScene* merger = nullptr;  // the neutron star merger (its own panel section)
+    keyframes::Track* track = nullptr;  // the camera's keyframes, edited in the panel
+    double waveHz = 0.0;  // the true frequency of the loudest gravitational wave heard (Hz)
+    // The timeline (src/timeline.h), as the bar at the bottom shows it. Times in M.
+    struct TimelineView {
+        bool available = false;
+        double start = 0.0, end = 0.0, time = 0.0;
+        bool live = true, playing = false, reverse = false, seeking = false;
+        size_t checkpoints = 0;
+        double megabytes = 0.0, gpuMegabytes = 0.0;
+    } timeline;
 
     // Requests carried out by the app after the UI is drawn.
     bool screenshotRequested = false;
@@ -139,6 +174,14 @@ struct UiContext {
     int centralRequested = -1;       // a central::catalog() entry
     bool burstRequested = false;     // set off a thermonuclear flash on the surface
     bool quakeRequested = false;     // a young neutron star's crust slips (a glitch)
+    int mergerRequest = 0;           // 1: start (or restart) the neutron star merger, 2: leave it
+    int sceneFileRequest = 0;        // 1: save the scene (again), 2: save it as..., 3: open one
+    bool timelineSeekRequested = false;  // go to timelineSeekTime (M) on the timeline
+    double timelineSeekTime = 0.0;
+    int keyframeRequest = 0;         // 1: add one where the camera is, 2: play or stop
+    int keyframeGo = -1;             // put the camera at this keyframe
+    int timelineCommand = 0;         // 1: play or pause, 2: play backwards, 3: back to the present,
+                                     // 4: to the start, 5: one frame back, 6: one frame on
 };
 
 // Turns the custom launch form into initial conditions (scene scale `scale`, central

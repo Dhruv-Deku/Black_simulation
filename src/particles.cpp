@@ -1,8 +1,11 @@
 #include "particles.h"
 
+#include "scene_file.h"
+
 #include <glm/glm.hpp>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 
@@ -129,10 +132,13 @@ void ParticleSystem::spawn(const std::vector<ParticleInit>& particles, double ti
     }
     m_alive += static_cast<int>(data.size());
     m_dirty = true;
+    ++m_edits;
 }
 
 void ParticleSystem::clear() {
     m_used = m_next = m_alive = 0;
+    m_restored = false;
+    ++m_edits;
 }
 
 void ParticleSystem::reframe(double oldSpin, double newSpin, double oldScale, double newScale, double surface) {
@@ -168,14 +174,13 @@ void ParticleSystem::resolve(GLuint density, GLuint velocity, GLenum format, boo
 
 void ParticleSystem::update(double spin, double dt, const GasParams& gas) {
     if (!active() || !m_update.valid() || !m_resolve.valid() || !m_deposit.valid()) return;
-    if (dt <= 0.0 && !m_dirty) return;
+    const bool restored = m_restored;
+    if (dt <= 0.0 && !m_dirty && !restored) return;
+    const bool step = dt > 0.0 || m_dirty;
     m_dirty = false;
+    m_restored = false;
     const bool delayed = gas.lightDelay;
 
-    glClearNamedBufferData(m_grid, GL_R32I, GL_RED_INTEGER, GL_INT, nullptr);
-    // Keep the accreted count (second int); clear only the alive count.
-    const int zeroInt = 0;
-    glNamedBufferSubData(m_stats, 0, sizeof(int), &zeroInt);
     const GLuint zero = 0;
     glClearTexImage(m_occupancy, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
 
@@ -211,18 +216,34 @@ void ParticleSystem::update(double spin, double dt, const GasParams& gas) {
     m_update.set("uImpactDims", glm::ivec2(kImpactTheta, kImpactLongitude));
     m_update.set("uSurfaceShift", static_cast<float>(gas.surfaceShift));
     m_update.set("uSurfacePhase", static_cast<float>(gas.surfacePhase));
-    // Last frame's gas, read while this frame's is accumulated.
-    glBindTextureUnit(0, m_density);
-    glBindTextureUnit(1, m_velocity);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_particles);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_grid);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_stats);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, m_impacts);
-    glDispatchCompute((m_used + 255) / 256, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    // One pass over the parcels: each reads last frame's gas while depositing this frame's.
+    auto pass = [&](bool depositOnly) {
+        glClearNamedBufferData(m_grid, GL_R32I, GL_RED_INTEGER, GL_INT, nullptr);
+        // Keep the accreted count (second int); clear only the alive count.
+        const int zeroInt = 0;
+        glNamedBufferSubData(m_stats, 0, sizeof(int), &zeroInt);
+        m_update.use();
+        m_update.set("uDepositOnly", depositOnly ? 1 : 0);
+        glBindTextureUnit(0, m_density);
+        glBindTextureUnit(1, m_velocity);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_particles);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_grid);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, m_stats);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, m_impacts);
+        glDispatchCompute((m_used + 255) / 256, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        if (depositOnly) resolve(m_density, m_velocity, GL_RGBA32F, true);
+    };
+    // Just loaded from a scene: first the gas as it was when saved, which the step reads
+    // as last frame's (the textures still hold the scene before).
+    if (restored) {
+        pass(true);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+    }
+    if (step) pass(false);
 
     // Fold this frame's impacts into the fading hot-spot map.
-    if (gas.surface > 0.0 && m_impactResolve.valid()) {
+    if (step && gas.surface > 0.0 && m_impactResolve.valid()) {
         m_impactResolve.use();
         m_impactResolve.set("uImpactDims", glm::ivec2(kImpactTheta, kImpactLongitude));
         m_impactResolve.set("uDecay", static_cast<float>(std::exp(-std::max(dt, 0.0) / std::max(gas.impactFadeTime, 1e-6))));
@@ -234,7 +255,7 @@ void ParticleSystem::update(double spin, double dt, const GasParams& gas) {
     }
 
     // The gas as it is now, for the physics.
-    resolve(m_density, m_velocity, GL_RGBA32F, true);
+    if (step) resolve(m_density, m_velocity, GL_RGBA32F, true);
 
     // The gas as the camera sees it.
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
@@ -254,7 +275,7 @@ void ParticleSystem::update(double spin, double dt, const GasParams& gas) {
     glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
 
     // The alive count is for display only; reading it back stalls briefly, so do it rarely.
-    if (++m_frame % 20 == 0) {
+    if (step && ++m_frame % 20 == 0) {
         int stats[2] = {0, 0};
         glGetNamedBufferSubData(m_stats, 0, sizeof(stats), stats);
         m_alive = stats[0];
@@ -292,6 +313,141 @@ std::string ParticleSystem::describe() const {
                       quantile(seen, 0.1), quantile(seen, 0.5), quantile(seen, 0.9));
     }
     return text;
+}
+
+json::Value ParticleSystem::save(scene::Blob& blob) const {
+    using json::Value;
+    Value out = Value::object();
+    int stats[2] = {0, 0};  // alive count, accreted weight (fixed point)
+    if (m_particles) {
+        if (m_used > 0) {
+            std::vector<GpuParticle> data(static_cast<size_t>(m_used));
+            glGetNamedBufferSubData(m_particles, 0, sizeof(GpuParticle) * data.size(), data.data());
+            blob.put("GAS", data.data(), sizeof(GpuParticle) * data.size());
+        }
+        glGetNamedBufferSubData(m_stats, 0, sizeof(stats), stats);
+        std::vector<float> map(static_cast<size_t>(kImpactTheta) * kImpactLongitude);
+        glGetTextureImage(m_impactMap, 0, GL_RED, GL_FLOAT, static_cast<GLsizei>(map.size() * sizeof(float)), map.data());
+        blob.put("HOTS", map.data(), map.size() * sizeof(float));
+    }
+    out.set("used", Value::number(static_cast<long long>(m_used)));
+    out.set("next", Value::number(static_cast<long long>(m_next)));
+    out.set("alive", Value::number(static_cast<long long>(m_alive)));
+    out.set("frame", Value::number(static_cast<long long>(m_frame)));
+    out.set("aliveCount", Value::number(static_cast<long long>(stats[0])));
+    out.set("accretedCount", Value::number(static_cast<long long>(stats[1])));
+    out.set("accreted", Value::number(m_accreted));
+    out.set("scale", Value::number(m_scale));
+    out.set("gridRMax", Value::number(m_gridRMax));
+    return out;
+}
+
+bool ParticleSystem::load(const json::Value& state, const scene::Blob& blob, std::string& error, bool checkOnly) {
+    long long used = 0, next = 0, alive = 0, frame = 0, aliveCount = 0, accretedCount = 0;
+    double accreted = 0.0, scale = 1.0;
+    float gridRMax = kGridRMax;
+    auto read = [&](const char* key, auto& value) {
+        const json::Value* x = state.find(key);
+        return !x || x->get(value);
+    };
+    const bool ok = state.isObject() && read("used", used) && read("next", next) && read("alive", alive) &&
+                    read("frame", frame) && read("aliveCount", aliveCount) && read("accretedCount", accretedCount) &&
+                    read("accreted", accreted) && read("scale", scale) && read("gridRMax", gridRMax);
+    const std::vector<char>* gas = blob.find("GAS");
+    const std::vector<char>* hot = blob.find("HOTS");
+    const size_t hotBytes = sizeof(float) * kImpactTheta * kImpactLongitude;
+    if (!ok || used < 0 || used > kCapacity || next < 0 || next >= kCapacity || !(scale > 0.0) || !(gridRMax > 0.0f) ||
+        aliveCount < INT_MIN || aliveCount > INT_MAX || accretedCount < INT_MIN || accretedCount > INT_MAX) {
+        error = "the scene's gas counters are damaged";
+        return false;
+    }
+    if (used > 0 && (!gas || gas->size() != sizeof(GpuParticle) * static_cast<size_t>(used))) {
+        error = "the sidecar's gas does not match the scene";
+        return false;
+    }
+    if (hot && hot->size() != hotBytes) {
+        error = "the sidecar's hot-spot map is damaged";
+        return false;
+    }
+    if (checkOnly) return true;
+
+    allocate();
+    if (used > 0) glNamedBufferSubData(m_particles, 0, static_cast<GLsizeiptr>(gas->size()), gas->data());
+    const int stats[2] = {static_cast<int>(aliveCount), static_cast<int>(accretedCount)};
+    glNamedBufferSubData(m_stats, 0, sizeof(stats), stats);
+    glClearNamedBufferData(m_impacts, GL_R32I, GL_RED_INTEGER, GL_INT, nullptr);
+    if (hot) {
+        glTextureSubImage2D(m_impactMap, 0, 0, 0, kImpactTheta, kImpactLongitude, GL_RED, GL_FLOAT, hot->data());
+    } else {
+        glClearTexImage(m_impactMap, 0, GL_RED, GL_FLOAT, nullptr);
+    }
+    m_used = static_cast<int>(used);
+    m_next = static_cast<int>(next);
+    m_alive = static_cast<int>(alive);
+    m_frame = static_cast<int>(frame);
+    m_accreted = accreted;
+    m_scale = scale;
+    m_gridRMax = gridRMax;
+    m_dirty = false;
+    m_restored = used > 0;
+    ++m_edits;
+    return true;
+}
+
+ParticleSystem::GpuCopy ParticleSystem::copyOnGpu() const {
+    GpuCopy c;
+    c.used = m_used;
+    c.next = m_next;
+    c.alive = m_alive;
+    c.frame = m_frame;
+    c.accreted = m_accreted;
+    c.scale = m_scale;
+    c.gridRMax = m_gridRMax;
+    if (!m_particles) return c;
+    // The parcels, then the two counters (alive, accreted), then the hot-spot map.
+    const size_t gasBytes = sizeof(GpuParticle) * static_cast<size_t>(m_used);
+    const size_t hotBytes = sizeof(float) * kImpactTheta * kImpactLongitude;
+    c.allocated = true;
+    c.bytes = gasBytes + 2 * sizeof(int) + hotBytes;
+    glCreateBuffers(1, &c.buffer);
+    glNamedBufferStorage(c.buffer, static_cast<GLsizeiptr>(c.bytes), nullptr, 0);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
+    if (gasBytes > 0) glCopyNamedBufferSubData(m_particles, c.buffer, 0, 0, static_cast<GLsizeiptr>(gasBytes));
+    glCopyNamedBufferSubData(m_stats, c.buffer, 0, static_cast<GLintptr>(gasBytes), 2 * sizeof(int));
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, c.buffer);
+    glGetTextureImage(m_impactMap, 0, GL_RED, GL_FLOAT, static_cast<GLsizei>(hotBytes),
+                      reinterpret_cast<void*>(gasBytes + 2 * sizeof(int)));
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    return c;
+}
+
+void ParticleSystem::restoreFromGpu(const GpuCopy& c) {
+    ++m_edits;
+    if (!c.allocated) {
+        // There was no gas then: none now, and no hot spots.
+        clear();
+        if (m_impactMap) glClearTexImage(m_impactMap, 0, GL_RED, GL_FLOAT, nullptr);
+        return;
+    }
+    allocate();
+    const size_t gasBytes = sizeof(GpuParticle) * static_cast<size_t>(c.used);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+    if (gasBytes > 0) glCopyNamedBufferSubData(c.buffer, m_particles, 0, 0, static_cast<GLsizeiptr>(gasBytes));
+    glCopyNamedBufferSubData(c.buffer, m_stats, static_cast<GLintptr>(gasBytes), 0, 2 * sizeof(int));
+    glClearNamedBufferData(m_impacts, GL_R32I, GL_RED_INTEGER, GL_INT, nullptr);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, c.buffer);
+    glTextureSubImage2D(m_impactMap, 0, 0, 0, kImpactTheta, kImpactLongitude, GL_RED, GL_FLOAT,
+                        reinterpret_cast<void*>(gasBytes + 2 * sizeof(int)));
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    m_used = c.used;
+    m_next = c.next;
+    m_alive = c.alive;
+    m_frame = c.frame;
+    m_accreted = c.accreted;
+    m_scale = c.scale;
+    m_gridRMax = c.gridRMax;
+    m_dirty = false;
+    m_restored = c.used > 0;
 }
 
 void ParticleSystem::hotReload() {

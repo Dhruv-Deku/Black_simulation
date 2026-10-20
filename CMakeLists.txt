@@ -8,7 +8,7 @@ set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 include(FetchContent)
 
 # The C++ runtime is linked in statically (into the dependencies too), so the prebuilt
-# executables in bin\ run on machines without the Visual C++ redistributable.
+# executable in bin\ runs on machines without the Visual C++ redistributable.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # ---------------------------------------------------------------------------
@@ -77,10 +77,19 @@ add_library(bh_physics STATIC
     src/kerr.cpp src/kerr.h
     src/central.cpp src/central.h
     src/debris.cpp src/debris.h
+    src/merger.cpp src/merger.h
+    src/film.cpp src/film.h
     src/tde.cpp src/tde.h
     src/trajectory.cpp src/trajectory.h
     src/tidal.cpp src/tidal.h
     src/gravity.cpp src/gravity.h
+    src/json.cpp src/json.h
+    src/scene_file.cpp src/scene_file.h
+    src/timeline.cpp src/timeline.h
+    src/keyframes.cpp src/keyframes.h
+    src/eht.cpp src/eht.h
+    src/penrose.cpp src/penrose.h
+    src/camera.cpp src/camera.h
     src/surface.cpp src/surface.h
     src/bodies.cpp src/bodies.h
     src/blackbody.cpp src/blackbody.h)
@@ -96,7 +105,12 @@ configure_file(src/config.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/config.h @O
 add_executable(blackhole
     src/main.cpp
     src/app.cpp           src/app.h
-    src/camera.cpp        src/camera.h
+    src/audio.cpp         src/audio.h
+    src/scene_sound.cpp   src/scene_sound.h
+    src/merger_scene.cpp  src/merger_scene.h
+    src/merger_sim.cpp    src/merger_sim.h
+    src/file_dialog.cpp   src/file_dialog.h
+    src/eht_view.cpp      src/eht_view.h
     src/gl_util.cpp       src/gl_util.h
     src/particles.cpp     src/particles.h
     src/recorder.cpp      src/recorder.h
@@ -107,8 +121,9 @@ target_include_directories(blackhole PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generat
 target_link_libraries(blackhole PRIVATE bh_physics glad glfw imgui glm::glm stb)
 target_compile_options(blackhole PRIVATE ${BH_WARNINGS})
 if(WIN32)
-    # Media Foundation encodes the MP4 videos.
-    target_link_libraries(blackhole PRIVATE opengl32 mfplat mfreadwrite mfuuid ole32)
+    # Media Foundation encodes the MP4 videos; waveOut (winmm) plays the merger's sound;
+    # comdlg32 has the Open and Save As dialogs for scenes.
+    target_link_libraries(blackhole PRIVATE opengl32 mfplat mfreadwrite mfuuid ole32 winmm comdlg32)
     target_compile_definitions(blackhole PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
 endif()
 add_custom_command(TARGET blackhole POST_BUILD

@@ -349,6 +349,23 @@ float diskPattern(float r, float psi, float seed) {
 #ifdef CENTRAL_BODY
 vec3 filmHue(float T);   // central_surface.glsl
 vec3 aia304(float t);
+
+// A cataclysmic variable's disk in film colors, as artists paint them and as its temperature
+// runs (~35,000 K drawn at the white dwarf, ~6,000 K at the rim): white-blue, blue, then pale
+// gold, gold, orange and red. Stops in log10 T; brightest channel 1.
+vec3 cvHue(float T) {
+    const int N = 7;
+    const float stops[N] = float[N](3.7, 3.78, 3.88, 4.0, 4.15, 4.35, 4.55);
+    const vec3 hues[N] = vec3[N](vec3(0.85, 0.2, 0.05), vec3(1.0, 0.42, 0.08), vec3(1.0, 0.7, 0.18),
+                                 vec3(1.0, 0.92, 0.6), vec3(0.62, 0.86, 1.0), vec3(0.32, 0.6, 1.0),
+                                 vec3(0.58, 0.8, 1.0));
+    float l = log2(max(T, 1.0)) * 0.30103;
+    if (l <= stops[0]) return hues[0];
+    for (int k = 1; k < N; ++k) {
+        if (l <= stops[k]) return mix(hues[k - 1], hues[k], (l - stops[k - 1]) / (stops[k] - stops[k - 1]));
+    }
+    return hues[N - 1];
+}
 #endif
 
 // Emission (rgb) and opacity (a) of the thin disk where a ray crosses it. delay is
@@ -414,17 +431,22 @@ vec4 diskEmission(float r, float phi, float delay) {
         float dr = (r - 0.93 * uDiskOuter) / (0.06 * uDiskOuter);
         // The spot, and the shocked gas it sheds downstream along the rim.
         float spot = exp(-dr * dr - dPhi * dPhi / 0.03) + 0.3 * exp(-2.0 * dr * dr - 6.0 * max(dPhi, 0.0)) * step(0.0, dPhi);
-        alpha = clamp(uDiskOpacity * edges * (0.9 + 0.1 * outer), 0.0, 1.0);
+        // Optically thick (tens of thousands of kelvin, dense): opaque.
+        alpha = clamp(1.5 * uDiskOpacity * edges, 0.0, 1.0);
         float Tspot = max(T, 12000.0) * 1.4;
         vec3 base = shiftedBlackbody(T * (1.0 + 0.12 * shocks), g, uDiskTemp) * uDiskBrightness * soft * (1.0 + 1.2 * shocks);
         vec3 hot = shiftedBlackbody(Tspot, g, uDiskTemp) * uDiskBrightness * 2.5 * spot;
         if (uFilmColor == 1) {
             // Exposed, as films and images of these binaries are, for the whole disk: its
-            // brightness compressed (square root) so the cool outer disk shows, its
-            // annuli (each turning at its own Kepler rate) drawn as rings.
-            float rings = 0.85 + 0.25 * smoothstep(-0.4, 0.7, sin(lr * 22.0 + 5.0 * n + 1.5 * gradientNoise(vec3(cos(phi), sin(phi), lr) * 3.0)));
-            base = filmHue(T * g) * (sqrt(luminance(base)) * 1.5 * rings);
-            hot = filmHue(Tspot * g) * sqrt(luminance(hot)) * 1.5;
+            // brightness compressed (fourth root, and capped below white so the hottest
+            // part keeps its blue) so the cool outer disk shows, in the colors artists give
+            // these disks (cvHue), its annuli (each turning at its own Kepler rate) drawn
+            // as fine rings, wavering a little.
+            float warp = 1.5 * gradientNoise(vec3(cos(phi), sin(phi), lr) * 3.0);
+            float rings = 0.8 + 0.14 * sin(lr * 26.0 + 5.0 * n + warp) + 0.1 * sin(lr * 61.0 + 2.0 * warp + 1.3) +
+                          0.06 * sin(lr * 140.0 + warp);
+            base = cvHue(T * g) * (min(pow(luminance(base), 0.25) * 1.5, 1.15) * rings);
+            hot = cvHue(Tspot * g) * min(pow(luminance(hot), 0.25) * 1.5, 1.6);
         }
         emit = base + hot;
     }
@@ -1483,8 +1505,12 @@ void main() {
 #else
     const bool hole = true;
 #endif
-    float horizon = MASS + sqrt(max(MASS * MASS - spinA2, 0.0));
-    float boundary = hole ? horizon : uSurfaceR;
+    // Spun past a = m there is no horizon: a naked singularity, a ring at r = 0 in the
+    // equator. Rays through the ring's disk go on to r < 0, a second region where gravity
+    // repels; they leave to a sky of their own there.
+    bool naked = hole && spinA > MASS;
+    float horizon = naked ? 0.0 : MASS + sqrt(max(MASS * MASS - spinA2, 0.0));
+    float boundary = hole ? (naked ? MASS : horizon) : uSurfaceR;
     bool lightDelay = bodyInfo.z != 0;
     vec3 X = toCartesian(r, th, ph);
     vec3 cameraX = X;
@@ -1523,7 +1549,10 @@ void main() {
     ivec3 pathCellNow = ivec3(-1000);
     bool pathOccupiedNow = uPathsEnabled == 1 && pathCell(vec4(r, th, ph, 0.0), pathCellNow);
 
-    for (int i = 0; i < uMaxSteps && fate == 0; ++i) {
+    // Without a horizon to end them, rays near a naked singularity's photon orbits wind
+    // round many times before they leave: they get more steps.
+    int maxSteps = naked ? 4 * uMaxSteps : uMaxSteps;
+    for (int i = 0; i < maxSteps && fate == 0; ++i) {
         steps = i + 1;
         float dPh1, aR1, aTh1, tD1;
         geodesicRhs(r, th, vr, dPh1, aR1, aTh1, tD1);
@@ -1534,9 +1563,12 @@ void main() {
         // ray approaches the axis, before the swing starts. Far from the hole
         // spacetime is nearly flat, so the allowed change grows with r.
         float sn = abs(sin(th));
-        float tol = uStepSize * clamp(r / (8.0 * MASS), 1.0, 4.0);
-        float h = tol / (abs(vr) / r + abs(vth) / max(sn, 1e-4) + abs(dPh1) + 1e-6);
-        h = min(h, sqrt(tol * r / (abs(aR1) + 1e-6)));
+        // Lengths: r, or near a naked ring (where r passes through 0) sqrt(Sigma).
+        float cth = cos(th);
+        float rs = naked ? max(sqrt(r * r + spinA2 * cth * cth), 0.02 * MASS) : r;
+        float tol = uStepSize * clamp(rs / (8.0 * MASS), 1.0, 4.0);
+        float h = tol / (abs(vr) / rs + abs(vth) / max(sn, 1e-4) + abs(dPh1) + 1e-6);
+        h = min(h, sqrt(tol * rs / (abs(aR1) + 1e-6)));
         h = min(h, sqrt(tol * max(sn, 1e-4) / (abs(aTh1) + 1e-6)));
 
         // Classical RK4 on (r, theta, phi, vr, vtheta), and on t for the delay.
@@ -1594,16 +1626,18 @@ void main() {
         // (not across a pole, where the coordinates jump), coronae and accretion columns.
         float chordLength = length(X1 - X);
         vec4 p0 = vec4(r, th, ph, 0.0), p1 = vec4(r1, th1, ph1, 0.0);
-        if (uDebrisEnabled == 1 && !reflected) {
+        // Matter, jets and paths live in our region (r > 0), not beyond a naked ring.
+        bool ours = r > 0.0 && r1 > 0.0;
+        if (uDebrisEnabled == 1 && !reflected && ours) {
             traceDebris(p0, vec2(vr, vth), p1, vec2(vrNext, vthNext), chordLength, color, transmittance);
         }
 #ifdef OUTFLOW
-        if (!reflected) {
+        if (!reflected && ours) {
             traceOutflow(X, X1, p0, p1, vec2(vr, vth), vec2(vrNext, vthNext), lightDelay ? delay : 0.0,
                          lightDelay ? delayNext : 0.0, outflowJitter, color, transmittance);
         }
 #endif
-        if (uJetsEnabled == 1 && !reflected) {
+        if (uJetsEnabled == 1 && !reflected && ours) {
             traceJets(X, X1, p0, p1, vec2(vr, vth), vec2(vrNext, vthNext), lightDelay ? delay : 0.0,
                       lightDelay ? delayNext : 0.0, boundary, color, transmittance);
 #if SURFACE_LOOK == 4
@@ -1630,7 +1664,7 @@ void main() {
         if (uPathsEnabled == 1) {
             ivec3 nextCell;
             bool nextOccupied;
-            if (!reflected) {
+            if (!reflected && ours) {
                 tracePaths(X, X1, p0, p1, pathLength, cameraX, pathCellNow, pathOccupiedNow, nextCell, nextOccupied,
                            color, transmittance);
             } else {
@@ -1731,9 +1765,25 @@ void main() {
 
         // Sinking back toward the horizon from outside: the light came out of the past
         // horizon, which shows as the black hole's shadow.
-        if (transmittance < 0.002 || (hole && r < horizon + 0.01 * MASS && vr < 0.0)) {
+        if (transmittance < 0.002 || (hole && !naked && r < horizon + 0.01 * MASS && vr < 0.0)) {
             fate = 2;
             break;
+        }
+        if (naked) {
+            // The ring itself, where Sigma = r^2 + a^2 cos^2(theta) vanishes.
+            float cs = cos(th);
+            if (r * r + spinA2 * cs * cs < 4e-4 * MASS * MASS) {
+                fate = 5;
+                break;
+            }
+            // Gone far out into the r < 0 region.
+            if (r < -uEscapeRadius && vr < 0.0) {
+                float dPh, unusedR, unusedTh, unusedT;
+                geodesicRhs(r, th, vr, dPh, unusedR, unusedTh, unusedT);
+                escapeDir = normalize(cartesianVelocity(r, th, ph, vr, vth, dPh));
+                fate = 4;
+                break;
+            }
         }
         if (r > uEscapeRadius && vr > 0.0) {
             float dPh, unusedR, unusedTh, unusedT;
@@ -1793,6 +1843,10 @@ void main() {
             vec2 span = sphereSpan(cameraX, d, uSurfaceR * 5.0);
             float glow = coronaGlow(cameraX, d, max(span.x, 0.0), min(span.y, tEnd), jitter, 0.0);
             color += front * electricHue(0.62) * (glow * kElectricLevel * uSurfaceBrightness);
+            // And, as in artists' pictures of them, threads of plasma crackling around it.
+            vec2 near = sphereSpan(cameraX, d, uSurfaceR * 2.2);
+            color += front * dwarfFilaments(cameraX, d, max(near.x, 0.0), min(near.y, tEnd), jitter) *
+                     (kElectricLevel * uSurfaceBrightness);
         }
 #elif SURFACE_LOOK == 1
         {
@@ -1833,11 +1887,16 @@ void main() {
     if (fate == 3) color += hitTransmittance * airTrans * surfaceLight;
 #endif
 
-    // Evaluated outside the loop so screen-space derivatives (grid lines) are valid.
-    vec3 sky = skyColor(escapeDir, gSky);
+    // Evaluated outside the loop so screen-space derivatives (grid lines) are valid. The sky
+    // of the region beyond a naked ring (r < 0) is drawn mirrored and violet, so it cannot be
+    // taken for ours.
+    vec3 sky = skyColor(fate == 4 ? -escapeDir : escapeDir, gSky);
     if (fate == 1) color += transmittance * airTrans * sky;
+    if (fate == 4) color += transmittance * sky * vec3(0.55, 0.35, 1.0);
+    // Light that struck the ring singularity: where the theory breaks down, drawn white-hot.
+    if (fate == 5) color += transmittance * vec3(4.0, 3.6, 5.0);
 
-    if (uDebugView == 1) color = heatMap(float(steps) / float(uMaxSteps));
+    if (uDebugView == 1) color = heatMap(float(steps) / float(maxSteps));
     if (uDebugView == 2) color = fate == 1 ? escapeDir * 0.5 + 0.5 : vec3(0.0);
     if (any(isnan(color)) || any(isinf(color))) color = vec3(0.0);
     outColor = vec4(min(color, vec3(30000.0)), 1.0);

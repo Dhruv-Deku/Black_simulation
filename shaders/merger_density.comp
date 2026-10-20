@@ -1,0 +1,73 @@
+#version 460 core
+
+// SPH density of every particle, sum over neighbours of m W(r, h), and from it the
+// pressure of the hybrid equation of state (src/merger.h):
+//     P = K rho^2 + (gamma_th - 1) rho u_th
+// the sound speed, the velocity divergence and curl (for Balsara's viscosity switch), and
+// the smoothing length for the next step, h = eta (m / rho)^(1/3) (about 58 neighbours).
+
+layout(local_size_x = 128) in;
+
+#include "merger_common.glsl"
+
+uniform float uK;            // polytropic constant of the cold part
+uniform float uGammaTh;
+uniform float uHMin;
+uniform float uHMax;
+uniform float uEta;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= uCount) return;
+    Particle p = particles[i];
+    if (p.thermo.w < 0.0) return;
+    vec3 x = p.pos.xyz;
+    vec3 v = p.vel.xyz;
+    float h = p.vel.w;
+    float rho = 0.0;
+    // Velocity derivatives: div v = sum m_j (v_j - v_i) . grad_i W_ij / rho_i, and the curl.
+    float div = 0.0;
+    vec3 curl = vec3(0.0);
+    float hNeighbours = h;  // the widest kernel among the neighbours: how far the force pass must look
+    ivec3 c0 = cellOf(x);
+    int kr = int(ceil(2.0 * h / uCellSize));
+    for (int dz = -kr; dz <= kr; ++dz)
+        for (int dy = -kr; dy <= kr; ++dy)
+            for (int dx = -kr; dx <= kr; ++dx) {
+                ivec3 c = c0 + ivec3(dx, dy, dz);
+                int j = gridHead[hashCell(c)];
+                while (j >= 0) {
+                    // Only the position is read until the particle is known to be a
+                    // neighbour: most candidates are not, and memory traffic is the cost.
+                    vec4 qp = particles[j].pos;
+                    vec3 d = x - qp.xyz;
+                    float r = length(d);
+                    // Different cells can share a hash bucket: count each particle once.
+                    if (r < 2.0 * h && cellOf(qp.xyz) == c) {
+                        rho += qp.w * kernelW(r, h);
+                        vec4 qv = particles[j].vel;
+                        hNeighbours = max(hNeighbours, qv.w);
+                        if (r > 1e-6) {
+                            vec3 g = kernelDW(r, h) * d / r;
+                            vec3 dv = qv.xyz - v;
+                            div += qp.w * dot(dv, g);
+                            curl += qp.w * cross(dv, g);
+                        }
+                    }
+                    j = gridNext[j];
+                }
+            }
+    rho = max(rho, 1e-20);
+    float uth = max(p.thermo.x, 0.0);
+    float pressure = uK * rho * rho + (uGammaTh - 1.0) * rho * uth;
+    float cs = sqrt(2.0 * uK * rho + uGammaTh * (uGammaTh - 1.0) * uth);
+    particles[i].thermo.y = rho;
+    particles[i].thermo.z = pressure;
+    aux[i] = vec4(div / rho, length(curl) / rho, cs, hNeighbours);  // div v, |curl v|, sound speed, reach
+    // Next step's smoothing length, changing by at most a quarter a step. Grid cells are
+    // about as wide as the cores' kernels; a parcel with a wider kernel (in the thin outer
+    // layers and the ejecta) searches more of them.
+    float hNew = uEta * pow(p.pos.w / rho, 1.0 / 3.0);
+    hNew = clamp(hNew, 0.8 * h, 1.25 * h);
+    particles[i].vel.w = clamp(hNew, uHMin, uHMax);
+}

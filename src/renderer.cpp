@@ -2,6 +2,7 @@
 #include <cstdio>
 
 #include "blackbody.h"
+#include "central.h"
 #include "kerr.h"
 
 #include <algorithm>
@@ -70,6 +71,8 @@ bool Renderer::init(const std::filesystem::path& shaderDir, std::string& error) 
     ok &= m_bloomDown.build(shaderDir, "fullscreen.vert", "bloom_down.frag");
     ok &= m_bloomUp.build(shaderDir, "fullscreen.vert", "bloom_up.frag");
     ok &= m_tonemap.build(shaderDir, "fullscreen.vert", "tonemap.frag");
+    ok &= m_easu.build(shaderDir, "fullscreen.vert", "easu.frag");
+    ok &= m_rcas.build(shaderDir, "fullscreen.vert", "rcas.frag");
     // Keep going on failure: a fixed shader file is picked up by hotReload().
     if (!ok) error = shaderErrors();
 
@@ -113,6 +116,7 @@ bool Renderer::init(const std::filesystem::path& shaderDir, std::string& error) 
     glTextureParameteri(m_historyTexture, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
     glCreateQueries(GL_TIME_ELAPSED, kQueries, m_queries);
+    for (auto& frame : m_stamps) glCreateQueries(GL_TIMESTAMP, 4, frame);
 
     // Path line buffers start out empty (every cell holds zero segments).
     glCreateBuffers(1, &m_pathSegments);
@@ -202,6 +206,9 @@ void Renderer::shutdown() {
                          m_placeholderOccupancy, m_historyTexture};
     glDeleteTextures(6, textures);
     glDeleteQueries(kQueries, m_queries);
+    for (auto& frame : m_stamps) glDeleteQueries(4, frame);
+    m_ldrLow.destroy();
+    m_upscaled.destroy();
     m_vao = m_bodyUbo = m_blackbodyTexture = m_skyTexture = m_placeholderTexture = 0;
     m_placeholderVolume = m_placeholderOccupancy = m_historyTexture = 0;
 }
@@ -257,6 +264,18 @@ void Renderer::readTimer() {
         float ms = static_cast<float>(ns * 1e-6);
         m_gpuMs = m_gpuMs == 0.0f ? ms : 0.9f * m_gpuMs + 0.1f * ms;
     }
+    // The passes, from the same frame's timestamps.
+    const GLuint* frame = m_stamps[(m_queryFrame + 1) % kQueries];
+    GLint ready = 0;
+    glGetQueryObjectiv(frame[3], GL_QUERY_RESULT_AVAILABLE, &ready);
+    if (ready) {
+        GLuint64 t[4] = {};
+        for (int k = 0; k < 4; ++k) glGetQueryObjectui64v(frame[k], GL_QUERY_RESULT, &t[k]);
+        for (int k = 0; k < 3; ++k) {
+            const float ms = t[k + 1] > t[k] ? static_cast<float>((t[k + 1] - t[k]) * 1e-6) : 0.0f;
+            m_passMs[k] = m_passMs[k] == 0.0f ? ms : 0.9f * m_passMs[k] + 0.1f * ms;
+        }
+    }
 }
 
 void Renderer::render(const FrameInputs& in) {
@@ -276,6 +295,7 @@ void Renderer::render(const FrameInputs& in) {
 
     readTimer();
     glBeginQuery(GL_TIME_ELAPSED, m_queries[m_queryFrame % kQueries]);
+    stamp(0);
 
     // --- 1. Ray trace ---------------------------------------------------------
     // Render units: lengths and times over the scene scale, mass 1 / scale.
@@ -479,6 +499,26 @@ void Renderer::render(const FrameInputs& in) {
     trace.set("uCompanionAxis", cv.companionAxis);
     trace.set("uCompanionTemp", cv.companionTemperature);
     {
+        // The companion's Roche lobe: L1, the potential there, and the effective gravity at
+        // the lobe's pole (its surface brightness is scaled to that), for its mass ratio.
+        static double cachedQ = -1.0;
+        static float l1 = 0.0f, surface = 0.0f, gravity = 1.0f;
+        const double q = std::max(static_cast<double>(cv.companionQ), 1e-3);
+        if (q != cachedQ) {
+            cachedQ = q;
+            const double x = central::innerLagrangeFraction(q);
+            const double pole = central::rocheLobeReach(q, 0.0, 0.0, 1.0);
+            const auto g = central::rocheGradient(q, 1.0, 0.0, pole);
+            l1 = static_cast<float>(x);
+            surface = static_cast<float>(central::rochePotential(q, x, 0.0, 0.0));
+            gravity = static_cast<float>(std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]));
+        }
+        trace.set("uCompanionQ", static_cast<float>(q));
+        trace.set("uRocheL1", l1);
+        trace.set("uRocheSurface", surface);
+        trace.set("uRocheGravity", gravity);
+    }
+    {
         glm::vec3 stream[16] = {};
         const int count = static_cast<int>(std::min<size_t>(cv.stream.size(), 16));
         for (int k = 0; k < count; ++k) stream[k] = cv.stream[k] * static_cast<float>(inv);
@@ -595,7 +635,16 @@ void Renderer::render(const FrameInputs& in) {
         trace.set("uPlanetMaps", earth || jupiter ? 1 : 0);
     }
     drawFullscreen();
+    stamp(1);
 
+    postProcess(s, tw, th, in.width, in.height, in.exposureBoost);
+
+    glEndQuery(GL_TIME_ELAPSED);
+    ++m_queryFrame;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void Renderer::postProcess(const Settings& s, int tw, int th, int outWidth, int outHeight, float exposureBoost) {
     // --- 2. Bloom: progressive downsample, then tent-filtered upsample --------
     // Debug views are shown raw: no bloom, exposure or tone curve.
     const bool debugView = s.debugView != 0;
@@ -628,18 +677,68 @@ void Renderer::render(const FrameInputs& in) {
         glDisable(GL_BLEND);
     }
 
+    stamp(2);
+
     // --- 3. Tone map to 8-bit ---------------------------------------------------
-    glBindFramebuffer(GL_FRAMEBUFFER, m_ldr.fbo);
-    glViewport(0, 0, in.width, in.height);
+    // Traced below the output's size, it is tone mapped at the traced size, enlarged with
+    // FSR 1's edge-adaptive upscale and sharpened (shaders/easu.frag, rcas.frag); else
+    // straight into the output.
+    const bool upscale = s.upscaler == 1 && !debugView && (tw < outWidth || th < outHeight);
+    if (upscale) {
+        m_ldrLow.ensure(tw, th, GL_RGBA16F);
+        m_upscaled.ensure(outWidth, outHeight, GL_RGBA16F);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, upscale ? m_ldrLow.fbo : m_ldr.fbo);
+    glViewport(0, 0, upscale ? tw : outWidth, upscale ? th : outHeight);
     m_tonemap.use();
-    m_tonemap.set("uExposure", debugView ? 1.0f : s.exposure * in.exposureBoost);
+    m_tonemap.set("uExposure", debugView ? 1.0f : s.exposure * exposureBoost);
     m_tonemap.set("uBloomStrength", bloom ? s.bloomStrength : 0.0f);
     m_tonemap.set("uBloomLevels", static_cast<float>(std::max(m_bloomCount, 1)));
     m_tonemap.set("uTonemapper", debugView ? 2 : s.tonemapper);
+    m_tonemap.set("uDither", upscale ? 0 : 1);
     glBindTextureUnit(0, m_hdr.texture);
     glBindTextureUnit(1, bloom ? m_bloom[0].texture : m_hdr.texture);
     drawFullscreen();
+    if (upscale) {
+        glBindFramebuffer(GL_FRAMEBUFFER, m_upscaled.fbo);
+        glViewport(0, 0, outWidth, outHeight);
+        m_easu.use();
+        m_easu.set("uInputSize", glm::vec2(tw, th));
+        m_easu.set("uOutputSize", glm::vec2(outWidth, outHeight));
+        glBindTextureUnit(0, m_ldrLow.texture);
+        drawFullscreen();
+        glBindFramebuffer(GL_FRAMEBUFFER, m_ldr.fbo);
+        m_rcas.use();
+        m_rcas.set("uSharpness", std::exp2(-std::max(s.sharpness, 0.0f)));
+        glBindTextureUnit(0, m_upscaled.texture);
+        drawFullscreen();
+    }
+    stamp(3);
+}
 
+void Renderer::beginExternal(int width, int height, float renderScale) {
+    const int tw = std::max(1, static_cast<int>(std::lround(width * renderScale)));
+    const int th = std::max(1, static_cast<int>(std::lround(height * renderScale)));
+    m_hdr.ensure(tw, th, GL_RGBA16F);
+    m_ldr.ensure(width, height, GL_RGBA8);
+    m_bloomCount = 0;
+    for (int i = 0, w = tw / 2, h = th / 2; i < kBloomLevels && w >= 2 && h >= 2; ++i, w /= 2, h /= 2) {
+        m_bloom[i].ensure(w, h, GL_R11F_G11F_B10F);
+        m_bloomCount = i + 1;
+    }
+    readTimer();
+    glBeginQuery(GL_TIME_ELAPSED, m_queries[m_queryFrame % kQueries]);
+    stamp(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, m_hdr.fbo);
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    glClearNamedFramebufferfv(m_hdr.fbo, GL_COLOR, 0, black);
+    glViewport(0, 0, tw, th);
+    glBindVertexArray(m_vao);
+}
+
+void Renderer::finishExternal(const Settings& s, float exposureBoost) {
+    stamp(1);
+    postProcess(s, m_hdr.width, m_hdr.height, m_ldr.width, m_ldr.height, exposureBoost);
     glEndQuery(GL_TIME_ELAPSED);
     ++m_queryFrame;
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -807,6 +906,8 @@ void Renderer::hotReload() {
     m_sdoBake.reloadIfChanged();
     m_bloomUp.reloadIfChanged();
     m_tonemap.reloadIfChanged();
+    m_easu.reloadIfChanged();
+    m_rcas.reloadIfChanged();
 }
 
 std::string Renderer::shaderErrors() const {
@@ -814,7 +915,7 @@ std::string Renderer::shaderErrors() const {
     for (const ShaderProgram& p : m_trace) {
         if (!p.error().empty()) all += p.error();
     }
-    for (const ShaderProgram* p : {&m_bloomDown, &m_bloomUp, &m_tonemap}) {
+    for (const ShaderProgram* p : {&m_bloomDown, &m_bloomUp, &m_tonemap, &m_easu, &m_rcas}) {
         if (!p->error().empty()) all += p->error();
     }
     return all;

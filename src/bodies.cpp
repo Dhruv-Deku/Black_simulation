@@ -18,6 +18,10 @@ constexpr int kBackfillSamples = 1400;  // 700 M of past orbit for each new body
 // A tidally stretched star is treated as torn apart once its longest axis reaches
 // this many radii: from there on its pieces are effectively unbound.
 constexpr double kDisruptionStretch = 2.5;
+// The Penrose process: the falling body weighs this much of the hole (enough for the hole's
+// spin-down to show) and throws its fragments off at this speed.
+constexpr double kPenroseMass = 0.02;
+constexpr double kFragmentSpeed = 0.95;
 // Gravity between bodies is softened over this fraction of their radii.
 constexpr double kSoftening = 0.1;
 // A small black hole bends light out to this many times its mass; beyond, the bend
@@ -263,6 +267,11 @@ const std::vector<PresetInfo>& presetList() {
          "A cataclysmic variable: a red dwarf (0.15 solar masses, 0.19 solar radii, 15 times wider than the "
          "white dwarf) so close that it fills its Roche lobe, circling in about two hours. Its gas feeds "
          "the disk.", true, hostBit(Host::WhiteDwarf)},
+        {Preset::Penrose, "Penrose process",
+         "A body falls into the ergosphere of a spinning hole and splits. One piece is thrown backwards, "
+         "against the rotation, so fast that its energy, seen from far away, is negative: it falls in, and the "
+         "other piece flies out with more energy than the whole body had. The energy comes from the hole's "
+         "rotation, which slows. Needs a fast spin (0.9 or more).", false, kHole},
         {Preset::InfallingClump, "Infalling clump",
          "A clump of gas, the debris of an asteroid shredded far out, falls onto the neutron star. It "
          "strikes at half the speed of light and releases a fifth of its rest energy as a flash of X-rays.",
@@ -281,6 +290,7 @@ void BodySystem::clear() {
     events.clear();
     pendingDebris.clear();
     tidalEvents.clear();
+    penroseSplits.clear();
     impacts.clear();
     accreted = 0.0;
     std::fill(std::begin(history.length), std::end(history.length), 0);
@@ -1012,6 +1022,31 @@ void BodySystem::addRealPreset(double spin, Preset preset) {
             break;
         }
 
+        case Preset::Penrose: {
+            // In from far away on a prograde parabolic orbit (E = 1) in the equator, whose
+            // closest approach lies deep in the ergosphere: there, its fall stopped, it splits.
+            const double rp = penrose::splitRadius(spin);
+            double L = 0.0;
+            if (spin < 0.5 || rp >= kerr::ergosphereRadius(spin, kHalfPi) || !penrose::parabolicPeriapsis(spin, rp, L)) {
+                logEvent("The Penrose process needs a fast spin: at this one, nothing falling in comes deep enough "
+                         "into the ergosphere. Raise the spin to 0.9 or more.");
+                break;
+            }
+            Body body;
+            body.name = "Penrose particle";
+            body.kind = BodyKind::Star;
+            body.constants = {1.0, L, 0.0, 1.0};
+            const double r0 = 25.0;
+            body.state = {time, r0, kHalfPi, uni(m_rng) * 6.28,
+                          -std::sqrt(std::max(kerr::radialPotential(spin, body.constants, r0), 0.0)), 0.0};
+            body.mass = kPenroseMass;
+            body.radius = 0.3f;
+            body.temperature = 9000.0f;
+            body.splitRadius = static_cast<float>(kerr::ergosphereRadius(spin, kHalfPi));
+            push(body, spin);
+            break;
+        }
+
         // --- Around a neutron star -------------------------------------------------------------------
         case Preset::InfallingClump: {
             // Nearly radial infall from 40 M: it strikes at ~0.5 c and releases
@@ -1092,7 +1127,7 @@ void BodySystem::drift(double spin, double target) {
     const double rh = kerr::horizonRadius(spin);
     const double limit = kerr::interiorLimit(spin);
     const bool star = surface > 0.0;
-    std::vector<size_t> finished;
+    std::vector<size_t> finished, splitting;
 
     for (size_t i = 0; i < bodies.size(); ++i) {
         Body& b = bodies[i];
@@ -1140,11 +1175,21 @@ void BodySystem::drift(double spin, double target) {
             } else if (!star && b.state.r < rh && !b.inside) {
                 b.inside = true;
                 logEvent(b.name + " crossed the event horizon.");
+                if (b.penroseSplit >= 0 && b.penroseSplit < static_cast<int>(penroseSplits.size())) {
+                    penroseSplits[static_cast<size_t>(b.penroseSplit)].absorbed = true;
+                }
             }
             if (gone) {
                 // Already handled.
             } else if (!star && b.state.r < limit) {
                 gone = true;  // as deep as anything is followed
+                if (spin > 1.0) {
+                    // No horizon: it reached the ring singularity, or passes through its disk to r < 0.
+                    const double c = std::cos(b.state.theta);
+                    logEvent(b.name + (std::abs(c) < 0.1 ? " struck the ring singularity."
+                                                         : " passed through the ring into the region r < 0, where "
+                                                           "gravity repels."));
+                }
             } else if (b.state.r > 3000.0 * scale) {
                 logEvent(b.name + " escaped to infinity.");
                 gone = true;
@@ -1154,11 +1199,75 @@ void BodySystem::drift(double spin, double target) {
             }
             if (gone) break;
             recordTrail(b, spin);
+            // Inside the ergosphere, at its closest approach (where it stops falling).
+            if (b.splitRadius > 0.0f && b.state.r <= b.splitRadius && b.state.vr >= 0.0) {
+                splitting.push_back(i);  // it stops here, at the moment it splits
+                break;
+            }
         }
         if (gone) finished.push_back(i);
-        else b.state.t = target;
+        else if (splitting.empty() || splitting.back() != i) b.state.t = target;
     }
+    // Splits add bodies at the end, so the departures' indices still hold.
+    for (size_t i : splitting) split(i, spin);
     for (auto it = finished.rbegin(); it != finished.rend(); ++it) depart(*it);
+    // The fragments go on from the moment of the split.
+    if (!splitting.empty()) drift(spin, target);
+}
+
+void BodySystem::split(size_t index, double spin) {
+    Body& parent = bodies[index];
+    parent.splitRadius = 0.0f;
+    double v0[3];
+    kerr::zamoVelocity(spin, parent.constants, parent.state, v0);
+    const penrose::Split s =
+        penrose::bestSplit(spin, parent.state.r, parent.state.theta, parent.mass, v0, kFragmentSpeed);
+    if (!s.valid) {
+        logEvent(parent.name + " reached the ergosphere but could not split usefully: " + s.why + ".");
+        return;
+    }
+    const kerr::State at = parent.state;
+    // Fragment 2 is the body itself, lighter now, on its way out.
+    kerr::Constants c2, c1;
+    kerr::State s2, s1;
+    kerr::launchFromZamo(spin, at.r, at.theta, at.phi, s.v2, 1.0, c2, s2);
+    kerr::launchFromZamo(spin, at.r, at.theta, at.phi, s.v1, 1.0, c1, s1);
+    s2.t = s1.t = at.t;
+    parent.constants = c2;
+    parent.state = s2;
+    parent.mass = s.m2;
+    parent.name = "Escaping fragment";
+    parent.temperature = 16000.0f;
+    // Fragment 1, with negative energy, shares the body's past (its history row).
+    Body f1;
+    f1.name = "Negative-energy fragment";
+    f1.kind = BodyKind::Star;
+    f1.constants = c1;
+    f1.state = s1;
+    f1.mass = s.m1;
+    f1.radius = 0.8f * parent.radius;
+    f1.temperature = 2600.0f;
+    f1.seed = parent.seed + 1.0f;
+    f1.trail = parent.trail;
+    f1.penroseSplit = static_cast<int>(penroseSplits.size());
+    const int pastSlot = parent.slot;
+    penroseSplits.push_back(s);
+    if (push(f1, spin)) {
+        Body& added = bodies.back();
+        added.state = s1;
+        const size_t rows = static_cast<size_t>(History::kRows) * History::kColumns;
+        std::copy_n(history.image.begin() + static_cast<std::ptrdiff_t>(rows * pastSlot), rows,
+                    history.image.begin() + static_cast<std::ptrdiff_t>(rows * added.slot));
+        history.length[added.slot] = history.length[pastSlot];
+        history.dirtyRows.push_back(added.slot);
+    }
+    char text[400];
+    std::snprintf(text, sizeof(text),
+                  "Penrose process: the particle split at r = %.3f M, inside the ergosphere. One fragment, thrown "
+                  "against the rotation, has energy %.3f per unit mass (negative, seen from far away) and falls in; "
+                  "the other leaves with %.1f%% more energy than the whole had, taken from the hole's spin.",
+                  s.r, s.E1, 100.0 * s.efficiency);
+    logEvent(text);
 }
 
 void BodySystem::swallowByMiniHoles(double spin) {

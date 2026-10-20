@@ -1,0 +1,141 @@
+#version 460 core
+
+// Accelerations and heating of every particle:
+//   pressure    -sum m_j (P_i / rho_i^2 + P_j / rho_j^2 + Pi_ij) grad W_ij, the kernel
+//               gradient averaged over both smoothing lengths so forces are symmetric;
+//   viscosity   Monaghan's artificial viscosity Pi_ij (alpha = 1, beta = 2) where particles
+//               approach, damped in shear flows by Balsara's switch: it turns the kinetic
+//               energy of colliding streams into heat, as the shocks of a real merger do;
+//   heating     d u_th / dt = (P_th,i / rho_i^2) sum m_j v_ij . grad W + half the viscous
+//               heating (the cold part's compression is carried by its own pressure, so
+//               only the thermal part is evolved);
+//   gravity     every particle pulls every other (Plummer-softened), summed in tiles held
+//               in shared memory; once a black hole forms, it pulls with the
+//               Paczynski-Wiita potential -M / (r - 2M), which has its ISCO at 6M;
+//   reaction    the 2.5PN radiation reaction of the two stars' orbit (sReaction, from the
+//               reduction), shared between the stars by mass so momentum is conserved.
+
+layout(local_size_x = 256) in;
+
+#include "merger_common.glsl"
+
+uniform float uAlpha;
+uniform float uBeta;
+uniform float uSoftening;
+uniform float uGammaTh;
+uniform int uGravity;  // self-gravity on
+
+shared vec4 tile[256];
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    bool inRange = i < uCount;
+    Particle p;
+    if (inRange) p = particles[i];
+    else p.thermo.w = -1.0;
+    bool alive = inRange && p.thermo.w >= 0.0;
+    vec3 x = alive ? p.pos.xyz : vec3(1e30);
+
+    // --- Gravity: all pairs, a tile of 256 at a time -------------------------------------
+    vec3 acc = vec3(0.0);
+    float potential = 0.0;
+    float eps2 = uSoftening * uSoftening;
+    if (uGravity == 1) {
+        for (int base = 0; base < uCount; base += 256) {
+            int j = base + int(gl_LocalInvocationID.x);
+            vec4 q = vec4(0.0);
+            if (j < uCount) {
+                Particle pj = particles[j];
+                q = pj.thermo.w >= 0.0 ? pj.pos : vec4(0.0);
+            }
+            tile[gl_LocalInvocationID.x] = q;
+            barrier();
+            int n = min(256, uCount - base);
+            for (int k = 0; k < n; ++k) {
+                vec4 s = tile[k];
+                vec3 d = s.xyz - x;
+                float r2 = dot(d, d) + eps2;
+                float inv = inversesqrt(r2);
+                float w = s.w * inv;
+                acc += d * (w * inv * inv);
+                potential -= w;
+            }
+            barrier();
+        }
+    }
+    if (!alive) return;
+    // The particle's own term: the softened self-potential -m / eps.
+    potential += p.pos.w / uSoftening;
+
+    // A black hole, once there is one.
+    if (sHole.w > 0.0) {
+        vec3 d = x - sHole.xyz;
+        float r = max(length(d), 2.05 * sHole.w);
+        float rs = 2.0 * sHole.w;
+        acc -= sHole.w * d / (r * (r - rs) * (r - rs));
+        potential -= sHole.w / (r - rs);
+    }
+
+    // Radiation reaction on the two stars' orbit, while they are still two.
+    if (sReaction.w > 0.5 && p.thermo.w <= 1.5) {
+        float m0 = sStar[0].w, m1 = sStar[2].w;
+        float M = m0 + m1;
+        acc += (p.thermo.w < 0.5 ? m1 / M : -m0 / M) * sReaction.xyz;
+    }
+
+    // --- Pressure and viscosity -------------------------------------------------------------
+    vec3 v = p.vel.xyz;
+    float h = p.vel.w;
+    float rhoI = p.thermo.y;
+    float pI = p.thermo.z;
+    vec4 ai = aux[i];
+    float csI = ai.z;
+    float balsaraI = abs(ai.x) / (abs(ai.x) + ai.y + 1e-4 * csI / h);
+    float pOverRho2 = pI / (rhoI * rhoI);
+    float pThOverRho2 = (uGammaTh - 1.0) * max(p.thermo.x, 0.0) / rhoI;
+    vec3 hydro = vec3(0.0);
+    float dudt = 0.0;
+    // As far as its own kernel or its widest neighbour's reaches (from the density pass).
+    float reach = 2.0 * max(h, ai.w);
+    ivec3 c0 = cellOf(x);
+    int kr = int(ceil(reach / uCellSize));
+    for (int dz = -kr; dz <= kr; ++dz)
+        for (int dy = -kr; dy <= kr; ++dy)
+            for (int dx = -kr; dx <= kr; ++dx) {
+                ivec3 c = c0 + ivec3(dx, dy, dz);
+                int j = gridHead[hashCell(c)];
+                while (j >= 0) {
+                    vec4 qp = particles[j].pos;
+                    vec3 d = x - qp.xyz;
+                    float r = length(d);
+                    // The position first: the rest only for real neighbours.
+                    if (j != i && r > 1e-6 && r < reach && cellOf(qp.xyz) == c) {
+                        vec4 qv = particles[j].vel;
+                        float hj = qv.w;
+                        if (r < 2.0 * max(h, hj)) {
+                            vec4 qt = particles[j].thermo;
+                            vec3 g = 0.5 * (kernelDW(r, h) + kernelDW(r, hj)) * d / r;
+                            vec3 dv = v - qv.xyz;
+                            float vr = dot(dv, d);
+                            float rhoJ = qt.y;
+                            float visc = 0.0;
+                            if (vr < 0.0) {
+                                float hm = 0.5 * (h + hj);
+                                float mu = hm * vr / (r * r + 0.01 * hm * hm);
+                                vec4 aj = aux[j];
+                                float balsaraJ = abs(aj.x) / (abs(aj.x) + aj.y + 1e-4 * aj.z / hj);
+                                float cm = 0.5 * (csI + aj.z);
+                                visc = (-uAlpha * cm * mu + uBeta * mu * mu) / (0.5 * (rhoI + rhoJ)) *
+                                       0.5 * (balsaraI + balsaraJ);
+                            }
+                            float mj = qp.w;
+                            hydro -= mj * (pOverRho2 + qt.z / (rhoJ * rhoJ) + visc) * g;
+                            dudt += mj * (pThOverRho2 + 0.5 * visc) * dot(dv, g);
+                        }
+                    }
+                    j = gridNext[j];
+                }
+            }
+    particles[i].acc = vec4(acc + hydro, dudt);
+    particles[i].extra.w = potential;
+}

@@ -3,6 +3,7 @@
 #include "central.h"
 #include "debris.h"
 #include "kerr.h"
+#include "penrose.h"
 #include "tde.h"
 #include "tidal.h"
 
@@ -64,6 +65,11 @@ struct Body {
     tidal::Star shape;            // TidalStar: its deformation (the affine model)
     float maxStretch = 1.0f;      // longest axis reached so far, in radii
     bool inside = false;          // has crossed the event horizon
+    // The Penrose process (src/penrose.h): the body splits at its closest approach if that
+    // is inside this radius (0: never); the fragment with negative energy remembers which
+    // split made it (-1: none).
+    float splitRadius = 0.0f;
+    int penroseSplit = -1;
     int slot = -1;                // row in the light-delay history
     std::deque<glm::vec3> trail;  // recent Cartesian positions, for the orbit map
 };
@@ -155,6 +161,7 @@ enum class Preset {
     WhiteDwarfAsteroid,
     CataclysmicCompanion,
     InfallingClump,
+    Penrose,  // a body splits in the ergosphere: one piece falls in with negative energy
 };
 
 struct PresetInfo {
@@ -214,6 +221,8 @@ public:
     // Every star torn apart so far: when its debris comes back, and what that powers
     // (the flare and the outflow; see tde.h). Newest last.
     std::vector<tde::Event> tidalEvents;
+    // Every Penrose split so far, newest last.
+    std::vector<penrose::Split> penroseSplits;
 
     void clear();
     // Sets the scene scale. If it changed a lot, the history's time step follows it and
@@ -252,6 +261,7 @@ public:
     double boundary(double spin) const;
 
 private:
+    friend struct scene::Access;  // a saved scene carries the state below (src/scene_file.cpp)
     bool push(Body body, double spin);
     // The ZAMO-frame velocity at apoapsis of the orbit between rp and ra (in M), tilted
     // out of the equator by tilt. False if there is none.
@@ -278,6 +288,8 @@ private:
     bool addCompanion(double spin, size_t primary, double mass, double separation, double tiltDeg, BodyKind kind,
                       const std::string& name);
     void disrupt(const Body& body, double spin);
+    // The Penrose process: the body at `index` splits where it is (src/penrose.h).
+    void split(size_t index, double spin);
     // Removes a body that has physically gone, keeping its light in flight.
     void depart(size_t index);
     std::string nextName();

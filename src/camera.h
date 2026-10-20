@@ -4,6 +4,7 @@
 
 #include <glm/glm.hpp>
 
+#include <array>
 #include <string>
 
 enum class CameraMotion {
@@ -40,6 +41,10 @@ struct Camera {
     double scale = 1.0;        // scene scale: how far out the camera may go
     bool landed = false;       // it came down on the surface (cleared by the app once reported)
     double landingSpeed = 0.0; // how fast it was moving, relative to a local static observer
+    // A hovering camera carried along a keyframed path for real (src/keyframes.h): its
+    // velocity relative to the local ZAMO, on the r, theta and phi axes (zero otherwise).
+    // It sees the sky aberrated and Doppler shifted, as a moving camera does.
+    std::array<double, 3> drift{};
 
     // Columns are the camera's right, up and forward axes, written on the frame's
     // spatial axes (which follow r, theta and phi).

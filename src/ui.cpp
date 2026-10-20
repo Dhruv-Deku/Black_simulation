@@ -3,6 +3,7 @@
 #include "blackbody.h"
 #include "central.h"
 #include "kerr.h"
+#include "merger_scene.h"
 #include "renderer.h"
 
 #include <imgui.h>
@@ -95,6 +96,10 @@ void statsSection(UiContext& ctx) {
     const Renderer& r = ctx.renderer;
     ImGui::Text("%.0f fps   GPU %.1f ms   trace %dx%d", ctx.fps, r.gpuMilliseconds(), r.traceWidth(),
                 r.traceHeight());
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("GPU time per pass: ray tracing %.2f ms, bloom %.2f ms, tone map and upscale %.2f ms",
+                          r.traceMilliseconds(), r.bloomMilliseconds(), r.outputMilliseconds());
+    }
     ImGui::TextDisabled("%s", ctx.gpuName);
     ImGui::Text("t = %s", timeText(ctx.settings, ctx.bodies.time).c_str());
     ImGui::SameLine();
@@ -203,6 +208,10 @@ void radiiTable(UiContext& ctx) {
     ImGui::TableHeadersRow();
     auto value = [&](double r) {
         if (r < 0.0) return;
+        if (r == 0.0) {
+            ImGui::TextDisabled("none");
+            return;
+        }
         if (surface > 0.0 && r < surface) ImGui::TextDisabled("%.3f (inside)", r);
         else ImGui::Text("%.3f", r);
     };
@@ -303,7 +312,7 @@ void centralSection(UiContext& ctx) {
     // Spin.
     {
         double chi = o.chi;
-        const double lo = 0.0, hi = o.hasHorizon() ? 0.999 : o.maxChi();
+        const double lo = 0.0, hi = o.hasHorizon() ? (o.naked ? central::kMaxNakedSpin : 0.999) : o.maxChi();
         if (ImGui::SliderScalar(o.hasHorizon() ? "Spin a/M" : "Spin J/M^2", ImGuiDataType_Double, &chi, &lo, &hi, "%.4g",
                                 hi > 5.0 ? ImGuiSliderFlags_Logarithmic : 0)) {
             o.chi = chi;
@@ -312,6 +321,16 @@ void centralSection(UiContext& ctx) {
             help("Angular momentum per unit mass. 0 is a non-rotating (Schwarzschild) hole; values near 1 are extreme "
                  "Kerr holes whose rotation drags space around them. Most astrophysical black holes are thought to "
                  "spin quickly.");
+            if (ImGui::Checkbox("Naked singularity (spin above 1)", &o.naked) && !o.naked) o.chi = std::min(o.chi, 0.999);
+            help("Spun past a = M, the Kerr solution has no horizon: its ring-shaped singularity is naked, in plain view. "
+                 "Light through the ring's disk passes into a second region (r < 0) where gravity repels: shown as a "
+                 "mirrored, violet sky. Light that strikes the ring is drawn white. The shadow opens into an arc.");
+            if (o.naked && o.chi > 1.0) {
+                ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "Hypothetical.");
+                ImGui::SameLine();
+                ImGui::TextWrapped("Cosmic censorship (Penrose 1969) holds that collapse never makes one: matter falling in "
+                                   "cannot spin a hole past a = M, and without a horizon the ergoregion would be unstable.");
+            }
         } else {
             help("c J / (G M^2). Above 1 is normal for planets and ordinary stars (the Earth's is ~890); only black "
                  "holes cannot exceed 1. The slider stops at the mass-shedding limit, where the equator would fly "
@@ -1283,7 +1302,12 @@ void videoSection(UiContext& ctx) {
         help("Ray tracing resolution relative to the video size. Above 1 smooths edges (supersampling) "
              "and takes longer. Recording runs slower than real time if needed; the video still plays "
              "smoothly.");
-        ImGui::Combo("Camera", &ui.videoPath, "As you fly it\0One orbit around the hole\0Slow approach\0");
+        ImGui::Combo("Camera", &ui.videoPath,
+                     "As you fly it\0One orbit around the hole\0Slow approach\0Along the keyframes\0");
+        if (ui.videoPath == RecordKeyframes) {
+            help("The camera follows the path through its keyframes (Camera path, above), and the video lasts as "
+                 "long as the path.");
+        }
         if (ImGui::Button("Record video")) ctx.recordRequested = true;
         ImGui::SameLine();
         ImGui::TextDisabled("saved in videos\\");
@@ -1291,10 +1315,243 @@ void videoSection(UiContext& ctx) {
     if (!ui.videoStatus.empty()) ImGui::TextWrapped("%s", ui.videoStatus.c_str());
 }
 
+void keyframeSection(UiContext& ctx) {
+    if (!ctx.track) return;
+    keyframes::Track& t = *ctx.track;
+    if (ImGui::Button("Add keyframe (K)")) ctx.keyframeRequest = 1;
+    ImGui::SameLine();
+    ImGui::BeginDisabled(t.keys.size() < 2);
+    if (ImGui::Button(t.playing ? "Stop" : "Play")) ctx.keyframeRequest = 2;
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Clear")) {
+        t.keys.clear();
+        t.playing = false;
+        t.rebuild();
+    }
+    help("Put the camera where you want a shot and press K; then the next. Play flies the camera through them on a "
+         "smooth path (a centripetal Catmull-Rom spline at even speed, turning smoothly with squad), slowing to a "
+         "stop where it starts, ends and holds. Record video > Camera > Along the keyframes films it.");
+    ImGui::Checkbox("Keep the center in view", &t.aim);
+    help("Between keyframes the camera turns from one keyframe's view to the next. With this on it keeps facing "
+         "the center instead (still rolling as the keyframes do).");
+    ImGui::Checkbox("Move for real", &t.physical);
+    help("Off: at each point the camera hovers, at rest, as a film camera would (no aberration). On: it moves "
+         "along the path at the speed it covers it in the simulation's time, and sees the sky crowd forward and "
+         "turn blue (relativistic aberration and Doppler shift). Speeds above 0.99 c are capped.");
+    if (!t.status.empty()) ImGui::TextWrapped("%s", t.status.c_str());
+    if (t.keys.empty()) {
+        ImGui::TextDisabled("No keyframes yet.");
+        return;
+    }
+    ImGui::TextDisabled("%zu keyframes, %.1f s", t.keys.size(), t.path.duration());
+    if (t.playing && t.path.duration() > 0.0) {
+        ImGui::ProgressBar(static_cast<float>(t.time / t.path.duration()), ImVec2(-1, 0), "");
+    }
+    bool changed = false;
+    int remove = -1, up = -1;
+    for (size_t i = 0; i < t.keys.size(); ++i) {
+        keyframes::Keyframe& k = t.keys[i];
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::Text("%zu", i + 1);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Go")) ctx.keyframeGo = static_cast<int>(i);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(i == 0);
+        if (ImGui::ArrowButton("##up", ImGuiDir_Up)) up = static_cast<int>(i);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(i + 1 == t.keys.size());
+        if (ImGui::ArrowButton("##down", ImGuiDir_Down)) up = static_cast<int>(i + 1);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) remove = static_cast<int>(i);
+        ImGui::SameLine();
+        float hold = static_cast<float>(k.hold);
+        ImGui::SetNextItemWidth(4.5f * ImGui::GetFontSize());
+        if (ImGui::DragFloat("hold", &hold, 0.05f, 0.0f, 60.0f, "%.1f s")) {
+            k.hold = hold;
+            changed = true;
+        }
+        if (i + 1 < t.keys.size()) {
+            ImGui::SameLine();
+            float duration = static_cast<float>(k.duration);
+            ImGui::SetNextItemWidth(4.5f * ImGui::GetFontSize());
+            if (ImGui::DragFloat("to next", &duration, 0.05f, 0.1f, 120.0f, "%.1f s")) {
+                k.duration = duration;
+                changed = true;
+            }
+        }
+        ImGui::PopID();
+    }
+    if (up > 0) {
+        std::swap(t.keys[static_cast<size_t>(up)], t.keys[static_cast<size_t>(up - 1)]);
+        changed = true;
+    }
+    if (remove >= 0) {
+        t.keys.erase(t.keys.begin() + remove);
+        changed = true;
+    }
+    if (changed) {
+        t.rebuild();
+        if (t.keys.size() < 2) t.playing = false;
+    }
+}
+
+void penroseSection(UiContext& ctx) {
+    Settings& s = ctx.settings;
+    const double a = s.spin;
+    const double rh = kerr::horizonRadius(a), re = kerr::ergosphereRadius(a, 0.5 * kerr::kPi);
+    ImGui::TextWrapped("Inside the ergosphere (here between r = %.3f M and %.3f M in the equator) even light must turn "
+                       "with the hole, and a body thrown against the rotation can have negative energy as seen from "
+                       "far away. A body that splits there can send that piece into the hole and the other out with "
+                       "more energy than it had: the extra comes from the hole's rotation.", rh, re);
+    if (ImGui::Button("Run the Penrose process")) ctx.bodies.addPreset(a, Preset::Penrose);
+    ImGui::SameLine();
+    ImGui::Checkbox("Spin the hole down", &s.penroseSpinDown);
+    help("When the negative-energy piece falls in, the hole's mass changes by m1 E1 and its angular momentum by "
+         "m1 L1, both negative: it slows. (The body is 2% of the hole's mass, so that this shows.)");
+    // What a hole of this spin holds: M_irr = sqrt(A / 16 pi); M - M_irr can be drawn out.
+    const double mirr = penrose::irreducibleMass(1.0, a);
+    ImGui::Text("Irreducible mass %.4f M: %.1f%% of the mass is rotation that could be drawn out", mirr,
+                100.0 * (1.0 - mirr));
+    if (ctx.bodies.penroseSplits.empty()) return;
+    const penrose::Split& p = ctx.bodies.penroseSplits.back();
+    ImGui::SeparatorText("The last split");
+    ImGui::Text("At r = %.3f M (horizon %.3f, ergosphere %.3f)", p.r, rh, re);
+    if (ImGui::BeginTable("##penrose", 4, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("");
+        ImGui::TableSetupColumn("rest mass (M)");
+        ImGui::TableSetupColumn("energy E");
+        ImGui::TableSetupColumn("ang. mom. L");
+        ImGui::TableHeadersRow();
+        const char* names[3] = {"the body", "falls in", "escapes"};
+        const double m[3] = {p.m0, p.m1, p.m2}, E[3] = {p.E0, p.E1, p.E2}, L[3] = {p.L0, p.L1, p.L2};
+        for (int k = 0; k < 3; ++k) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(names[k]);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.5f", m[k]);
+            ImGui::TableNextColumn();
+            if (k == 1) ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.4f, 1.0f), "%+.4f", E[k]);
+            else ImGui::Text("%+.4f", E[k]);
+            ImGui::TableNextColumn();
+            ImGui::Text("%+.4f", L[k]);
+        }
+        ImGui::EndTable();
+    }
+    ImGui::Text("Energy gained: %.3g M, %.1f%% more than the body brought", -p.m1 * p.E1, 100.0 * p.efficiency);
+    help("Per unit rest mass, energy E and angular momentum L are each conserved in total: m0 E0 = m1 E1 + m2 E2. "
+         "With E1 < 0 the escaping piece carries m2 E2 = m0 E0 - m1 E1 > m0 E0. One split at the horizon of a hole "
+         "spinning at the limit gains at most (sqrt 2 - 1) / 2 = 20.7%.");
+    const double after = penrose::spinAfter(p.spinBefore, p), mass = penrose::massAfter(p);
+    const double omegaH = penrose::horizonOmega(1.0, p.spinBefore);
+    ImGui::Text("Hole: M %.4f -> %.4f, a %.4f -> %.4f%s", 1.0, mass, p.spinBefore, after,
+                p.absorbed ? "" : " (once the piece falls in)");
+    ImGui::Text("Area %.3f -> %.3f M^2; irreducible mass %.5f -> %.5f", penrose::horizonArea(1.0, p.spinBefore),
+                penrose::horizonArea(mass, after * mass), penrose::irreducibleMass(1.0, p.spinBefore),
+                penrose::irreducibleMass(mass, after * mass));
+    ImGui::Text("Area theorem: dM - Omega_H dJ = m1 (E1 - Omega_H L1) = %+.3g >= 0",
+                p.m1 * (p.E1 - omegaH * p.L1));
+}
+
+void telescopeSection(UiContext& ctx) {
+    UiState& ui = ctx.state;
+    ImGui::Checkbox("Show what the telescope sees (T)", &ui.ehtOpen);
+    help("The black hole as the Event Horizon Telescope images it: the light of a hot, thick flow (thermal "
+         "synchrotron at 230 GHz), ray traced through the hole's spacetime with radiative transfer, its density set "
+         "so that the total flux matches what is observed, then blurred to the array's resolution. Shown at the real "
+         "angular scale, with the shadow's exact edge and the ring the EHT measured.");
+    ImGui::Combo("Target", &ui.ehtTarget, "M87* (EHT 2019)\0Sagittarius A* (EHT 2022)\0This black hole\0");
+    if (ui.ehtTarget < 2) {
+        ImGui::SliderFloat("Spin##eht", &ui.ehtSpin, 0.0f, 0.998f, "a = %.3f");
+        help("The flow's stable part reaches in to the ISCO: 4.2 M at a = 0.5, 2 M at 0.94. Seen nearly face-on, "
+             "as M87* is, gas that close projects onto the shadow and fills it in this smooth model; with a = 0.5 "
+             "the ring is 42 uas across with a dark center, as the EHT measured. (The turbulent, magnetized flows of "
+             "simulations leave a dark center at high spin too; the image alone hardly tells the spin.)");
+        ImGui::SliderFloat("Inclination##eht", &ui.ehtInclination[ui.ehtTarget], 1.0f, 179.0f, "%.0f deg");
+        help(ui.ehtTarget == 0 ? "Of the spin axis to our line of sight. M87*'s jet says about 17 degrees, its spin "
+                                 "pointing away from us: 163."
+                               : "Of the spin axis to our line of sight. Sgr A*'s image favours a fairly face-on view.");
+    } else {
+        ImGui::TextDisabled("Its own spin, seen from the camera's angle.");
+    }
+    ImGui::Combo("Frequency", &ui.ehtFrequency, "86 GHz\0" "230 GHz (the EHT)\0" "345 GHz\0");
+    const int t = std::clamp(ui.ehtTarget, 0, 2);
+    ImGui::SliderFloat("Electron temperature", &ui.ehtTemperature[t], 3e10f, 3e12f, "%.2g K at r = M",
+                       ImGuiSliderFlags_Logarithmic);
+    help("T_e = T0 (r/M)^-0.84. Hotter electrons glow farther out, widening the ring; cooler ones leave only the "
+         "inner flow and the photon ring.");
+    ImGui::SliderFloat("Plasma beta", &ui.ehtBeta, 1.0f, 100.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
+    ImGui::SliderFloat("Flow thickness", &ui.ehtHeight[t], 0.1f, 1.5f, "H/R = %.2f");
+    help("How puffed up the flow is. A thick one surrounds the hole, and the gas in front of it fills in part of "
+         "the shadow; a thinner one leaves it darker.");
+    ImGui::SliderFloat("Resolution (beam)", &ui.ehtBeam, 5.0f, 40.0f, "%.0f uas");
+    help("The EHT's 2017 array resolves about 20 microarcseconds; the next generation will see finer.");
+    ImGui::Combo("Pixels", &ui.ehtResolution, "96\0" "160\0" "256\0");
+    ImGui::Checkbox("The shadow's edge", &ui.ehtCurve);
+}
+
+void soundSection(UiContext& ctx) {
+    Settings& s = ctx.settings;
+    ImGui::Checkbox("Sound", &s.sound);
+    help("Space carries no sound: this is a film's convention. But every sound here is carried by light: its pitch "
+         "and its rate are multiplied by g, the frequency ratio that colours the light (gravitational redshift and "
+         "Doppler shift), so an approaching star sings sharp and one near the hole drops low. Videos record it too.");
+    if (!s.sound) return;
+    ImGui::SliderFloat("Volume", &s.soundVolume, 0.0f, 1.0f, "%.2f");
+    ImGui::Checkbox("Bodies", &s.soundBodies);
+    ImGui::SameLine();
+    ImGui::Checkbox("Pulsars", &s.soundPulsars);
+    ImGui::SameLine();
+    ImGui::Checkbox("Tide", &s.soundRumble);
+    ImGui::SameLine();
+    ImGui::Checkbox("Waves", &s.soundWaves);
+    help("Bodies: a tone each, pitched by kind and temperature, panned by where they are. Pulsars: a tick each time "
+         "a beam sweeps past. Tide: a roar growing as 1/r^3 near the hole. Waves: heavy bodies (over 0.1% of the "
+         "hole's mass) send out gravitational waves at twice their orbital frequency, raised in pitch to be heard.");
+    if (s.soundWaves && ctx.waveHz > 0.0) {
+        const double hz = ctx.waveHz;
+        if (hz < 1e-3) ImGui::TextDisabled("Loudest wave: %.3g microhertz (LISA's band and below)", hz * 1e6);
+        else if (hz < 1.0) ImGui::TextDisabled("Loudest wave: %.3g millihertz (LISA's band)", hz * 1e3);
+        else ImGui::TextDisabled("Loudest wave: %.3g Hz (LIGO's band)", hz);
+    }
+}
+
+void sceneFileSection(UiContext& ctx) {
+    UiState& ui = ctx.state;
+    if (ImGui::Button("Save (Ctrl+S)")) ctx.sceneFileRequest = 1;
+    ImGui::SameLine();
+    if (ImGui::Button("Save as...")) ctx.sceneFileRequest = 2;
+    ImGui::SameLine();
+    if (ImGui::Button("Open... (Ctrl+O)")) ctx.sceneFileRequest = 3;
+    help("A scene holds everything that decides what happens next: the central object, every setting, the camera "
+         "(on its own path, if it is moving), every body with its orbit, shape and past, the gas, the flashes and "
+         "the random numbers. Opened again, it carries on exactly as it would have. Two files: NAME.bhscene "
+         "(readable text) and NAME.bhscene.bin beside it. You can also drop a scene onto the window.");
+    if (!ui.sceneName.empty()) ImGui::TextDisabled("Scene: %s", ui.sceneName.c_str());
+    if (!ui.sceneStatus.empty()) ImGui::TextWrapped("%s", ui.sceneStatus.c_str());
+}
+
 void renderSection(UiContext& ctx) {
     Settings& s = ctx.settings;
+    ImGui::BeginDisabled(s.dynamicResolution);
     ImGui::SliderFloat("Resolution", &s.renderScale, 0.25f, 2.0f, "%.2f x");
+    ImGui::EndDisabled();
     help("Fraction of the window resolution that is ray traced. Lower is faster; above 1 supersamples.");
+    ImGui::Checkbox("Dynamic resolution", &s.dynamicResolution);
+    help("The traced resolution follows a frame-time target: when frames take longer than it, fewer pixels are "
+         "traced (down to 0.4 of the window's), and more when there is time to spare.");
+    if (s.dynamicResolution) {
+        ImGui::SliderFloat("Frame time", &s.targetMs, 8.0f, 50.0f, "%.1f ms (GPU)");
+    }
+    ImGui::Combo("Upscaling", &s.upscaler, "Bilinear\0FSR 1 (edge-adaptive, sharpened)\0");
+    help("Below full resolution the traced image must be enlarged. FSR 1 (after AMD's FidelityFX Super Resolution) "
+         "enlarges it along its edges rather than across them, then sharpens it without ringing: thin features "
+         "such as the photon ring stay crisp.");
+    if (s.upscaler == 1) ImGui::SliderFloat("Sharpness", &s.sharpness, 0.0f, 2.0f, "%.2f stops below the sharpest");
+    ImGui::TextDisabled("Pass times: hover the GPU readout at the top.");
     ImGui::SliderFloat("Step size", &s.stepSize, 0.01f, 0.15f, "%.3f", ImGuiSliderFlags_Logarithmic);
     help("Integration accuracy: smaller steps trace the strongly bent rays near the photon ring more "
          "precisely, at a higher cost.");
@@ -1653,6 +1910,12 @@ void helpWindow(UiState& ui) {
             "G              toggle the lensing grid\n"
             "Tab            hide or show the interface\n"
             "F12            save a screenshot\n"
+            "Ctrl+S         save the scene (Ctrl+Shift+S: as...)\n"
+            "Ctrl+O         open a scene (or drop one here)\n"
+            "Shift+Space    play the past backwards\n"
+            "[ / ]          one frame back / on (timeline)\n"
+            "K              add a camera keyframe\n"
+            "T              what the Event Horizon Telescope sees\n"
             "Esc            stop recording a video\n"
             "H              this window");
         ImGui::Separator();
@@ -1708,14 +1971,78 @@ void scaleBar(UiContext& ctx) {
     dl->AddText(ImVec2(b.x - width, a.y - 1.5f * em), color, label.c_str());
 }
 
+// The timeline: a bar along the bottom of the window to go back and forth in time.
+void timelineBar(UiContext& ctx) {
+    const UiContext::TimelineView& t = ctx.timeline;
+    if (!t.available) return;
+    const ImVec2 screen = ImGui::GetIO().DisplaySize;
+    const float em = ImGui::GetFontSize();
+    // Centered in the room right of the control panel.
+    const float left = std::clamp(ctx.state.panelRight + em, em, 0.5f * screen.x);
+    const float width = std::min(screen.x - left - em, 52.0f * em);
+    ImGui::SetNextWindowPos(ImVec2(0.5f * (left + screen.x - em), screen.y - 3.6f * em), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+                                   ImGuiWindowFlags_NoFocusOnAppearing;
+    if (ImGui::Begin("##timeline", nullptr, flags)) {
+        if (ImGui::Button("|<")) ctx.timelineCommand = 4;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("To the start");
+        ImGui::SameLine();
+        if (ImGui::Button("[")) ctx.timelineCommand = 5;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("One frame back ([)");
+        ImGui::SameLine();
+        if (ImGui::Button(t.reverse ? " || ##back" : " << ")) ctx.timelineCommand = 2;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Play backwards (Shift+Space)");
+        ImGui::SameLine();
+        if (ImGui::Button(t.playing && !t.reverse ? " || " : " > ")) ctx.timelineCommand = 1;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Play or pause (Space)");
+        ImGui::SameLine();
+        if (ImGui::Button("]")) ctx.timelineCommand = 6;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("One frame on (])");
+        ImGui::SameLine();
+        if (t.live) {
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "LIVE");
+        } else if (ImGui::Button("Live")) {
+            ctx.timelineCommand = 3;
+        }
+        if (!t.live && ImGui::IsItemHovered()) ImGui::SetTooltip("Back to the present");
+        ImGui::SameLine();
+        // Times as far back as the timeline reaches; the slider moves through them.
+        float value = static_cast<float>(t.time);
+        char label[96];
+        const double behind = t.end - t.time;
+        if (behind > 0.0) std::snprintf(label, sizeof(label), "t = %.5g M  (%.4g M ago)", t.time, behind);
+        else std::snprintf(label, sizeof(label), "t = %.5g M", t.time);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::SliderFloat("##time", &value, static_cast<float>(t.start), static_cast<float>(std::max(t.end, t.start + 1e-6)),
+                               label, ImGuiSliderFlags_NoInput)) {
+            ctx.timelineSeekRequested = true;
+            ctx.timelineSeekTime = value;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Drag to go back and forth in time. Everything since t = %.5g M can be replayed exactly "
+                              "(%zu checkpoints, %.0f MB + %.0f MB of gas on the GPU). Changing anything in the "
+                              "past starts a new future from there.",
+                              t.start, t.checkpoints, t.megabytes, t.gpuMegabytes);
+        }
+    }
+    ImGui::End();
+}
+
 void drawUi(UiContext& ctx) {
     UiState& ui = ctx.state;
     helpWindow(ui);
-    inspectorWindow(ctx);
-    scaleBar(ctx);
+    const bool mergerScene = ctx.merger && ctx.merger->active();
+    if (!mergerScene && !ui.ehtOpen) {
+        inspectorWindow(ctx);
+        scaleBar(ctx);
+    }
     if (!ui.showPanel) {
         ui.plannerOpen = false;
-        if (ui.showOrbitMap) orbitMap(ctx);
+        if (ui.showOrbitMap && !mergerScene && !ui.ehtOpen) orbitMap(ctx);
         return;
     }
 
@@ -1723,10 +2050,25 @@ void drawUi(UiContext& ctx) {
     ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(24.0f * em, ImGui::GetIO().DisplaySize.y - 24), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Black Hole Simulator")) {
+        ui.panelRight = ImGui::GetWindowPos().x + ImGui::GetWindowSize().x;
         ImGui::PushItemWidth(-9.5f * em);  // leave room for labels
-        statsSection(ctx);
+        const bool merging = ctx.merger && ctx.merger->active();
+        if (!merging) statsSection(ctx);
+        if (ctx.merger) {
+            // The merger has a scene of its own: while it runs, only what applies to it shows.
+            if (merging) ImGui::SetNextItemOpen(true);
+            if (ImGui::CollapsingHeader("Neutron star merger")) ctx.mergerRequest = ctx.merger->drawControls(ctx.camera);
+        }
+        if (merging) {
+            if (ImGui::CollapsingHeader("Record video", ImGuiTreeNodeFlags_DefaultOpen)) videoSection(ctx);
+            if (ImGui::CollapsingHeader("Rendering")) renderSection(ctx);
+            ImGui::PopItemWidth();
+            ImGui::End();
+            return;
+        }
         if (ImGui::CollapsingHeader("Central object", ImGuiTreeNodeFlags_DefaultOpen)) centralSection(ctx);
         if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) cameraSection(ctx);
+        if (ImGui::CollapsingHeader("Camera path (keyframes)")) keyframeSection(ctx);
         if (ImGui::CollapsingHeader("Accretion disk and jets", ImGuiTreeNodeFlags_DefaultOpen)) diskSection(ctx);
         ui.plannerOpen = false;
         if (ImGui::CollapsingHeader("Objects and orbits", ImGuiTreeNodeFlags_DefaultOpen)) objectsSection(ctx);
@@ -1738,6 +2080,10 @@ void drawUi(UiContext& ctx) {
             if (ImGui::CollapsingHeader("Tidal disruption flare")) flareSection(ctx);
         }
         if (ImGui::CollapsingHeader("Record video")) videoSection(ctx);
+        if (ctx.settings.central.hasHorizon() && ImGui::CollapsingHeader("Penrose process")) penroseSection(ctx);
+        if (ImGui::CollapsingHeader("What the telescope sees (EHT)")) telescopeSection(ctx);
+        if (ImGui::CollapsingHeader("Sound")) soundSection(ctx);
+        if (ImGui::CollapsingHeader("Save and open scenes")) sceneFileSection(ctx);
         if (ImGui::CollapsingHeader("Sky")) skySection(ctx);
         if (ImGui::CollapsingHeader("Rendering")) renderSection(ctx);
         ImGui::Separator();
@@ -1757,5 +2103,6 @@ void drawUi(UiContext& ctx) {
         ImGui::PopItemWidth();
     }
     ImGui::End();
-    if (ui.showOrbitMap) orbitMap(ctx);
+    if (ui.showOrbitMap && !ui.ehtOpen) orbitMap(ctx);
+    if (ui.showTimeline) timelineBar(ctx);
 }

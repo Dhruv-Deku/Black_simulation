@@ -108,10 +108,26 @@ struct Settings {
     int tonemapper = 0;  // 0 = ACES, 1 = Reinhard, 2 = linear clamp
     int debugView = 0;   // 0 = off, 1 = step count heat map
     bool vsync = true;
+    // Traced below the window's resolution, the image is enlarged with FSR 1 (an
+    // edge-adaptive upscale, then contrast-adaptive sharpening) instead of bilinearly.
+    int upscaler = 1;            // 0 = bilinear, 1 = FSR 1
+    float sharpness = 0.25f;     // RCAS, in stops below the sharpest
+    // The resolution follows a frame-time target: scale *= (target / measured)^(1/2), smoothed.
+    bool dynamicResolution = false;
+    float targetMs = 16.7f;
 
     // Simulation
     float timeScale = 15.0f;  // M of coordinate time per real second
+    bool penroseSpinDown = true;  // a Penrose split's negative-energy fragment spins the hole down
     bool paused = false;
+
+    // Sound (src/scene_sound.h): off by default, and quiet when on.
+    bool sound = false;
+    float soundVolume = 0.5f;
+    bool soundBodies = true;    // a tone for each body
+    bool soundPulsars = true;   // pulsars' clicks
+    bool soundRumble = true;    // the roar of the tide near the hole
+    bool soundWaves = true;     // gravitational waves of heavy bodies, raised in pitch
 
     // Tools
     bool rayInspector = true;  // Ctrl+click or middle-click traces the light reaching a pixel

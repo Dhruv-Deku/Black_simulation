@@ -151,7 +151,7 @@ const char* kindName(Kind kind) {
 }
 
 double Object::metricSpin() const {
-    if (hasHorizon()) return std::clamp(chi, 0.0, 0.999);
+    if (hasHorizon()) return std::clamp(chi, 0.0, naked ? kMaxNakedSpin : 0.999);
     return std::clamp(chi, 0.0, 0.99);
 }
 
@@ -162,6 +162,7 @@ double Object::boundaryRadius() const {
 double Object::surfaceOmega() const {
     if (hasHorizon()) {
         const double a = metricSpin();
+        if (a > 1.0) return 0.0;  // no horizon to turn
         return a / (2.0 * kerr::horizonRadius(a));
     }
     // J = I Omega with J = chi M^2 (M = 1), never faster than mass shedding allows.
@@ -508,6 +509,84 @@ double innerLagrangeFraction(double q) {
         (force(mid) < 0.0 ? lo : hi) = mid;
     }
     return 0.5 * (lo + hi);
+}
+
+double rochePotential(double q, double x, double y, double z) {
+    const double mu1 = 1.0 / (1.0 + q), mu2 = q / (1.0 + q);
+    const double r1 = std::sqrt(x * x + y * y + z * z);
+    const double r2 = std::sqrt((x - 1.0) * (x - 1.0) + y * y + z * z);
+    return -mu1 / r1 - mu2 / r2 - 0.5 * ((x - mu2) * (x - mu2) + y * y);
+}
+
+std::array<double, 3> rocheGradient(double q, double x, double y, double z) {
+    const double mu1 = 1.0 / (1.0 + q), mu2 = q / (1.0 + q);
+    const double r1 = std::sqrt(x * x + y * y + z * z);
+    const double r2 = std::sqrt((x - 1.0) * (x - 1.0) + y * y + z * z);
+    const double k1 = mu1 / (r1 * r1 * r1), k2 = mu2 / (r2 * r2 * r2);
+    return {k1 * x + k2 * (x - 1.0) - (x - mu2), k1 * y + k2 * y - y, k1 * z + k2 * z};
+}
+
+double rocheLobeReach(double q, double dx, double dy, double dz) {
+    const double n = std::sqrt(dx * dx + dy * dy + dz * dz);
+    dx /= n;
+    dy /= n;
+    dz /= n;
+    const double xL1 = innerLagrangeFraction(q);
+    const double surface = rochePotential(q, xL1, 0.0, 0.0);
+    // The potential climbs from -infinity at M2 to the lobe's surface; step out to the
+    // first point at or above it (never past L1's plane), then bisect.
+    const double step = 0.01 * (1.0 - xL1);
+    auto inside = [&](double s) {
+        const double x = 1.0 + s * dx;
+        return x > xL1 && rochePotential(q, x, s * dy, s * dz) < surface;
+    };
+    double lo = 0.0, hi = step;
+    while (inside(hi) && hi < 2.0) {
+        lo = hi;
+        hi += step;
+    }
+    for (int k = 0; k < 60; ++k) {
+        const double mid = 0.5 * (lo + hi);
+        (inside(mid) ? lo : hi) = mid;
+    }
+    return 0.5 * (lo + hi);
+}
+
+double rocheLobeVolume(double q) {
+    // V = (1/3) integral of reach^3 over solid angle, by Gauss-Legendre in cos(theta) (the
+    // polar axis toward M1, where the lobe is sharpest) and the midpoint rule in azimuth.
+    constexpr int kTheta = 48, kPhi = 48;
+    std::vector<double> nodes(kTheta), weights(kTheta);
+    for (int i = 0; i < kTheta; ++i) {
+        // Legendre roots by Newton's method from the Chebyshev guess.
+        double x = std::cos(kerr::kPi * (i + 0.75) / (kTheta + 0.5));
+        double dp = 1.0;
+        for (int it = 0; it < 100; ++it) {
+            double p0 = 1.0, p1 = x;
+            for (int k = 2; k <= kTheta; ++k) {
+                const double p2 = ((2.0 * k - 1.0) * x * p1 - (k - 1.0) * p0) / k;
+                p0 = p1;
+                p1 = p2;
+            }
+            dp = kTheta * (x * p1 - p0) / (x * x - 1.0);
+            const double dx = p1 / dp;
+            x -= dx;
+            if (std::abs(dx) < 1e-15) break;
+        }
+        nodes[static_cast<size_t>(i)] = x;
+        weights[static_cast<size_t>(i)] = 2.0 / ((1.0 - x * x) * dp * dp);
+    }
+    double volume = 0.0;
+    for (int i = 0; i < kTheta; ++i) {
+        const double ct = nodes[static_cast<size_t>(i)], st = std::sqrt(1.0 - ct * ct);
+        for (int j = 0; j < kPhi; ++j) {
+            const double ph = 2.0 * kerr::kPi * (j + 0.5) / kPhi;
+            // Polar axis toward M1 (-x).
+            const double reach = rocheLobeReach(q, -ct, st * std::cos(ph), st * std::sin(ph));
+            volume += weights[static_cast<size_t>(i)] * (2.0 * kerr::kPi / kPhi) * reach * reach * reach / 3.0;
+        }
+    }
+    return volume;
 }
 
 double tidalTruncationFraction(double q) {

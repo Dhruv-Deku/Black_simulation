@@ -1,0 +1,25 @@
+#version 460 core
+
+// The merger's neighbour grid: stage 0 empties the hash table, stage 1 threads every
+// particle onto the list of its cell.
+
+layout(local_size_x = 256) in;
+
+#include "merger_common.glsl"
+
+uniform int uStage;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (uStage == 0) {
+        if (i <= uHashMask) gridHead[i] = -1;
+        return;
+    }
+    if (i >= uCount) return;
+    if (particles[i].thermo.w < 0.0) {
+        gridNext[i] = -1;
+        return;
+    }
+    int cell = hashCell(cellOf(particles[i].pos.xyz));
+    gridNext[i] = atomicExchange(gridHead[cell], i);
+}

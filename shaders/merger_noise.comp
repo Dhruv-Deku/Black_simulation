@@ -1,0 +1,66 @@
+#version 460 core
+
+// Noise for the merger's clouds (shaders/merger_view.frag), baked once at the start into a
+// 128^3 texture that repeats every texture width, so the ray marcher reads it with one
+// filtered lookup instead of summing octaves of noise at every step:
+//   r  fractal gradient noise, 4 cells across the texture and four octaves (billows)
+//   g  ridged noise, the same (the crests of plumes)
+//   b  smooth fractal noise, 2 cells across and three octaves (to warp the others)
+//   a  another, independent
+// All in about [-1, 1] (ridged: [0, 1]).
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+layout(binding = 0, rgba16f) uniform writeonly image3D uOut;
+
+#include "noise.glsl"
+
+// Gradient noise on a lattice that wraps every `period` cells.
+float tiledGradient(vec3 p, float period, float seed) {
+    vec3 i = floor(p);
+    vec3 f = p - i;
+    vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float n[8];
+    for (int k = 0; k < 8; ++k) {
+        vec3 o = vec3(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+        vec3 g = hash33(mod(i + o, period) + seed) * 2.0 - 1.0;
+        n[k] = dot(g, f - o);
+    }
+    return 1.6 * mix(mix(mix(n[0], n[1], u.x), mix(n[2], n[3], u.x), u.y),
+                     mix(mix(n[4], n[5], u.x), mix(n[6], n[7], u.x), u.y), u.z);
+}
+
+float tiledFbm(vec3 x, float cells, int octaves, float seed) {
+    float sum = 0.0;
+    float amplitude = 0.5;
+    for (int o = 0; o < octaves; ++o) {
+        sum += amplitude * tiledGradient(x * cells, cells, seed + 37.1 * float(o));
+        cells *= 2.0;
+        amplitude *= 0.5;
+    }
+    return sum;
+}
+
+float tiledRidged(vec3 x, float cells, int octaves, float seed) {
+    float sum = 0.0;
+    float amplitude = 0.5;
+    float weight = 1.0;
+    for (int o = 0; o < octaves; ++o) {
+        float n = 1.0 - abs(tiledGradient(x * cells, cells, seed + 53.7 * float(o)));
+        n *= n * weight;
+        weight = clamp(n * 1.5, 0.0, 1.0);
+        sum += amplitude * n;
+        cells *= 2.0;
+        amplitude *= 0.5;
+    }
+    return sum;
+}
+
+void main() {
+    ivec3 size = imageSize(uOut);
+    ivec3 id = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(id, size))) return;
+    vec3 x = (vec3(id) + 0.5) / vec3(size);
+    vec4 v = vec4(tiledFbm(x, 4.0, 4, 11.0), tiledRidged(x, 4.0, 4, 271.0), tiledFbm(x, 2.0, 3, 523.0),
+                  tiledFbm(x, 2.0, 3, 811.0));
+    imageStore(uOut, id, v);
+}

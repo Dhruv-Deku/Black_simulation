@@ -1,0 +1,58 @@
+#version 460 core
+
+// Moves the merger's particles: kick-drift-kick leapfrog, with the step dt the reduction
+// chose (sStep.x).
+//   stage 0  half kick and drift: v += a dt/2, u_th += du dt/2, x += v dt
+//   stage 1  half kick with the new forces; parcels that reach the black hole are swallowed;
+//            the clock advances
+//   stage 2  the stars carried whole along their inspiral (before the hydrodynamics starts):
+//            each parcel at its star's centre plus where it sits in the star
+//   stage 3  stage 1 with damping, to settle freshly built stars into equilibrium
+
+layout(local_size_x = 256) in;
+
+#include "merger_common.glsl"
+
+uniform int uStage;
+uniform vec3 uCenter[2];    // stage 2: the stars' centres
+uniform vec3 uVelocity[2];  // ... and velocities
+uniform float uRadius;      // the stars' radius (labels are in radii)
+uniform float uDamping;     // stage 3: fraction of the velocity kept per step
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i == 0 && (uStage == 1 || uStage == 3)) {
+        sTime += double(sStep.x);
+        sStep.z += 1.0;
+    }
+    if (i >= uCount) return;
+    Particle p = particles[i];
+    if (p.thermo.w < 0.0) return;
+    float dt = sStep.x;
+    if (uStage == 0) {
+        p.vel.xyz += 0.5 * dt * p.acc.xyz;
+        p.thermo.x = max(p.thermo.x + 0.5 * dt * p.acc.w, 0.0);
+        p.pos.xyz += dt * p.vel.xyz;
+    } else if (uStage == 1 || uStage == 3) {
+        p.vel.xyz += 0.5 * dt * p.acc.xyz;
+        p.thermo.x = max(p.thermo.x + 0.5 * dt * p.acc.w, 0.0);
+        if (uStage == 3) {
+            p.vel.xyz *= uDamping;
+            p.thermo.x = 0.0;
+        }
+        if (sHole.w > 0.0) {
+            // Swallowed inside the Paczynski-Wiita marginally bound orbit's neighbourhood.
+            vec3 d = p.pos.xyz - sHole.xyz;
+            if (dot(d, d) < 2.5 * 2.5 * sHole.w * sHole.w) {
+                p.thermo.w = -1.0;
+                atomicAdd(sCounters.y, 1);
+            }
+        }
+    } else if (uStage == 2) {
+        int star = p.thermo.w < 0.5 ? 0 : 1;
+        p.pos.xyz = uCenter[star] + p.extra.xyz * uRadius;
+        p.vel.xyz = uVelocity[star];
+        p.acc.xyz = vec3(0.0);
+    }
+    particles[i] = p;
+}

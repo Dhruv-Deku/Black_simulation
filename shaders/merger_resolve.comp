@@ -1,0 +1,71 @@
+#version 460 core
+
+// Turns the fixed-point sums of merger_deposit.comp into textures:
+//   stage 0  the 3D grid, lightly smoothed (1-2-1 in each direction) into
+//            uVolumeA = (log10 density in g/cm^3, log10 temperature, label x, label y) and
+//            uVolumeB = (velocity, label z), mass-weighted averages;
+//   stage 1  the 2D map into (log10 column density in g/cm^2, log10 temperature).
+
+#include "merger_common.glsl"
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(std430, binding = 6) buffer Cells {
+    int cells[];
+};
+
+layout(rgba16f, binding = 0) uniform writeonly image3D uVolumeA;
+layout(rgba16f, binding = 1) uniform writeonly image3D uVolumeB;
+layout(rg32f, binding = 2) uniform writeonly image2D uMap;
+
+uniform int uStage;
+uniform int uBoxDims;
+uniform float uBoxCell;
+uniform int uMapDims;
+uniform float uMapCell;
+uniform float uMassRef;
+uniform float uDensityUnit;  // g/cm^3 per (mass unit / length unit^3)
+uniform float uColumnUnit;   // g/cm^2 per (mass unit / length unit^2)
+
+const float kFixed = 16384.0;
+
+void main() {
+    if (uStage == 0) {
+        ivec3 c = ivec3(gl_GlobalInvocationID);
+        if (any(greaterThanEqual(c, ivec3(uBoxDims)))) return;
+        float s[8];
+        for (int k = 0; k < 8; ++k) s[k] = 0.0;
+        float weights = 0.0;
+        for (int z = -1; z <= 1; ++z)
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x) {
+                    ivec3 cc = clamp(c + ivec3(x, y, z), ivec3(0), ivec3(uBoxDims - 1));
+                    float w = float((2 - abs(x)) * (2 - abs(y)) * (2 - abs(z)));
+                    int base = 8 * ((cc.z * uBoxDims + cc.y) * uBoxDims + cc.x);
+                    for (int k = 0; k < 8; ++k) s[k] += w * float(cells[base + k]);
+                    weights += w;
+                }
+        for (int k = 0; k < 8; ++k) s[k] /= weights * kFixed;
+        float m = s[0];
+        float logRho = -30.0;
+        vec4 a = vec4(logRho, 6.0, 0.0, 0.0), b = vec4(0.0);
+        if (m > 1e-6) {
+            float rho = m * uMassRef / (uBoxCell * uBoxCell * uBoxCell) * uDensityUnit;
+            a = vec4(log(rho) / log(10.0), s[1] / m, s[5] / m, s[6] / m);
+            b = vec4(s[2] / m, s[3] / m, s[4] / m, s[7] / m);
+        }
+        imageStore(uVolumeA, c, a);
+        imageStore(uVolumeB, c, b);
+    } else {
+        ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+        if (gl_GlobalInvocationID.z != 0u || any(greaterThanEqual(c, ivec2(uMapDims)))) return;
+        int base = 2 * (c.y * uMapDims + c.x);
+        float m = float(cells[base]) / kFixed;
+        float logSigma = -30.0, logT = 6.0;
+        if (m > 1e-7) {
+            logSigma = log(m * uMassRef / (uMapCell * uMapCell) * uColumnUnit) / log(10.0);
+            logT = float(cells[base + 1]) / kFixed / m;
+        }
+        imageStore(uMap, c, vec4(logSigma, logT, 0.0, 0.0));
+    }
+}

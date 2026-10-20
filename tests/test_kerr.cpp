@@ -3,19 +3,30 @@
 #include "bodies.h"
 #include "central.h"
 #include "debris.h"
+#include "eht.h"
 #include "gravity.h"
+#include "json.h"
 #include "kerr.h"
+#include "keyframes.h"
+#include "merger.h"
+#include "penrose.h"
+#include "scene_file.h"
 #include "surface.h"
 #include "tde.h"
 #include "tidal.h"
+#include "timeline.h"
 #include "trajectory.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
+#include <thread>
 
 using namespace kerr;
 
@@ -1289,6 +1300,41 @@ static void testCloseBinary() {
           "the stream bends ahead of the companion and stops at the disk's rim (0.48 a for q = 0.25)");
 }
 
+// The shape of a star filling its Roche lobe (the white dwarf's companion is drawn as it).
+static void testRocheLobe() {
+    // The potential's gradient (minus the effective gravity) against finite differences.
+    const double q = 0.25, x = 0.7, y = 0.12, z = 0.05, h = 1e-6;
+    const auto g = central::rocheGradient(q, x, y, z);
+    auto phi = [&](double a, double b, double c) { return central::rochePotential(q, a, b, c); };
+    const double fx = (phi(x + h, y, z) - phi(x - h, y, z)) / (2.0 * h);
+    const double fy = (phi(x, y + h, z) - phi(x, y - h, z)) / (2.0 * h);
+    const double fz = (phi(x, y, z + h) - phi(x, y, z - h)) / (2.0 * h);
+    truth(std::abs(g[0] - fx) < 1e-6 && std::abs(g[1] - fy) < 1e-6 && std::abs(g[2] - fz) < 1e-6,
+          "the Roche potential's gradient is its derivative");
+    double force = 0.0, worst = 0.0, reachL1 = 0.0;
+    bool teardrop = true;
+    for (double qq : {0.1, 0.25, 1.0, 3.0}) {
+        // No net force at L1 (a saddle of the potential).
+        const double xL = central::innerLagrangeFraction(qq);
+        force = std::max(force, std::abs(central::rocheGradient(qq, xL, 0.0, 0.0)[0]));
+        // Eggleton (1983): the radius of a sphere of the lobe's volume is his fit's to 1%.
+        const double rv = std::cbrt(3.0 * central::rocheLobeVolume(qq) / (4.0 * kerr::kPi));
+        worst = std::max(worst, std::abs(rv / central::rocheLobeFraction(qq) - 1.0));
+        // It reaches L1 toward the other star, and is a teardrop: shortest to the pole, wider
+        // along the orbit, longer behind, longest toward L1 (Kopal 1959).
+        const double point = central::rocheLobeReach(qq, -1.0, 0.0, 0.0);
+        reachL1 = std::max(reachL1, std::abs(point - (1.0 - xL)));
+        const double pole = central::rocheLobeReach(qq, 0.0, 0.0, 1.0);
+        const double side = central::rocheLobeReach(qq, 0.0, 1.0, 0.0);
+        const double back = central::rocheLobeReach(qq, 1.0, 0.0, 0.0);
+        teardrop = teardrop && pole < side && side < back && back < point;
+    }
+    truth(force < 1e-9, "no net force at L1");
+    near(worst, 0.0, 0.01, "Eggleton's radius matches the Roche lobe's volume to 1% (q = 0.1 to 3)");
+    near(reachL1, 0.0, 1e-3, "a lobe-filling star reaches L1");
+    truth(teardrop, "the lobe is a teardrop: pole < side < back < point (q = 0.1 to 3)");
+}
+
 static void testRealWorld() {
     using central::Host;
     const auto& cat = central::catalog();
@@ -1672,6 +1718,794 @@ static void testTidalFlare() {
     }
 }
 
+static void testMerger() {
+    using namespace merger;
+    using merger::kPi;
+    // GW170817: two stars of ~1.365 Suns have a chirp mass of 1.188 Suns, and their chirp
+    // took ~100 s to sweep up from 24 Hz to the merger.
+    near(chirpMass(1.365, 1.365), 1.1883, 1e-3, "GW170817 chirp mass 1.188 Suns");
+    near(chirpFrequency(101.0 / kSecond, chirpMass(1.365, 1.365)) / kSecond, 24.0, 0.5,
+         "GW170817 was at 24 Hz ~100 s before the merger");
+    {
+        // The Peters time and the chirp agree: f = 2 f_orbit = sqrt(M / a^3) / pi.
+        const double a = 40.0, m = 1.35;
+        near(chirpFrequency(coalescenceTime(a, m, m), chirpMass(m, m)) / (std::sqrt(2 * m / (a * a * a)) / kPi), 1.0,
+             1e-9, "chirp frequency = twice the Kepler frequency at the Peters separation");
+        near(separationAfter(a, 0.5 * coalescenceTime(a, m, m), m, m), a * std::pow(0.5, 0.25), 1e-9,
+             "a(t) = a0 (1 - t/T)^(1/4)");
+    }
+    {
+        // The 2.5PN reaction force drains a circular orbit at Peters' rate, and integrating
+        // it (with Newtonian gravity) reproduces his inspiral time.
+        const double m1 = 1.35, m2 = 1.25, M = m1 + m2, mu = m1 * m2 / M;
+        const double a0 = 40.0;
+        glm::dvec3 x(a0, 0, 0), v(0, std::sqrt(M / a0), 0);
+        near(mu * glm::dot(v, radiationReaction(x, v, m1, m2)) / -gwLuminosity(a0, m1, m2), 1.0, 1e-12,
+             "radiation reaction loses energy at the quadrupole rate");
+        auto accel = [&](const glm::dvec3& p, const glm::dvec3& w) {
+            const double r = glm::length(p);
+            return -M * p / (r * r * r) + radiationReaction(p, w, m1, m2);
+        };
+        double t = 0.0;
+        while (glm::length(x) > 12.0) {
+            const double r = glm::length(x);
+            const double h = 0.002 * std::sqrt(r * r * r / M);
+            const glm::dvec3 k1x = v, k1v = accel(x, v);
+            const glm::dvec3 k2x = v + 0.5 * h * k1v, k2v = accel(x + 0.5 * h * k1x, v + 0.5 * h * k1v);
+            const glm::dvec3 k3x = v + 0.5 * h * k2v, k3v = accel(x + 0.5 * h * k2x, v + 0.5 * h * k2v);
+            const glm::dvec3 k4x = v + h * k3v, k4v = accel(x + h * k3x, v + h * k3v);
+            x += h / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x);
+            v += h / 6.0 * (k1v + 2.0 * k2v + 2.0 * k3v + k4v);
+            t += h;
+        }
+        const double peters = coalescenceTime(a0, m1, m2) - coalescenceTime(12.0, m1, m2);
+        near(t / peters, 1.0, 0.01, "integrated inspiral from 40 M to 12 M takes Peters' time");
+    }
+    {
+        // Quadrupole waves of a circular binary: amplitude 4 mu M / (a D) face-on, half that
+        // in h+ (and no hx) edge-on.
+        const double m1 = 1.4, m2 = 1.2, M = m1 + m2, mu = m1 * m2 / M, a = 30.0, D = 1e6;
+        const double w = std::sqrt(M / (a * a * a));
+        for (double phase : {0.0, 0.7, 2.1}) {
+            const glm::dvec3 n(std::cos(phase), std::sin(phase), 0.0);
+            const glm::dvec3 t(-n.y, n.x, 0.0);
+            std::vector<glm::dvec3> xs = {m2 / M * a * n, -m1 / M * a * n};
+            std::vector<glm::dvec3> vs = {m2 / M * a * w * t, -m1 / M * a * w * t};
+            std::vector<glm::dvec3> as = {-m2 / M * a * w * w * n, m1 / M * a * w * w * n};
+            const auto I = quadrupoleSecondDerivative(xs, vs, as, {m1, m2});
+            const Strain faceOn = strain(I, glm::dvec3(0, 0, 1), D);
+            near(std::hypot(faceOn.plus, faceOn.cross) / (4.0 * mu * M / (a * D)), 1.0, 1e-9,
+                 "face-on strain 4 mu M / (a D)");
+            const Strain edgeOn = strain(I, glm::dvec3(0, 1, 0), D);
+            near(edgeOn.cross * D, 0.0, 1e-9, "edge-on: no cross polarization");
+            near(std::abs(edgeOn.plus) / (2.0 * mu * M / (a * D) * std::abs(std::cos(2.0 * phase))), 1.0, 1e-9,
+                 "edge-on: h+ at half the face-on amplitude");
+        }
+    }
+    {
+        // An n = 1 polytrope of 1.35 Suns and 12 km: central density 1.2e15 g/cm^3, in
+        // hydrostatic equilibrium, dP/dr = -rho m / r^2.
+        const double M = 1.35, R = 12.0 / kKm;
+        near(polytropeCentralDensity(M, R) * kGramsPerCc / 1.22e15, 1.0, 0.01, "central density 1.2e15 g/cc");
+        near(polytropeEnclosed(M, R, R), M, 1e-12, "the polytrope's mass");
+        const double K = polytropeK(R), r = 0.5 * R, dr = 1e-5;
+        const double dP = K * (std::pow(polytropeDensity(M, R, r + dr), 2) - std::pow(polytropeDensity(M, R, r - dr), 2)) /
+                          (2 * dr);
+        near(dP / (-polytropeDensity(M, R, r) * polytropeEnclosed(M, R, r) / (r * r)), 1.0, 1e-6,
+             "polytrope in hydrostatic equilibrium");
+        const auto ps = starParticles(5000, R);
+        near(static_cast<double>(ps.size()), 5000.0, 0.0, "star built from exactly n particles");
+        double rMax = 0.0;
+        int inner = 0;
+        for (const auto& p : ps) {
+            rMax = std::max(rMax, glm::length(p));
+            if (glm::length(p) < 0.5 * R) ++inner;
+        }
+        truth(rMax < R, "particles inside the star");
+        near(inner / 5000.0, polytropeEnclosed(1.0, R, 0.5 * R), 2e-3, "particles follow the polytrope's mass profile");
+        near(temperatureFromThermalEnergy(thermalEnergyFromTemperature(3e10)), 3e10, 1.0, "temperature round trip");
+        // 10 MeV ~ 1.16e11 K is u_th ~ 0.016 for an ideal nucleon gas.
+        near(thermalEnergyFromTemperature(1.1605e11), 1.5 * 10.0 / 939.565, 1e-4, "kT = 10 MeV");
+    }
+    {
+        // Collapse: a cold ball falls in whole; a Keplerian ring far out stays behind.
+        std::vector<glm::dvec3> x, v;
+        std::vector<double> m, phi;
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<double> u(-1.0, 1.0);
+        while (x.size() < 2000) {
+            glm::dvec3 p(u(rng), u(rng), u(rng));
+            if (glm::dot(p, p) > 1.0) continue;
+            x.push_back(4.0 * p);
+            v.push_back(glm::dvec3(0.0));
+            m.push_back(2.5 / 2000.0);
+            phi.push_back(-1.0);
+        }
+        for (int k = 0; k < 200; ++k) {
+            const double ang = 2.0 * kPi * k / 200.0, r = 40.0, vc = std::sqrt(2.5 / r);
+            x.push_back({r * std::cos(ang), r * std::sin(ang), 0.0});
+            v.push_back({-vc * std::sin(ang), vc * std::cos(ang), 0.0});
+            m.push_back(0.1 / 200.0);
+            phi.push_back(-2.5 / r);
+        }
+        std::vector<bool> alive(x.size(), true), swallowed;
+        const BlackHole bh = collapse(x, v, m, phi, alive, glm::dvec3(0.0), swallowed);
+        near(bh.mass, 2.5, 1e-9, "the cold ball collapses whole");
+        near(bh.diskMass, 0.1, 1e-9, "the ring at 40 M stays out as a disk");
+        near(bh.spin, 0.0, 1e-9, "a non-rotating ball makes a non-rotating hole");
+    }
+    {
+        // Ringdown (Berti et al. 2006): M omega = 0.3737 for Schwarzschild; a 2.6-Sun hole
+        // of spin 0.7 rings at ~6.6 kHz.
+        near(ringdown(1.0, 0.0).omega, 0.3737, 0.01, "Schwarzschild l=m=2 QNM frequency");
+        near(ringdown(1.0, 0.0).tau, 11.24, 0.6, "Schwarzschild QNM damping time ~11 M");
+        near(ringdown(2.6, 0.7).omega / (2 * kPi) / kSecond / 1000.0, 6.65, 0.1, "2.6 Suns, chi 0.7: rings at 6.6 kHz");
+        near(horizonRadius(2.0, 0.0), 4.0, 1e-12, "Schwarzschild horizon 2M");
+    }
+    {
+        // r-process heating ~2e10 erg/g/s a day after the merger (Korobkin et al. 2012;
+        // Metzger et al. 2010), falling as t^-1.3.
+        near(rProcessHeating(kDay) / 2.0e10, 1.0, 0.1, "r-process heating 2e10 erg/g/s at 1 day");
+        near(std::log(rProcessHeating(10 * kDay) / rProcessHeating(kDay)) / std::log(10.0), -1.3, 0.01,
+             "heating falls as t^-1.3");
+        const auto ej = gw170817Ejecta();
+        const Kilonova blue(ej[0]), red(ej[2]);
+        truth(blue.peakTime() > 0.3 * kDay && blue.peakTime() < 2.0 * kDay, "blue kilonova peaks within ~a day");
+        truth(red.peakTime() > blue.peakTime(), "the red component peaks later");
+        double total = 0.0;
+        for (const auto& c : ej) total += Kilonova(c).luminosity(kDay);
+        truth(total > 2e41 && total < 3e42, "AT2017gfo: ~5e41 erg/s a day after the merger");
+        truth(blue.temperature(0.5 * kDay) > 6000.0, "blue component hot at half a day");
+        near(red.temperature(10 * kDay), 3745.0, 1.0, "red photosphere held at its floor late on");
+    }
+    {
+        // The debris cloud the collision throws out: at 0.3 c its edge is 90 km further out
+        // each millisecond; it cools adiabatically as 1 / R (radiation dominated) and its
+        // column thins as 1 / R^2; a few thousandths of a Sun are opaque for hours even to
+        // electron scattering alone.
+        const DebrisCloud cloud;
+        near(debrisRadiusKm(cloud, 0.0), cloud.launchKm, 1e-12, "the cloud starts at the stars' surface");
+        near(debrisRadiusKm(cloud, 1e-3) - debrisRadiusKm(cloud, 0.0), 89.94, 0.01, "0.3 c: 90 km per ms");
+        near(debrisTemperature(cloud, 1e-3) * debrisRadiusKm(cloud, 1e-3), cloud.launchTemperature * cloud.launchKm,
+             1e-3 * cloud.launchTemperature * cloud.launchKm, "T R stays constant as it expands");
+        near(debrisOpticalDepth(cloud, 2e-3) / debrisOpticalDepth(cloud, 1e-2),
+             std::pow(debrisRadiusKm(cloud, 1e-2) / debrisRadiusKm(cloud, 2e-3), 2.0), 1e-9,
+             "its optical depth falls as 1 / R^2");
+        truth(debrisOpticalDepth(cloud, 1e-3) > 1e12, "a millisecond after the merger it is utterly opaque");
+        truth(debrisOpticalDepth(cloud, 3600.0) > 100.0, "still opaque an hour later");
+    }
+    {
+        // GRB 170817A: gamma-rays 1.7 s after the merger, from a jet that broke out of the
+        // ejecta; a jet core seen 25 degrees off-axis is de-boosted ~10 times below 1.
+        near(breakoutTime(Jet{}, kEjectaEdge * kBluePolarStretch * gw170817Ejecta()[0].velocity), 1.7, 0.02,
+             "jet breaks out of the ejecta 1.7 s after the merger");
+        near(dopplerFactor(100.0, 0.0), 2.0 * 100.0, 0.02 * 200.0, "on-axis Doppler factor ~2 Gamma");
+        truth(dopplerFactor(100.0, 25.0 * kPi / 180.0) < 0.15, "seen off-axis the core is de-boosted");
+        const Tempo tp;
+        near(tempo(tp, -1.0, 0.02, 1.7), tp.inspiralRate, 1e-12, "one second before: 0.32 s per s");
+        near(tempo(tp, -1e-7, 0.02, 1.7), tp.mergerRate, 1e-12, "at the merger: slow motion");
+    }
+}
+
+// --- Saving and loading scenes (src/scene_file.h, src/json.h) ---------------------------
+
+// A scene as the scene file writes it.
+static std::string sceneText(const Settings& settings, const Camera& camera, const BodySystem& bodies,
+                             std::vector<char>* binary = nullptr) {
+    scene::Blob blob;
+    const std::string text = json::dump(scene::save(settings, camera, bodies, blob));
+    if (binary) *binary = blob.serialize();
+    return text;
+}
+
+static void testSceneFile() {
+    {
+        // Numbers come back bit for bit, the hard ones included (the smallest denormal,
+        // the largest double, a negative zero; floats in their own shortest form).
+        const double doubles[] = {0.1, 1.0 / 3.0, 5e-324, 1.7976931348623157e308, -2.5e-310, 6.02214076e23, -0.0,
+                                  kPi};
+        const float floats[] = {0.1f, 0.05f, 1e-45f, 3.4028235e38f, 15.0f, 6500.0f, 0.94f};
+        json::Value list = json::Value::array();
+        for (double d : doubles) list.push(json::Value::number(d));
+        for (float f : floats) list.push(json::Value::number(f));
+        list.push(json::Value::number(INFINITY));
+        list.push(json::Value::number(-INFINITY));
+        list.push(json::Value::number(NAN));
+        const std::string odd = "quote \" backslash \\ line\nbreak, tab\t, \xC3\xA9, \xE2\x9C\x93, \x01";
+        list.push(json::Value::string(odd));
+        json::Value back;
+        std::string error;
+        const bool parsed = json::parse(json::dump(list), back, error);
+        truth(parsed, "JSON: what is written parses");
+        bool exact = parsed && back.size() == list.size();
+        size_t i = 0;
+        for (double d : doubles) {
+            double x = 1.0;
+            exact = exact && back[i++].get(x) && std::memcmp(&x, &d, sizeof d) == 0;
+        }
+        for (float f : floats) {
+            float x = 1.0f;
+            exact = exact && back[i++].get(x) && std::memcmp(&x, &f, sizeof f) == 0;
+        }
+        truth(exact, "JSON: doubles and floats come back bit for bit");
+        double inf = 0.0, minusInf = 0.0, nan = 0.0;
+        truth(parsed && back[i].get(inf) && back[i + 1].get(minusInf) && back[i + 2].get(nan) && inf == INFINITY &&
+                  minusInf == -INFINITY && std::isnan(nan),
+              "JSON: infinities and NaN survive (as strings)");
+        std::string text;
+        truth(parsed && back[i + 3].get(text) && text == odd, "JSON: escapes and UTF-8 survive");
+        json::Value bad;
+        const bool refused = !json::parse("{\n  \"a\": [1, 2,\n}", bad, error);
+        truth(refused && error.find("line 3") != std::string::npos, "JSON: a malformed file is refused, with its line");
+        truth(!json::parse("[1e999]", bad, error), "JSON: an out-of-range number is refused");
+    }
+
+    // A scene with everything in it: a star on its way to being torn apart, a binary, a
+    // precessing orbit, bodies pulling on each other, a camera falling in.
+    const double spin = 0.7;
+    Settings settings;
+    settings.central.chi = spin;
+    settings.spin = static_cast<float>(spin);
+    settings.diskOuter = 17.3f;
+    settings.timeScale = 33.3f;
+    settings.debrisFilaments = true;
+    Camera camera;
+    camera.motion = CameraMotion::FreeFall;
+    {
+        const double v[3] = {-0.1, 0.02, 0.05};
+        launchFromZamo(spin, 30.0, 1.2, 0.4, v, 1.0, camera.geodesic, camera.path);
+        camera.r = camera.path.r;
+        camera.theta = camera.path.theta;
+        camera.phi = camera.path.phi;
+        camera.properTime = 3.25;
+    }
+    BodySystem original;
+    original.addPreset(spin, Preset::TidalDisruption);
+    original.addPreset(spin, Preset::BinaryStar);
+    original.addPreset(spin, Preset::Precessing);
+    auto runFor = [&](BodySystem& b, int steps) {
+        for (int k = 0; k < steps; ++k) {
+            b.setFrameTime(1.0, spin);
+            b.update(spin, 1.0, true);
+            b.pendingDebris.clear();  // the app hands these to the GPU every frame
+        }
+    };
+    runFor(original, 450);
+    truth(!original.tidalEvents.empty() && !original.departed.empty(), "test scene: the star has been torn apart");
+
+    std::vector<char> binary1;
+    const std::string text1 = sceneText(settings, camera, original, &binary1);
+    json::Value root;
+    scene::Blob blob;
+    std::string error;
+    const bool read = json::parse(text1, root, error) && blob.deserialize(binary1, error);
+    Settings settings2;
+    Camera camera2;
+    BodySystem copy;
+    const bool loaded = read && scene::load(root, blob, settings2, camera2, copy, error);
+    truth(loaded, "scene: loads what was saved");
+    std::vector<char> binary2;
+    const std::string text2 = sceneText(settings2, camera2, copy, &binary2);
+    truth(text1 == text2 && binary1 == binary2, "scene: save, load, save gives identical files");
+
+    // ... and it runs on exactly as the original does, random numbers included.
+    runFor(original, 150);
+    runFor(copy, 150);
+    original.addPreset(spin, Preset::Cluster);
+    copy.addPreset(spin, Preset::Cluster);
+    runFor(original, 50);
+    runFor(copy, 50);
+    std::vector<char> after1, after2;
+    truth(sceneText(settings, camera, original, &after1) == sceneText(settings2, camera2, copy, &after2) &&
+              after1 == after2,
+          "scene: the loaded copy evolves bit for bit like the original");
+
+    // Through files on disk; a sidecar that does not match is caught.
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "bh_test_scene.bhscene";
+    const bool wrote = scene::writeFiles(path, root, blob, error);
+    json::Value root3;
+    scene::Blob blob3;
+    const bool reread = wrote && scene::readFiles(path, root3, blob3, error);
+    truth(reread && blob3.serialize() == binary1, "scene: written to disk and read back");
+    {
+        std::fstream f(scene::sidecarPath(path), std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(100);
+        f.put('\x7f');
+    }
+    truth(!scene::readFiles(path, root3, blob3, error) && error.find("does not belong") != std::string::npos,
+          "scene: a changed sidecar is refused");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(scene::sidecarPath(path), ec);
+
+    // A bad value is refused, says where it is, and changes nothing.
+    {
+        std::string broken = text1;
+        const size_t at = broken.find("\"kind\": 0");
+        broken.replace(at, 9, "\"kind\": 99");
+        json::Value badRoot;
+        Settings untouched;
+        untouched.diskOuter = 5.0f;
+        Camera cam;
+        BodySystem bodies;
+        const bool parsedBroken = json::parse(broken, badRoot, error);
+        const bool refused = parsedBroken && !scene::load(badRoot, blob, untouched, cam, bodies, error);
+        truth(refused && error.find("settings.central.kind") != std::string::npos && untouched.diskOuter == 5.0f &&
+                  bodies.bodies.empty(),
+              "scene: an impossible value is refused, with where it is, and nothing changes");
+        std::string newer = text1;
+        newer.replace(newer.find("\"version\": 1"), 12, "\"version\": 99");
+        truth(json::parse(newer, badRoot, error) && !scene::load(badRoot, blob, untouched, cam, bodies, error) &&
+                  error.find("newer") != std::string::npos,
+              "scene: a file from a newer version is refused");
+    }
+}
+
+// --- The timeline (src/timeline.h) ------------------------------------------------------
+
+static void testTimeline() {
+    // A scene of bodies pulling on each other, stepped by frames of uneven length (as
+    // real frames are), with checkpoints every 25 M and the user adding bodies at step 150.
+    const double spin = 0.6;
+    const Settings settings{};
+    const Camera camera{};
+    auto frameDt = [](size_t i) { return 0.6 + 0.35 * std::sin(0.37 * static_cast<double>(i)); };
+    auto stepScene = [&](BodySystem& b, double dt) {
+        b.setFrameTime(dt, spin);
+        b.update(spin, dt, true);
+        b.pendingDebris.clear();
+    };
+    auto checkpointOf = [&](const BodySystem& b, bool pinned) {
+        Timeline::Checkpoint c;
+        c.pinned = pinned;
+        c.scene = sceneText(settings, camera, b);
+        scene::Blob blob;
+        scene::save(settings, camera, b, blob);
+        c.blob = blob;
+        return c;
+    };
+    auto restore = [&](const Timeline::Checkpoint& c, BodySystem& b) {
+        json::Value root;
+        std::string error;
+        Settings s;
+        Camera cam;
+        return json::parse(c.scene, root, error) && scene::load(root, c.blob, s, cam, b, error);
+    };
+    const size_t kSteps = 400, kAction = 150;
+    BodySystem live;
+    live.addPreset(spin, Preset::BinaryStar);
+    live.addPreset(spin, Preset::PlanetWithMoon);
+    Timeline timeline;
+    timeline.addCheckpoint(checkpointOf(live, true), live.time);
+    std::vector<std::string> expected(kSteps + 1);  // the scene after every step, for comparison
+    expected[0] = sceneText(settings, camera, live);
+    for (size_t i = 0; i < kSteps; ++i) {
+        if (i == kAction) {
+            live.addPreset(spin, Preset::Precessing);
+            timeline.addCheckpoint(checkpointOf(live, true), live.time);
+            expected[i] = sceneText(settings, camera, live);
+        }
+        const double dt = frameDt(i);
+        stepScene(live, dt);
+        timeline.addStep({dt, 1.0f / 60.0f, {}}, live.time);
+        expected[i + 1] = sceneText(settings, camera, live);
+        if (live.time - timeline.lastCheckpointTime() >= 25.0) timeline.addCheckpoint(checkpointOf(live, false), live.time);
+    }
+
+    // Seeking: restore the checkpoint before, replay the logged steps.
+    auto seek = [&](size_t target, BodySystem& b) {
+        const Timeline::Checkpoint& c = timeline.checkpointFor(target);
+        if (!restore(c, b)) return false;
+        for (size_t i = c.step; i < target; ++i) stepScene(b, timeline.step(i).dt);
+        timeline.setPosition(target);
+        return true;
+    };
+    bool exact = true;
+    for (size_t target : {size_t(0), size_t(37), size_t(149), size_t(150), size_t(151), size_t(288), kSteps}) {
+        BodySystem b;
+        exact = exact && seek(target, b) && sceneText(settings, camera, b) == expected[target];
+    }
+    truth(exact, "timeline: any moment, restored and replayed, is the scene as it was, bit for bit");
+    truth(timeline.checkpointFor(kAction + 1).step >= kAction && timeline.checkpointFor(kAction).step == kAction,
+          "timeline: no replay runs across what the user did");
+    const size_t at = timeline.positionAt(137.3);
+    truth(timeline.timeAt(at) <= 137.3 && timeline.timeAt(at + 1) > 137.3, "timeline: finds the frame at a time");
+    truth(timeline.positionAt(-5.0) == 0 && timeline.positionAt(1e9) == kSteps, "timeline: times outside it clamp");
+
+    // Thinning keeps the first, the latest and the pinned checkpoints, and seeking stays exact.
+    const size_t before = timeline.checkpointCount();
+    timeline.thin(timeline.bytes() / 2, ~size_t(0));
+    bool kept = timeline.checkpointCount() < before && timeline.checkpointFor(0).step == 0 &&
+                timeline.checkpointFor(kSteps).step > kSteps - 60 && timeline.checkpointFor(kAction).step == kAction;
+    truth(kept, "timeline: thinning keeps the first, the latest and the pinned checkpoints");
+    exact = true;
+    for (size_t target : {size_t(99), size_t(222), size_t(371)}) {
+        BodySystem b;
+        exact = exact && seek(target, b) && sceneText(settings, camera, b) == expected[target];
+    }
+    truth(exact, "timeline: after thinning, still bit for bit");
+
+    // A new future from the past: what came after is dropped, and recording goes on.
+    {
+        BodySystem b;
+        seek(200, b);
+        timeline.truncate();
+        truth(timeline.atEnd() && timeline.length() == 200 && timeline.lastCheckpointTime() <= timeline.end(),
+              "timeline: a new future drops the old one");
+        stepScene(b, 0.5);
+        timeline.addStep({0.5, 1.0f / 60.0f, {}}, b.time);
+        truth(timeline.length() == 201 && timeline.end() == b.time, "timeline: and records on from there");
+    }
+}
+
+// --- Camera keyframes (src/keyframes.h) -------------------------------------------------
+
+static void testKeyframes() {
+    using namespace keyframes;
+    const double spin = 0.9;
+    // Five shots around the hole, near and far, turned every way, with a hold at the third.
+    std::vector<Keyframe> keys;
+    const double place[5][7] = {
+        // r, theta, phi, yaw, pitch, roll, fov
+        {40.0, 1.40, 0.0, 0.0, 0.0, 0.0, 60.0},  {25.0, 1.10, 1.2, 0.3, -0.2, 0.1, 50.0},
+        {12.0, 1.55, 2.6, -0.4, 0.1, -0.3, 70.0}, {30.0, 0.60, 4.0, 1.2, 0.5, 0.0, 40.0},
+        {60.0, 1.30, 5.5, 0.0, -0.1, 0.4, 65.0},
+    };
+    bool cameraRoundTrip = true;
+    for (int i = 0; i < 5; ++i) {
+        Camera c;
+        c.r = place[i][0];
+        c.theta = place[i][1];
+        c.phi = place[i][2];
+        c.yaw = static_cast<float>(place[i][3]);
+        c.pitch = static_cast<float>(place[i][4]);
+        c.roll = static_cast<float>(place[i][5]);
+        c.fovDeg = static_cast<float>(place[i][6]);
+        Keyframe k = fromCamera(c, spin);
+        k.duration = 3.0 + i;
+        k.hold = i == 2 ? 1.5 : 0.0;
+        keys.push_back(k);
+        Pose pose;
+        pose.position = k.position;
+        pose.orientation = k.orientation;
+        pose.fovDeg = k.fovDeg;
+        Camera back;
+        applyPose(pose, spin, 1.0, back);
+        cameraRoundTrip = cameraRoundTrip && std::abs(back.r - c.r) < 1e-9 && std::abs(back.theta - c.theta) < 1e-9 &&
+                          std::abs(std::remainder(back.phi - c.phi, 2.0 * kPi)) < 1e-9 &&
+                          std::abs(back.yaw - c.yaw) < 1e-5f && std::abs(back.pitch - c.pitch) < 1e-5f &&
+                          std::abs(back.roll - c.roll) < 1e-5f && back.fovDeg == c.fovDeg;
+    }
+    truth(cameraRoundTrip, "keyframes: a camera's place and view, as a keyframe and back");
+
+    Path path;
+    path.build(keys);
+    // The spline passes through every keyframe, and the camera is there when due.
+    double worst = 0.0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        worst = std::max(worst, glm::length(path.at(path.arrival(i)).position - keys[i].position));
+        if (i + 1 < keys.size()) {
+            worst = std::max(worst, glm::length(path.curve(i, 0.0) - keys[i].position));
+            worst = std::max(worst, glm::length(path.curve(i, 1.0) - keys[i + 1].position));
+        }
+    }
+    near(worst, 0.0, 1e-9, "keyframes: the spline passes through every keyframe");
+    bool turned = true, zoomed = true;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const Pose p = path.at(path.arrival(i));
+        turned = turned && std::abs(std::abs(glm::dot(p.orientation, keys[i].orientation)) - 1.0) < 1e-9;
+        zoomed = zoomed && std::abs(p.fovDeg - keys[i].fovDeg) < 1e-9;
+    }
+    truth(turned && zoomed, "keyframes: the camera faces each keyframe's way, at its field of view");
+    // Reparametrized by arc length, the camera moves evenly along each segment.
+    double spread = 0.0;
+    for (size_t i = 0; i < path.segments(); ++i) {
+        const int n = 200;
+        const double step = path.segmentLength(i) / n;
+        for (int k = 0; k < n; ++k) {
+            const double d = glm::length(path.evenly(i, (k + 1.0) / n) - path.evenly(i, static_cast<double>(k) / n));
+            spread = std::max(spread, std::abs(d / step - 1.0));
+        }
+    }
+    near(spread, 0.0, 0.01, "keyframes: arc-length speed varies by under 1%");
+    // At rest at the start, through the hold and at the end; the distance never runs back.
+    const Pose start = path.at(0.0), end = path.at(path.duration());
+    const Pose held = path.at(path.arrival(2) + 0.7);
+    bool still = glm::length(start.velocity) < 1e-9 && glm::length(end.velocity) < 1e-9 &&
+                 glm::length(held.velocity) < 1e-9 && glm::length(held.position - keys[2].position) < 1e-9;
+    truth(still, "keyframes: at rest at the start, while holding and at the end");
+    bool onward = true;
+    glm::dvec3 last = path.at(0.0).position;
+    double travelled = 0.0;
+    for (double t = 0.01; t <= path.duration(); t += 0.01) {
+        const Pose p = path.at(t);
+        travelled += glm::length(p.position - last);
+        last = p.position;
+        onward = onward && glm::dot(p.velocity, path.at(t + 1e-4).position - p.position) >= -1e-12;
+    }
+    double length = 0.0;
+    for (size_t i = 0; i < path.segments(); ++i) length += path.segmentLength(i);
+    truth(onward && std::abs(travelled / length - 1.0) < 1e-3, "keyframes: the camera never turns back along the path");
+    // Squad turns smoothly through a keyframe: the rate of turning just before and just
+    // after it is the same (C1), where linking slerps would jump.
+    {
+        const double t = path.arrival(1), h = 1e-4;
+        const glm::dquat a = path.at(t - h).orientation, b = path.at(t).orientation, c = path.at(t + h).orientation;
+        auto turn = [](const glm::dquat& x, const glm::dquat& y) {
+            const glm::dquat d = glm::conjugate(x) * (glm::dot(x, y) < 0.0 ? -y : y);
+            return glm::dvec3(d.x, d.y, d.z) * 2.0;
+        };
+        const glm::dvec3 before = turn(a, b) / h, after = turn(b, c) / h;
+        near(glm::length(after - before) / std::max(glm::length(before), 1e-9), 0.0, 0.02,
+             "keyframes: the camera turns smoothly through a keyframe (squad)");
+    }
+    // The ZAMO's own speed: a path that moves with the frame dragging is at rest in it.
+    {
+        bool capped = false;
+        const glm::dvec3 p(8.0, 0.0, 0.0);
+        const auto rtp = fromCartesian(spin, p.x, p.y, p.z);
+        const double omega = metricAt(spin, rtp[0], rtp[1]).omega;
+        const glm::dvec3 v = zamoVelocity(p, omega * glm::dvec3(-p.y, p.x, 0.0), spin, 0.99, capped);
+        const glm::dvec3 fast = zamoVelocity(glm::dvec3(500.0, 0.0, 0.0), glm::dvec3(0.0, 3.0, 0.0), spin, 0.99, capped);
+        truth(glm::length(v) < 1e-12 && capped && std::abs(glm::length(fast) - 0.99) < 1e-12,
+              "keyframes: dragged with the ZAMO is at rest; faster than light is capped");
+    }
+    // Saved and read back.
+    std::vector<Keyframe> back;
+    const bool read = fromJson(toJson(keys), back) && back.size() == keys.size();
+    bool same = read;
+    for (size_t i = 0; same && i < keys.size(); ++i) {
+        same = back[i].position == keys[i].position && back[i].orientation == keys[i].orientation &&
+               back[i].fovDeg == keys[i].fovDeg && back[i].duration == keys[i].duration && back[i].hold == keys[i].hold;
+    }
+    truth(same, "keyframes: saved and read back bit for bit");
+}
+
+// --- What the Event Horizon Telescope sees (src/eht.h) --------------------------------------
+
+static void testEht() {
+    using namespace eht;
+    const Target& m87 = targets()[0];
+    const Target& sgra = targets()[1];
+    // theta_g = G M / (c^2 D).
+    near(angularScale(m87.massSolar, m87.distancePc), 3.82, 0.01, "EHT: M of M87* subtends 3.82 uas");
+    near(angularScale(sgra.massSolar, sgra.distancePc), 5.13, 0.01, "EHT: M of Sgr A* subtends 5.13 uas");
+    // The shadow of a hole without spin: 2 sqrt(27) M across.
+    const std::vector<Point> circle = criticalCurve(0.0, 1.0, 3600);
+    near(2.0 * criticalRadius(circle, 0.3), 2.0 * std::sqrt(27.0), 1e-4, "EHT: shadow 2 sqrt(27) M across at a = 0");
+    near(2.0 * std::sqrt(27.0) * angularScale(m87.massSolar, m87.distancePc), 39.7, 0.1,
+         "EHT: M87*'s shadow is 39.7 uas (the ring: 42 +- 3)");
+    near(2.0 * std::sqrt(27.0) * angularScale(sgra.massSolar, sgra.distancePc), 53.3, 0.1,
+         "EHT: Sgr A*'s shadow is 53.3 uas (the ring: 51.8 +- 2.3)");
+
+    // The traced shadow's edge against the critical curve: a = 0.9 seen 17 degrees from the
+    // axis, and a = 0 (bisecting along rays from the center of the image).
+    auto edge = [](const View& cam, double psi) {
+        double lo = 1.0, hi = 12.0;  // falls in at lo, escapes at hi
+        for (int k = 0; k < 30; ++k) {
+            const double mid = 0.5 * (lo + hi);
+            const bool in = traceRay(cam, Flow{}, mid * std::cos(psi), mid * std::sin(psi), false).captured;
+            (in ? lo : hi) = mid;
+        }
+        return 0.5 * (lo + hi);
+    };
+    double worst = 0.0;
+    for (const auto& [a, deg] : {std::pair{0.9, 17.0}, std::pair{0.9, 60.0}, std::pair{0.0, 40.0}}) {
+        View cam;
+        cam.a = a;
+        cam.inclination = deg * kPi / 180.0;
+        const std::vector<Point> curve = criticalCurve(a, cam.inclination, 400);
+        for (int k = 0; k < 8; ++k) {
+            const double psi = 2.0 * kPi * (k + 0.25) / 8.0;
+            const double want = criticalRadius(curve, psi);
+            worst = std::max(worst, std::abs(edge(cam, psi) / want - 1.0));
+        }
+    }
+    near(worst, 0.0, 2e-3, "EHT: the traced shadow follows the critical curve (a = 0.9 at 17 and 60 deg, a = 0)");
+
+    // Synchrotron pieces.
+    near(besselK2(1.0) / 1.6248388986351774, 1.0, 1e-5, "EHT: K2(1)");
+    near(besselK2(0.5) / 7.5501835512408695, 1.0, 1e-5, "EHT: K2(0.5)");
+    near(besselK2(10.0) / 2.1509817006932767e-05, 1.0, 1e-5, "EHT: K2(10)");
+    near(besselK2(1.0 / 50.0) / (2.0 * 50.0 * 50.0), 1.0, 1e-3, "EHT: K2(1/theta) -> 2 theta^2 for hot electrons");
+    near(brightnessTemperature(planck(230e9, 1e10), 230e9) / 1e10, 1.0, 1e-3,
+         "EHT: a blackbody's brightness temperature is its temperature (Rayleigh-Jeans)");
+    {
+        // Doubling the density doubles the emissivity; the spectrum peaks near nu_s and
+        // falls as exp(-X^1/3) far above it.
+        const double j1 = synchrotronEmissivity(230e9, 1e5, 10.0, 10.0, 0.8);
+        const double j2 = synchrotronEmissivity(230e9, 2e5, 10.0, 10.0, 0.8);
+        const double far = synchrotronEmissivity(230e13, 1e5, 10.0, 10.0, 0.8);
+        truth(std::abs(j2 / j1 - 2.0) < 1e-12 && far < 1e-10 * j1, "EHT: synchrotron emissivity scales with density, cuts off above nu_s");
+    }
+
+    // An image: calibrated to the observed flux, the approaching side brighter.
+    {
+        const int threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+        View cam;
+        cam.a = 0.9;
+        cam.inclination = 60.0 * kPi / 180.0;
+        cam.size = 40;
+        cam.massSolar = m87.massSolar;
+        Flow flow;
+        const double thetaG = angularScale(m87.massSolar, m87.distancePc);
+        flow.n0 = calibrate(cam, flow, m87.flux, thetaG, threads);
+        cam.size = 48;
+        const Image image = render(cam, flow, threads);
+        near(flux(image, thetaG) / m87.flux, 1.0, 0.08, "EHT: calibrated to M87*'s 0.5 Jy at 230 GHz");
+        double left = 0.0, right = 0.0;
+        for (int y = 0; y < image.size; ++y) {
+            for (int x = 0; x < image.size; ++x) (x < image.size / 2 ? left : right) += image.intensity[static_cast<size_t>(y) * image.size + x];
+        }
+        // Bardeen's alpha (L = -alpha sin i): gas coming toward us is on the left.
+        truth(left > 1.5 * right, "EHT: the side of the flow coming toward us is the brighter (Doppler beaming)");
+        int shadowPixels = 0;
+        for (unsigned char c : image.shadow) shadowPixels += c;
+        const double shadowArea = shadowPixels * image.pixel() * image.pixel();
+        const double curveArea = [&] {
+            const std::vector<Point> curve = criticalCurve(cam.a, cam.inclination, 400);
+            double area = 0.0;
+            for (size_t k = 0; k < curve.size(); ++k) {
+                const Point& p = curve[k];
+                const Point& q = curve[(k + 1) % curve.size()];
+                area += 0.5 * (p.alpha * q.beta - q.alpha * p.beta);
+            }
+            return std::abs(area);
+        }();
+        near(shadowArea / curveArea, 1.0, 0.05, "EHT: the image's shadow has the critical curve's area");
+    }
+}
+
+// --- The Penrose process (src/penrose.h) ---------------------------------------------------------
+
+static void testPenrose() {
+    using namespace penrose;
+    const double a = 0.99;
+    const double rh = horizonRadius(a), re = ergosphereRadius(a, kPi / 2);
+    // E = gamma (alpha + omega varpi v_phi) and L = gamma varpi v_phi agree with the ZAMO launch.
+    {
+        const double v[3] = {-0.3, 0.1, -0.5};
+        Constants c;
+        State st;
+        launchFromZamo(a, 1.6, 1.4, 0.0, v, 1.0, c, st);
+        const Zamo z = penrose::zamoAt(a, 1.6, 1.4);
+        const Momentum p = momentum(1.0, v);
+        near(energy(z, p), c.E, 1e-12, "Penrose: ZAMO-frame energy matches the geodesic's E");
+        near(angularMomentum(z, p), c.L, 1e-12, "Penrose: ZAMO-frame angular momentum matches L");
+    }
+    // A body falling from rest far away (E0 = 1, L0 = 0), at r inside and just outside the ergosphere.
+    auto fallingVelocity = [&](double r, double v0[3]) {
+        Constants c{1.0, 0.0, 0.0, 1.0};
+        State st{0.0, r, kPi / 2, 0.0, -std::sqrt(radialPotential(a, c, r)), 0.0};
+        zamoVelocity(a, c, st, v0);
+    };
+    double v0[3];
+    fallingVelocity(re * 1.05, v0);
+    truth(!bestSplit(a, re * 1.05, kPi / 2, 1.0, v0, 0.95).valid,
+          "Penrose: outside the ergosphere nothing can have negative energy");
+    // At the closest approach of a parabolic orbit deep in the ergosphere, it can.
+    const double rs = splitRadius(a);
+    double Lp = 0.0;
+    truth(parabolicPeriapsis(a, rs, Lp) && std::abs(radialPotential(a, Constants{1.0, Lp, 0.0, 1.0}, rs)) < 1e-9,
+          "Penrose: the parabolic orbit turns round at the split radius (R = 0 there)");
+    {
+        const Constants c{1.0, Lp, 0.0, 1.0};
+        const State st{0.0, rs, kPi / 2, 0.0, 0.0, 0.0};
+        zamoVelocity(a, c, st, v0);
+    }
+    const Split best = bestSplit(a, rs, kPi / 2, 1.0, v0, 0.95);
+    truth(best.valid && best.E1 < 0.0 && best.E2 > best.E0, "Penrose: inside, a split gives a negative-energy piece");
+    near(best.m1 * best.E1 + best.m2 * best.E2, best.m0 * best.E0, 1e-12, "Penrose: energy is conserved at the split");
+    near(best.m1 * best.L1 + best.m2 * best.L2, best.m0 * best.L0, 1e-12, "Penrose: angular momentum is conserved");
+    near(best.efficiency, -best.m1 * best.E1 / (best.m0 * best.E0), 1e-12, "Penrose: the gain is -m1 E1");
+    truth(best.efficiency > 0.0 && best.efficiency <= kMaxEfficiency, "Penrose: gains, but less than (sqrt 2 - 1) / 2");
+    // Whatever falls in has E - Omega_H L >= 0 (the area theorem): random throws that plunge.
+    {
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<double> uni(-1.0, 1.0);
+        const double omegaH = horizonOmega(1.0, a);
+        double worst = 1.0;
+        int plunged = 0;
+        for (int k = 0; k < 4000; ++k) {
+            double v[3] = {uni(rng), 0.3 * uni(rng), uni(rng)};
+            const double n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            const double speed = 0.999 * std::abs(uni(rng));
+            for (double& x : v) x *= speed / std::max(n, 1e-9);
+            const double r = rh + (re - rh) * (0.5 + 0.5 * uni(rng));
+            Constants c;
+            State st;
+            launchFromZamo(a, r, kPi / 2 + 0.3 * uni(rng), 0.0, v, 1.0, c, st);
+            if (trajectory::classify(a, c, st).fate != trajectory::Fate::Plunges) continue;
+            ++plunged;
+            worst = std::min(worst, c.E - omegaH * c.L);
+        }
+        truth(plunged > 500 && worst >= -1e-12, "Penrose: everything that falls in has E - Omega_H L >= 0 (area theorem)");
+    }
+    // The hole: M^2 = M_irr^2 + J^2 / (4 M_irr^2), and 29% of a maximal hole is rotation.
+    double worstIdentity = 0.0;
+    for (double spin : {0.0, 0.3, 0.7, 0.9, 0.998}) {
+        const double mirr = irreducibleMass(1.0, spin);
+        worstIdentity = std::max(worstIdentity, std::abs(mirr * mirr + spin * spin / (4.0 * mirr * mirr) - 1.0));
+    }
+    near(worstIdentity, 0.0, 1e-12, "Penrose: Christodoulou's M^2 = M_irr^2 + J^2 / 4 M_irr^2");
+    near(1.0 - irreducibleMass(1.0, 1.0), 1.0 - 1.0 / std::sqrt(2.0), 1e-12, "Penrose: 29.3% extractable at a = 1");
+    near(horizonArea(1.0, 0.0), 16.0 * kPi, 1e-12, "Penrose: horizon area 16 pi M^2 without spin");
+    // After the negative-energy piece falls in, the hole turns more slowly and its area grows.
+    {
+        const double after = spinAfter(a, best), mass = massAfter(best);
+        truth(after < a && mass < 1.0 && horizonArea(mass, after * mass) >= horizonArea(1.0, a),
+              "Penrose: the hole spins down, loses mass, and its area grows");
+    }
+    // The whole thing among the bodies: the body falls, splits, one piece falls in, the other leaves.
+    {
+        BodySystem system;
+        system.addPreset(a, Preset::Penrose);
+        bool escaped = false;
+        for (int k = 0; k < 600 && !escaped; ++k) {
+            system.update(a, 0.5, false);
+            for (const Body& b : system.bodies) escaped = escaped || (b.name == "Escaping fragment" && b.state.r > 30.0);
+        }
+        const bool split = !system.penroseSplits.empty();
+        truth(split && system.penroseSplits[0].absorbed && escaped && system.penroseSplits[0].E2 > system.penroseSplits[0].E0,
+              "Penrose: the falling body splits; one piece falls in, the other escapes with more energy");
+    }
+}
+
+// --- Naked singularities (spin above 1) -------------------------------------------------------
+
+static void testNakedSingularity() {
+    const double a = 1.2, b = std::sqrt(a * a - 1.0);
+    // No horizon: Delta = (r - 1)^2 + b^2 > 0 everywhere, least b^2 at r = 1.
+    double least = 1e30;
+    for (double r = -20.0; r <= 20.0; r += 0.001) least = std::min(least, r * r - 2.0 * r + a * a);
+    near(least, b * b, 1e-9, "naked: Delta > 0 everywhere, b^2 at its least");
+    truth(horizonRadius(a) == 0.0 && innerHorizonRadius(a) == 0.0, "naked: no horizons");
+    // The Kerr-Schild shifts in closed form have the right derivatives, for r < 0 too.
+    double worst = 0.0;
+    for (double r : {-6.0, -1.0, -0.2, 0.0, 0.3, 1.0, 2.5, 9.0}) {
+        const double h = 1e-5, delta = r * r - 2.0 * r + a * a;
+        const double dt = (timeShift(a, r + h) - timeShift(a, r - h)) / (2.0 * h);
+        const double dphi = (azimuthShift(a, r + h) - azimuthShift(a, r - h)) / (2.0 * h);
+        worst = std::max({worst, std::abs(dt - 2.0 * r / delta), std::abs(dphi - a / delta)});
+    }
+    near(worst, 0.0, 1e-8, "naked: d/dr of the closed-form shifts is 2r/Delta and a/Delta");
+    // Equatorial photon orbits: r (r - 3)^2 = 4 a^2; past a = 1 only the retrograde one.
+    const double rph = photonOrbitRadius(a, false);
+    near(rph * (rph - 3.0) * (rph - 3.0), 4.0 * a * a, 1e-10, "naked: the retrograde photon orbit solves r (r-3)^2 = 4a^2");
+    truth(photonOrbitRadius(a, true) == 0.0, "naked: no prograde equatorial photon orbit");
+    // The ISCO: the least energy of circular orbits (dE/dr = 0).
+    {
+        const double r = iscoRadius(a, true), h = 1e-4;
+        auto energy = [&](double x) { return circularOrbit(a, x, true).E; };
+        near((energy(r + h) - energy(r - h)) / (2.0 * h), 0.0, 1e-6, "naked: dE/dr = 0 at the ISCO");
+        truth(energy(r) < energy(r * 0.9) && energy(r) < energy(r * 1.1) && r < 1.0,
+              "naked: the ISCO is a minimum of E, inside r = M");
+    }
+    // A ray through the ring's disk (r = 0 away from the equator) goes on to r < 0 on the
+    // same geodesic: E, L, Q are kept (vr^2 = R, vtheta^2 = Theta all the way).
+    {
+        // Q < 0: such rays reach r = 0 (R(0) = -a^2 Q); with a^2 + Q small, R stays positive
+        // for every r < 0 as well (otherwise the repulsion there turns the ray back).
+        Constants c{1.0, 0.0, -1.2, 0.0};
+        State st{0.0, 8.0, 0.3, 0.0, 0.0, 0.0};
+        st.vr = -std::sqrt(radialPotential(a, c, st.r));
+        st.vtheta = std::sqrt(std::max(polarPotential(a, c, st.theta), 0.0));
+        double leastSigma = 1e30, drift = 0.0;
+        for (int k = 0; k < 200000 && st.r > -8.0 && st.r < 1e3; ++k) {
+            stepMino(a, c, st, photonStepSize(a, c, st, 0.005));
+            enforceConstraints(a, c, st);
+            normalizeAngles(st);
+            const double cs = std::cos(st.theta);
+            leastSigma = std::min(leastSigma, st.r * st.r + a * a * cs * cs);
+            const double R = radialPotential(a, c, st.r), Th = polarPotential(a, c, st.theta);
+            drift = std::max({drift, std::abs(st.vr * st.vr - R) / (1.0 + std::abs(R)),
+                              std::abs(st.vtheta * st.vtheta - Th) / (1.0 + std::abs(Th))});
+        }
+        truth(st.r <= -8.0 && leastSigma > 0.05, "naked: a ray through the ring's disk comes out at r < 0");
+        near(drift, 0.0, 1e-6, "naked: ... keeping E, L and Q (vr^2 = R, vtheta^2 = Theta)");
+    }
+}
+
 static void run(const char* name, void (*test)()) {
     const auto start = std::chrono::steady_clock::now();
     test();
@@ -1681,6 +2515,13 @@ static void run(const char* name, void (*test)()) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    run("testSceneFile", testSceneFile);
+    run("testTimeline", testTimeline);
+    run("testKeyframes", testKeyframes);
+    run("testEht", testEht);
+    run("testPenrose", testPenrose);
+    run("testNakedSingularity", testNakedSingularity);
+    run("testMerger", testMerger);
     run("testTidalFlare", testTidalFlare);
     run("testCentralUnits", testCentralUnits);
     run("testSurfaceAppearance", testSurfaceAppearance);
@@ -1696,6 +2537,7 @@ int main() {
     run("testRealWorld", testRealWorld);
     run("testPulsarBeams", testPulsarBeams);
     run("testCloseBinary", testCloseBinary);
+    run("testRocheLobe", testRocheLobe);
     run("testTidalModel", testTidalModel);
     run("testMutualGravity", testMutualGravity);
     run("testKerrSchildMetric", testKerrSchildMetric);

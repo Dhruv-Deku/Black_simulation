@@ -1,0 +1,126 @@
+#version 460 core
+
+// Once per step, one workgroup measures the whole merger:
+//   - each star's mass, centre and velocity, and from them the 2.5PN radiation reaction of
+//     their orbit (src/merger.h, radiationReaction), until the cores touch;
+//   - the time step: dt = min over particles of 0.3 h / v_signal and 0.25 sqrt(h / |a|)
+//     (Courant and force limits), no longer than uDtMax;
+//   - the second time derivative of the mass quadrupole, sum m (2 v v + x a + a x), which
+//     is the gravitational wave (written to the history each step);
+//   - the largest density and temperature, how far the matter reaches, how much is unbound.
+
+layout(local_size_x = 256) in;
+
+#include "merger_common.glsl"
+
+uniform float uDtMax;
+uniform float uMergeSeparation;  // the cores touch: radiation reaction off from here on
+uniform int uHistorySize;
+uniform int uRecord;             // write a history sample
+
+const int kSlots = 29;
+shared float red[kSlots * 256];
+
+// Thermal energy per unit mass to log10 of the temperature (src/merger.h).
+float logTemperature(float uth) {
+    return log(max(2.0 / 3.0 * 1.090327e13 * uth, 1e6)) / log(10.0);
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float s[kSlots];
+    for (int k = 0; k < kSlots; ++k) s[k] = 0.0;
+    s[22] = 1e30;  // dt
+    float denseThreshold = 1e-3 * sIddot1.z;
+    for (int i = int(t); i < uCount; i += 256) {
+        Particle p = particles[i];
+        if (p.thermo.w < 0.0) continue;
+        float m = p.pos.w;
+        vec3 x = p.pos.xyz, v = p.vel.xyz, a = p.acc.xyz;
+        int o = p.thermo.w < 0.5 ? 0 : 7;
+        s[o] += m;
+        s[o + 1] += m * x.x;
+        s[o + 2] += m * x.y;
+        s[o + 3] += m * x.z;
+        s[o + 4] += m * v.x;
+        s[o + 5] += m * v.y;
+        s[o + 6] += m * v.z;
+        s[14] += m * (2.0 * v.x * v.x + 2.0 * x.x * a.x);
+        s[15] += m * (2.0 * v.y * v.y + 2.0 * x.y * a.y);
+        s[16] += m * (2.0 * v.z * v.z + 2.0 * x.z * a.z);
+        s[17] += m * (2.0 * v.x * v.y + x.x * a.y + x.y * a.x);
+        s[18] += m * (2.0 * v.x * v.z + x.x * a.z + x.z * a.x);
+        s[19] += m * (2.0 * v.y * v.z + x.y * a.z + x.z * a.y);
+        float rho = p.thermo.y;
+        s[20] = max(s[20], rho);
+        s[21] = max(s[21], logTemperature(p.thermo.x));
+        vec4 au = aux[i];
+        float h = p.vel.w;
+        float vsig = au.z + 1.2 * h * max(-au.x, 0.0) + 1e-6;
+        float dt = 0.3 * h / vsig;
+        float accel = length(a);
+        if (accel > 0.0) dt = min(dt, 0.25 * sqrt(h / accel));
+        s[22] = min(s[22], dt);
+        float r = length(x);
+        float e = 0.5 * dot(v, v) + p.extra.w;
+        bool unbound = e > 0.0 && dot(x, v) > 0.0;
+        if (unbound) {
+            s[26] += m;
+        } else {
+            s[23] += m * r * r;
+            s[24] += m;
+        }
+        if (rho > denseThreshold) s[25] = max(s[25], r);
+        s[27] += 0.5 * m * dot(v, v);
+    }
+    for (int k = 0; k < kSlots; ++k) red[k * 256 + t] = s[k];
+    barrier();
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (t < stride) {
+            for (int k = 0; k < kSlots; ++k) {
+                float a = red[k * 256 + t], b = red[k * 256 + t + stride];
+                red[k * 256 + t] = (k == 20 || k == 21 || k == 25) ? max(a, b) : (k == 22 ? min(a, b) : a + b);
+            }
+        }
+        barrier();
+    }
+    if (t != 0) return;
+
+    float m0 = max(red[0], 1e-20), m1 = max(red[7 * 256], 1e-20);
+    vec3 c0 = vec3(red[1 * 256], red[2 * 256], red[3 * 256]) / m0;
+    vec3 v0 = vec3(red[4 * 256], red[5 * 256], red[6 * 256]) / m0;
+    vec3 c1 = vec3(red[8 * 256], red[9 * 256], red[10 * 256]) / m1;
+    vec3 v1 = vec3(red[11 * 256], red[12 * 256], red[13 * 256]) / m1;
+    sStar[0] = vec4(c0, red[0]);
+    sStar[1] = vec4(v0, 0.0);
+    sStar[2] = vec4(c1, red[7 * 256]);
+    sStar[3] = vec4(v1, 0.0);
+    sIddot0 = vec4(red[14 * 256], red[15 * 256], red[16 * 256], red[17 * 256]);
+    sIddot1 = vec4(red[18 * 256], red[19 * 256], red[20 * 256], red[21 * 256]);
+    sExtent = vec4(sqrt(red[23 * 256] / max(red[24 * 256], 1e-20)), red[25 * 256], red[26 * 256], red[27 * 256]);
+
+    // Radiation reaction: on while there are two stars (src/merger.cpp, radiationReaction).
+    vec3 x = c0 - c1, v = v0 - v1;
+    float sep = length(x);
+    if (sep < uMergeSeparation || red[0] <= 0.0 || red[7 * 256] <= 0.0) sStep.w = 1.0;
+    sReaction = vec4(0.0);
+    if (sStep.w < 0.5 && sHole.w <= 0.0) {
+        float M = m0 + m1, eta = m0 * m1 / (M * M);
+        vec3 n = x / sep;
+        float rdot = dot(n, v), v2 = dot(v, v);
+        vec3 a = 1.6 * eta * M * M / (sep * sep * sep) * ((3.0 * v2 + 17.0 / 3.0 * M / sep) * rdot * n - (v2 + 3.0 * M / sep) * v);
+        sReaction = vec4(a, 1.0);
+    }
+
+    float dtCfl = red[22 * 256];
+    sStep.y = dtCfl;
+    sStep.x = min(dtCfl, uDtMax);
+
+    if (uRecord == 1) {
+        int k = sCounters.x % uHistorySize;
+        history[k].t = sTime;
+        history[k].a = sIddot0;
+        history[k].b = vec4(sIddot1.xy, sep, 0.0);
+        sCounters.x += 1;
+    }
+}

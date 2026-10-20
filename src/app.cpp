@@ -2,8 +2,11 @@
 
 #include "blackbody.h"
 #include "central.h"
+#include "file_dialog.h"
+#include "keyframes.h"
 #include "gravity.h"
 #include "kerr.h"
+#include "scene_file.h"
 #include "surface.h"
 
 #include <glad/gl.h>
@@ -15,10 +18,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <map>
+#include <sstream>
 
 namespace {
 
@@ -42,6 +47,13 @@ constexpr double kCrustQ = 60.0;
 constexpr double kQuakeFlash = 1.2, kQuakeFlashFade = 6000.0;
 // Brightness of a beacon neutron star's needle beams.
 constexpr float kBeaconBeamGlow = 2.4f;
+// The timeline takes a checkpoint every this much scene time (times the scene's time
+// unit), within these memory budgets (bytes; older checkpoints are thinned out to stay
+// inside), and replays for at most this long (seconds) per frame while seeking.
+constexpr double kCheckpointInterval = 25.0;
+constexpr size_t kTimelineMemory = size_t(256) << 20;
+constexpr size_t kTimelineGpuMemory = size_t(512) << 20;
+constexpr double kSeekBudget = 0.03;
 
 const std::map<std::string, Preset>& presetNames() {
     static const std::map<std::string, Preset> names = {
@@ -62,6 +74,7 @@ const std::map<std::string, Preset>& presetNames() {
         {"giant-planets", Preset::GiantInnerPlanets}, {"wd-planet", Preset::WhiteDwarfPlanet},
         {"wd-asteroid", Preset::WhiteDwarfAsteroid}, {"cv-companion", Preset::CataclysmicCompanion},
         {"clump", Preset::InfallingClump},
+        {"penrose", Preset::Penrose},
     };
     return names;
 }
@@ -85,7 +98,37 @@ void APIENTRY glDebugCallback(GLenum, GLenum type, GLuint, GLenum severity, GLsi
 }
 
 void scrollCallback(GLFWwindow* window, double, double dy) {
-    if (auto* scroll = static_cast<double*>(glfwGetWindowUserPointer(window))) *scroll += dy;
+    if (auto* inbox = static_cast<WindowInbox*>(glfwGetWindowUserPointer(window))) inbox->scroll += dy;
+}
+
+void dropCallback(GLFWwindow* window, int count, const char** paths) {
+    if (auto* inbox = static_cast<WindowInbox*>(glfwGetWindowUserPointer(window))) {
+        for (int i = 0; i < count; ++i) inbox->dropped.emplace_back(paths[i]);
+    }
+}
+
+// Paths to and from UTF-8 (GLFW's and the scene files' encoding).
+std::filesystem::path pathFromUtf8(const std::string& text) {
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()), text.size()));
+}
+
+std::string utf8Of(const std::filesystem::path& path) {
+    const std::u8string text = path.u8string();
+    return std::string(text.begin(), text.end());
+}
+
+json::Value encodeVec3(const glm::vec3& v) {
+    json::Value a = json::Value::array();
+    for (int i = 0; i < 3; ++i) a.push(json::Value::number(v[i]));
+    return a;
+}
+
+bool decodeVec3(const json::Value* x, glm::vec3& v) {
+    if (!x || !x->isArray() || x->size() != 3) return false;
+    for (int i = 0; i < 3; ++i) {
+        if (!(*x)[static_cast<size_t>(i)].get(v[i])) return false;
+    }
+    return true;
 }
 
 std::string timestampedPath(const char* folder, const char* extension) {
@@ -151,6 +194,7 @@ void printUsage() {
         "  --field G              its magnetic field in gauss (neutron stars, white dwarfs)\n"
         "  --physical-units       readouts in km, AU, seconds and hours too\n"
         "  --spin A               spin J/M^2 (a/M for a black hole, in [0, 0.999])\n"
+        "  --naked                let a black hole spin past 1 (to 1.5): a naked singularity\n"
         "  --distance R           camera distance in M (around a star or planet, in units of R/6)\n"
         "  --inclination DEG      camera angle from the spin axis (90 = edge-on)\n"
         "  --azimuth DEG          camera azimuth\n"
@@ -182,9 +226,11 @@ void printUsage() {
         "                           orbits:  isco circular retrograde precessing zoom-whirl\n"
         "                                    polar plunge flyby cluster\n"
         "                           objects: planet gas-giant pulsar tde tde-flare grazing binary moon\n"
-        "                                    cloud ring einstein-ring mini-hole white-dwarf\n"
+        "                                    cloud ring einstein-ring mini-hole white-dwarf penrose\n"
         "  --advance T            run the simulation for T M before starting\n"
         "  --scale S              ray tracing resolution scale (0.25 to 2)\n"
+        "  --upscale bilinear|fsr how a smaller traced image is enlarged (default fsr: FSR 1)\n"
+        "  --dynamic-resolution   the traced resolution follows a frame-time target\n"
         "  --no-disk              hide the accretion disk\n"
         "  --heatmap              show integration steps per pixel instead of the image\n"
         "  --debug-directions     show each ray's final direction as a color\n"
@@ -194,8 +240,32 @@ void printUsage() {
         "  --record PATH          record an MP4 video (at --size) and exit\n"
         "  --duration S           video length in seconds (default 5)\n"
         "  --fps N                video frame rate (default 30)\n"
-        "  --camera-path flown|orbit|push-in\n"
-        "                         how the camera moves during the video\n");
+        "  --camera-path flown|orbit|push-in|keyframes\n"
+        "                         how the camera moves during the video\n"
+        "  --merger               two neutron stars merge (GW170817): inspiral, merger, black hole,\n"
+        "                         gamma-ray burst, kilonova\n"
+        "  --merger-view cinematic|simulation|split|film\n"
+        "                         film-like view, simulation from above, or both side by side\n"
+        "  --merger-particles N   SPH particles per star (default 12000)\n"
+        "  --merger-masses M1,M2  the stars' masses in Suns (default 1.35,1.35)\n"
+        "  --merger-collapse MS   the remnant collapses this long after the merger (default 15)\n"
+        "  --merger-advance S     run the merger for S seconds of viewing before starting\n"
+        "  --distance KM          around the merger, the camera's distance in km\n"
+        "  --no-sound             no gravitational-wave sound (live or in videos)\n"
+        "  --sound                the scene's sound: bodies, pulsars, the tide's rumble, waves\n"
+        "  --no-captions          no captions in the merger's views\n"
+        "  --scene-file PATH      open a saved scene (.bhscene) first; other options apply on top\n"
+        "  --save-scene PATH      save the scene to PATH once set up (after --advance)\n"
+        "  --seek T               after --advance, go back to time T on the timeline (replayed)\n"
+        "  --no-timeline          do not record a timeline\n"
+        "  --keyframe R,INCL,AZ[,S]\n"
+        "                         a camera keyframe (may repeat): distance, inclination and azimuth\n"
+        "                         as for --distance and the rest, reached S seconds after the last (4)\n"
+        "  --eht m87|sgra|here    what the Event Horizon Telescope sees (here: this black hole)\n"
+        "  --eht-inclination DEG  its spin axis to the line of sight (M87*: 163, Sgr A*: 30)\n"
+        "  --eht-size N           its image's pixels across (default 160)\n"
+        "  --keyframes-physical   the camera moves along the keyframes for real (aberration);\n"
+        "                         --camera-path keyframes films along them\n");
 }
 
 bool parseArguments(int argc, char** argv, LaunchOptions& out, std::string& error) {
@@ -242,7 +312,9 @@ bool parseArguments(int argc, char** argv, LaunchOptions& out, std::string& erro
             }
         } else if (arg == "--spin") {
             if (!number(v)) return false;
-            out.spin = static_cast<float>(std::clamp(v, 0.0, 0.999));
+            out.spin = static_cast<float>(std::clamp(v, 0.0, central::kMaxNakedSpin));
+        } else if (arg == "--naked") {
+            out.naked = true;
         } else if (arg == "--distance") {
             if (!number(v)) return false;
             out.distance = v;
@@ -295,7 +367,7 @@ bool parseArguments(int argc, char** argv, LaunchOptions& out, std::string& erro
             if (c < 0) return false;
             out.cameraMotion = c;
         } else if (arg == "--camera-path") {
-            int c = choice({"flown", "orbit", "push-in"});
+            int c = choice({"flown", "orbit", "push-in", "keyframes"});
             if (c < 0) return false;
             out.recordPathMode = c;
         } else if (arg == "--scene") {
@@ -393,6 +465,90 @@ bool parseArguments(int argc, char** argv, LaunchOptions& out, std::string& erro
             out.debugView = 2;
         } else if (arg == "--ui") {
             out.screenshotUi = true;
+        } else if (arg == "--merger") {
+            out.merger = true;
+        } else if (arg == "--merger-view") {
+            int c = choice({"cinematic", "simulation", "split", "film"});
+            if (c < 0) return false;
+            out.mergerView = c;
+            out.merger = true;
+        } else if (arg == "--merger-particles") {
+            if (!number(v)) return false;
+            out.mergerParticles = std::clamp(static_cast<int>(v), 1000, 60000);
+            out.merger = true;
+        } else if (arg == "--merger-masses") {
+            const char* s = value();
+            double a = 0.0, b = 0.0;
+            if (!s || std::sscanf(s, "%lf,%lf", &a, &b) != 2 || a < 1.0 || b < 1.0 || a > 2.0 || b > 2.0) {
+                if (error.empty()) error = "--merger-masses expects M1,M2 in Suns (1 to 2), e.g. 1.4,1.3";
+                return false;
+            }
+            out.mergerMass1 = a;
+            out.mergerMass2 = b;
+            out.merger = true;
+        } else if (arg == "--merger-collapse") {
+            if (!number(v)) return false;
+            out.mergerCollapseMs = std::clamp(v, 1.0, 100.0);
+            out.merger = true;
+        } else if (arg == "--merger-advance") {
+            if (!number(v)) return false;
+            out.mergerAdvance = std::max(v, 0.0);
+            out.merger = true;
+        } else if (arg == "--no-sound") {
+            out.noSound = true;
+        } else if (arg == "--sound") {
+            out.sound = true;
+        } else if (arg == "--no-captions") {
+            out.noCaptions = true;
+        } else if (arg == "--scene-file") {
+            const char* s = value();
+            if (!s) return false;
+            out.sceneFile = s;
+        } else if (arg == "--save-scene") {
+            const char* s = value();
+            if (!s) return false;
+            out.saveScene = s;
+        } else if (arg == "--seek") {
+            if (!number(v)) return false;
+            out.seek = std::max(v, 0.0);
+        } else if (arg == "--upscale") {
+            int c = choice({"bilinear", "fsr"});
+            if (c < 0) return false;
+            out.upscaler = c;
+        } else if (arg == "--dynamic-resolution") {
+            out.dynamicResolution = true;
+        } else if (arg == "--no-timeline") {
+            out.noTimeline = true;
+        } else if (arg == "--keyframe") {
+            const char* s = value();
+            LaunchOptions::Keyframe k{0.0, 0.0, 0.0, 4.0};
+            if (!s || std::sscanf(s, "%lf,%lf,%lf,%lf", &k.distance, &k.inclinationDeg, &k.azimuthDeg, &k.seconds) < 3 ||
+                k.distance <= 0.0) {
+                if (error.empty()) error = "--keyframe expects R,INCL,AZ or R,INCL,AZ,SECONDS";
+                return false;
+            }
+            out.keyframes.push_back(k);
+        } else if (arg == "--eht") {
+            int c = choice({"m87", "sgra", "here"});
+            if (c < 0) return false;
+            out.eht = c;
+        } else if (arg == "--eht-inclination") {
+            if (!number(v)) return false;
+            out.ehtInclinationDeg = std::clamp(v, 1.0, 179.0);
+        } else if (arg == "--eht-spin") {
+            if (!number(v)) return false;
+            out.ehtSpin = std::clamp(v, 0.0, 0.998);
+        } else if (arg == "--eht-thickness") {
+            if (!number(v)) return false;
+            out.ehtHeight = std::clamp(v, 0.05, 2.0);
+        } else if (arg == "--eht-temperature") {
+            if (!number(v)) return false;
+            out.ehtTemperature = std::clamp(v, 1e9, 1e14);
+        } else if (arg == "--eht-size") {
+            if (!number(v)) return false;
+            out.ehtSize = std::clamp(static_cast<int>(v), 16, 1024);
+        } else if (arg == "--keyframes-physical") {
+            out.keyframesPhysical = true;
         } else {
             error = "unknown option: " + arg;
             return false;
@@ -435,8 +591,9 @@ bool App::init(const LaunchOptions& options, const std::filesystem::path& shader
     glDebugMessageCallback(glDebugCallback, nullptr);
 
     // Our scroll handler must be installed before ImGui's, which chains to it.
-    glfwSetWindowUserPointer(m_window, &m_scroll);
+    glfwSetWindowUserPointer(m_window, &m_inbox);
     glfwSetScrollCallback(m_window, scrollCallback);
+    glfwSetDropCallback(m_window, dropCallback);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -449,6 +606,13 @@ bool App::init(const LaunchOptions& options, const std::filesystem::path& shader
     // ImGui's built-in pixel font looks rough when scaled; prefer Segoe UI.
     const char* font = "C:\\Windows\\Fonts\\segoeui.ttf";
     if (std::filesystem::exists(font)) io.Fonts->AddFontFromFileTTF(font, 16.0f);
+    // The merger film's captions are a heavy italic, as the reference's are (Segoe UI Black
+    // Italic, else Bold Italic).
+    for (const char* captionFont : {"C:\\Windows\\Fonts\\seguibli.ttf", "C:\\Windows\\Fonts\\segoeuiz.ttf"}) {
+        if (!std::filesystem::exists(captionFont)) continue;
+        m_merger.setCaptionFont(io.Fonts->AddFontFromFileTTF(captionFont, 32.0f));
+        break;
+    }
 #endif
     ImGui_ImplGlfw_InitForOpenGL(m_window, true);
     ImGui_ImplOpenGL3_Init("#version 460");
@@ -461,11 +625,18 @@ bool App::init(const LaunchOptions& options, const std::filesystem::path& shader
     if (!m_particles.init(shaderDir, error)) {
         std::fprintf(stderr, "Debris shader errors:\n%s\n", error.c_str());
     }
+    if (!m_merger.init(shaderDir, error)) {
+        std::fprintf(stderr, "Merger shader errors:\n%s\n", error.c_str());
+    }
     applyOptions(options);
     return true;
 }
 
 void App::applyOptions(const LaunchOptions& o) {
+    // The timeline records in the window; for a picture or a video only if it is to seek.
+    const bool headless = !o.screenshotPath.empty() || !o.recordPath.empty();
+    m_timelineOn = !o.noTimeline && (!headless || o.seek.has_value());
+    if (!o.sceneFile.empty()) loadScene(o.sceneFile);
     if (o.scene) applyScene(*o.scene);
     if (o.central) applyCentral(*o.central);
     central::Object& c = m_settings.central;
@@ -483,7 +654,8 @@ void App::applyOptions(const LaunchOptions& o) {
     if (o.surfaceTemperature) c.surfaceTemperature = *o.surfaceTemperature;
     if (o.magneticField) c.magneticField = *o.magneticField;
     if (o.physicalUnits) m_settings.physicalUnits = true;
-    if (o.spin) c.chi = *o.spin;
+    if (o.naked && c.hasHorizon()) c.naked = true;
+    if (o.spin) c.chi = c.naked ? *o.spin : std::min(*o.spin, 0.999f);
     syncCentral(0.0, 0.0f);
     if (o.distance) m_camera.r = *o.distance * sceneScale();
     if (o.inclinationDeg) m_camera.theta = std::clamp(*o.inclinationDeg, 1.0, 179.0) * kerr::kPi / 180.0;
@@ -492,6 +664,8 @@ void App::applyOptions(const LaunchOptions& o) {
     m_camera.r = std::max(m_camera.r, m_camera.minDistance(m_settings.spin));
     if (o.sky) m_settings.skyMode = *o.sky;
     if (o.renderScale) m_settings.renderScale = *o.renderScale;
+    if (o.upscaler) m_settings.upscaler = *o.upscaler;
+    if (o.dynamicResolution) m_settings.dynamicResolution = true;
     if (o.relativity) m_settings.relativity = *o.relativity;
     if (o.diskTemperature) m_settings.diskTemperature = *o.diskTemperature;
     if (o.diskBrightness) m_settings.diskBrightness = *o.diskBrightness;
@@ -505,6 +679,7 @@ void App::applyOptions(const LaunchOptions& o) {
     if (o.noBodyGravity) m_settings.bodyGravity = false;
     if (o.noFlare) m_settings.tdeFlare = false;
     if (o.jets) m_settings.jetsEnabled = true;
+    if (o.sound) m_settings.sound = true;
     if (o.noPaths) m_settings.showPaths = false;
     if (o.debugView) m_settings.debugView = o.debugView;
     if (!o.skyImage.empty()) {
@@ -524,14 +699,35 @@ void App::applyOptions(const LaunchOptions& o) {
         rideWith(m_bodies.bodies[*o.ride].slot);
     }
     if (o.starquake) starquake();
+    if (!o.keyframes.empty()) {
+        const Camera saved = m_camera;
+        m_track.keys.clear();
+        for (const LaunchOptions::Keyframe& k : o.keyframes) {
+            m_camera.motion = CameraMotion::Hover;
+            m_camera.r = std::max(k.distance * sceneScale(), m_camera.minDistance(m_settings.spin));
+            m_camera.theta = std::clamp(k.inclinationDeg, 1.0, 179.0) * kerr::kPi / 180.0;
+            m_camera.phi = k.azimuthDeg * kerr::kPi / 180.0;
+            m_camera.yaw = m_camera.pitch = m_camera.roll = 0.0f;
+            if (!m_track.keys.empty()) m_track.keys.back().duration = std::max(k.seconds, 0.1);
+            m_track.keys.push_back(keyframes::fromCamera(m_camera, m_settings.spin));
+        }
+        m_camera = saved;
+        m_track.aim = true;  // each faces the center: so does the camera between them
+        m_track.physical = o.keyframesPhysical;
+        m_track.rebuild();
+    }
     // --advance is in M around a black hole, in scene time (scale^1.5 M) around a bigger object.
     const double tScale = sceneScale() * std::sqrt(sceneScale());
     for (double t = 0.0; t < o.advance; t += 1.0) {
         const double dt = std::min(1.0, o.advance - t) * tScale;
-        syncCentral(dt, 0.0f);
-        m_bodies.setFrameTime(dt, m_settings.spin);
-        advanceSimulation(dt);
-        syncRide(dt);
+        if (m_timelineOn) timelineFrame(0.0f, dt);
+        else simulateFrame(dt, 0.0f);
+    }
+    if (o.seek && m_timelineOn && !m_timeline.empty()) {
+        const size_t target = m_timeline.positionAt(*o.seek * tScale);
+        while (!seekTowards(target, 1e9)) {
+        }
+        std::printf("Replayed the timeline back to t = %.6g M\n", m_bodies.time);
     }
     if (m_settings.flareCamera && !o.distance && m_camera.motion == CameraMotion::Hover) {
         m_camera.r = flareCameraDistance();
@@ -539,6 +735,38 @@ void App::applyOptions(const LaunchOptions& o) {
     if (o.lookAhead) {
         m_camera.lookAhead = true;
         if (m_camera.motion != CameraMotion::Hover) m_camera.faceVelocity(m_settings.spin);
+    }
+    if (!o.saveScene.empty()) saveScene(o.saveScene);
+    if (o.merger) {
+        if (o.mergerParticles) m_merger.params.perStar = *o.mergerParticles;
+        if (o.mergerCollapseMs) m_merger.params.collapseMs = *o.mergerCollapseMs;
+        if (o.mergerMass1) m_merger.params.m1 = *o.mergerMass1;
+        if (o.mergerMass2) m_merger.params.m2 = *o.mergerMass2;
+        if (o.mergerView) m_merger.view = *o.mergerView;
+        m_merger.sound = !o.noSound;
+        m_merger.captions = !o.noCaptions;
+        m_merger.start(m_camera);
+        // Around the merger --distance is in km, and setting the view stops the camera's
+        // following.
+        if (o.distance) m_camera.r = *o.distance / merger::kKm;
+        if (o.inclinationDeg) m_camera.theta = std::clamp(*o.inclinationDeg * kerr::kPi / 180.0, 0.02, kerr::kPi - 0.02);
+        if (o.azimuthDeg) m_camera.phi = *o.azimuthDeg * kerr::kPi / 180.0;
+        if (o.fov) m_camera.fovDeg = *o.fov;
+        const double step = 1.0 / 30.0;
+        if (m_merger.view == MergerScene::Film) m_merger.setFilmTime(o.mergerAdvance);
+        else
+            for (double t = 0.0; t < o.mergerAdvance; t += step) m_merger.update(step, false, m_camera, 1000, false);
+        if (o.distance) m_merger.autoCamera = false;
+    }
+    if (o.eht >= 0) {
+        m_ui.ehtOpen = true;
+        m_ui.ehtTarget = o.eht;
+        if (o.ehtInclinationDeg && o.eht < 2) m_ui.ehtInclination[o.eht] = static_cast<float>(*o.ehtInclinationDeg);
+        if (o.ehtSize) m_ui.ehtResolution = *o.ehtSize <= 96 ? 0 : (*o.ehtSize <= 160 ? 1 : 2);
+        if (o.ehtSize) m_ehtSizeOverride = *o.ehtSize;
+        if (o.ehtHeight) m_ui.ehtHeight[o.eht] = static_cast<float>(*o.ehtHeight);
+        if (o.ehtSpin) m_ui.ehtSpin = static_cast<float>(*o.ehtSpin);
+        if (o.ehtTemperature) m_ui.ehtTemperature[o.eht] = static_cast<float>(*o.ehtTemperature);
     }
     if (o.inspect) {
         inspectPixel(o.inspect->first, o.inspect->second);
@@ -556,6 +784,16 @@ void App::applyOptions(const LaunchOptions& o) {
 
 void App::shutdown() {
     if (m_recording.active) stopRecording();
+    m_sound.close();
+    m_eht.shutdown();
+    if (!m_timeline.empty()) {
+        std::printf("Timeline: t = %.6g to %.6g M, %zu frames, %zu checkpoints (%zu after changes), %.1f MB + %.1f MB "
+                    "on the GPU\n",
+                    m_timeline.start(), m_timeline.end(), m_timeline.length(), m_timeline.checkpointCount(),
+                    m_timeline.pinnedCount(), m_timeline.bytes() / 1048576.0, m_timeline.gpuBytes() / 1048576.0);
+    }
+    clearTimeline();
+    m_merger.shutdown();
     m_particles.shutdown();
     m_renderer.shutdown();
     if (ImGui::GetCurrentContext()) {
@@ -610,14 +848,25 @@ void App::handleInput(float dt) {
     if (m_dragRight || (m_dragLeft && moving)) {
         m_camera.look(static_cast<float>(dx * sensitivity), static_cast<float>(-dy * sensitivity));
     }
-    if (!io.WantCaptureMouse && m_scroll != 0.0 && !moving) {
-        m_camera.zoom(std::pow(0.9, m_scroll), minR);
+    if (!io.WantCaptureMouse && m_inbox.scroll != 0.0 && !moving) {
+        m_camera.zoom(std::pow(0.9, m_inbox.scroll), minR);
         m_settings.flareCamera = false;  // you set the distance now
     }
-    m_scroll = 0.0;
+    m_inbox.scroll = 0.0;
 
     if (io.WantCaptureKeyboard) return;
-    if (pressed(GLFW_KEY_SPACE)) m_settings.paused = !m_settings.paused;
+    const bool shiftHeld = glfwGetKey(m_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                           glfwGetKey(m_window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+    // Space plays or pauses (in the past too); Shift+Space plays the past backwards.
+    if (pressed(GLFW_KEY_SPACE)) {
+        if (shiftHeld && m_timelineOn) timelineCommand(2);
+        else if (m_timelineOn && !m_timeline.empty()) timelineCommand(1);
+        else m_settings.paused = !m_settings.paused;
+    }
+    if (pressed(GLFW_KEY_K)) addKeyframe();
+    if (pressed(GLFW_KEY_T)) m_ui.ehtOpen = !m_ui.ehtOpen;
+    if (pressed(GLFW_KEY_LEFT_BRACKET)) timelineCommand(5);
+    if (pressed(GLFW_KEY_RIGHT_BRACKET)) timelineCommand(6);
     if (pressed(GLFW_KEY_TAB)) m_ui.showPanel = !m_ui.showPanel;
     if (pressed(GLFW_KEY_H)) m_ui.showHelp = !m_ui.showHelp;
     if (pressed(GLFW_KEY_R)) {
@@ -628,8 +877,14 @@ void App::handleInput(float dt) {
     if (pressed(GLFW_KEY_I)) m_settings.rayInspector = !m_settings.rayInspector;
     if (pressed(GLFW_KEY_F12)) saveScreenshot(timestampedPath("screenshots", ".png"));
     if (pressed(GLFW_KEY_ESCAPE) && m_recording.active) stopRecording();
+    // Ctrl+S saves the scene (Ctrl+Shift+S: somewhere else), Ctrl+O opens one.
+    const bool shift = glfwGetKey(m_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                       glfwGetKey(m_window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+    const bool saveKey = pressed(GLFW_KEY_S), openKey = pressed(GLFW_KEY_O);
+    if (ctrl && saveKey && !m_recording.active) saveSceneInteractive(shift);
+    if (ctrl && openKey && !m_recording.active) openSceneInteractive();
 
-    if (moving) return;
+    if (moving || ctrl) return;
     auto held = [&](int key) { return glfwGetKey(m_window, key) == GLFW_PRESS; };
     const double speed = 1.2 * dt;
     if (held(GLFW_KEY_W) || held(GLFW_KEY_S)) m_settings.flareCamera = false;
@@ -1518,6 +1773,7 @@ CentralView App::centralView() const {
             v.companion = glm::vec4(static_cast<float>(a * c), static_cast<float>(a * sn), 0.0f,
                                     static_cast<float>(central::rocheLobeFraction(q) * a));
             v.companionAxis = glm::vec3(static_cast<float>(c), static_cast<float>(sn), 0.0f);
+            v.companionQ = static_cast<float>(q);
             for (const auto& p : m_streamPath) {
                 v.stream.push_back(glm::vec3(static_cast<float>(a * (p[0] * c - p[1] * sn)),
                                              static_cast<float>(a * (p[0] * sn + p[1] * c)), 0.0f));
@@ -1619,9 +1875,648 @@ void App::addEinsteinRing() {
     }
 }
 
+json::Value App::saveAppState() const {
+    using json::Value;
+    Value out = Value::object();
+    out.set("flashTime", Value::number(m_flashTime));
+    out.set("flashStrength", Value::number(m_flashStrength));
+    out.set("flashFade", Value::number(m_flashFade));
+    out.set("burstFuel", Value::number(m_burstFuel));
+    out.set("lastAccreted", Value::number(m_lastAccreted));
+    out.set("screenFlash", Value::number(m_screenFlash));
+    Value flares = Value::array();
+    for (const StarFlare& f : m_flares) {
+        Value x = Value::object();
+        x.set("direction", encodeVec3(f.direction));
+        x.set("time", Value::number(f.time));
+        x.set("strength", Value::number(f.strength));
+        flares.push(std::move(x));
+    }
+    out.set("flares", std::move(flares));
+    Value quakes = Value::array();
+    for (const Quake& q : m_quakes) {
+        Value x = Value::object();
+        x.set("time", Value::number(q.time));
+        x.set("amplitude", Value::number(q.amplitude));
+        x.set("l", Value::number(static_cast<long long>(q.l)));
+        x.set("direction", encodeVec3(q.direction));
+        quakes.push(std::move(x));
+    }
+    out.set("quakes", std::move(quakes));
+    std::ostringstream rng;
+    rng << m_rng;
+    out.set("random", Value::string(rng.str()));
+    return out;
+}
+
+bool App::loadAppState(const json::Value& state, bool checkOnly, std::string& error) {
+    // Each value keeps what it has if the file lacks it.
+    double flashTime = m_flashTime, flashStrength = m_flashStrength, flashFade = m_flashFade;
+    double burstFuel = 0.0, lastAccreted = 0.0;
+    float screenFlash = 0.0f;
+    std::vector<StarFlare> flares;
+    std::vector<Quake> quakes;
+    std::string random;
+    auto read = [&](const char* key, auto& value) {
+        const json::Value* x = state.find(key);
+        return !x || x->get(value);
+    };
+    bool ok = state.isObject() && read("flashTime", flashTime) && read("flashStrength", flashStrength) &&
+              read("flashFade", flashFade) && read("burstFuel", burstFuel) && read("lastAccreted", lastAccreted) &&
+              read("screenFlash", screenFlash) && read("random", random);
+    if (const json::Value* list = ok ? state.find("flares") : nullptr) {
+        ok = list->isArray();
+        for (size_t i = 0; ok && i < list->size(); ++i) {
+            const json::Value& x = (*list)[i];
+            StarFlare f{};
+            const json::Value *time = x.find("time"), *strength = x.find("strength");
+            ok = decodeVec3(x.find("direction"), f.direction) && time && time->get(f.time) && strength &&
+                 strength->get(f.strength);
+            flares.push_back(f);
+        }
+    }
+    if (const json::Value* list = ok ? state.find("quakes") : nullptr) {
+        ok = list->isArray();
+        for (size_t i = 0; ok && i < list->size(); ++i) {
+            const json::Value& x = (*list)[i];
+            Quake q{};
+            long long l = 2;
+            const json::Value *time = x.find("time"), *amplitude = x.find("amplitude"), *degree = x.find("l");
+            ok = time && time->get(q.time) && amplitude && amplitude->get(q.amplitude) && degree && degree->get(l) &&
+                 l >= 2 && l <= 10 && decodeVec3(x.find("direction"), q.direction);
+            q.l = static_cast<int>(l);
+            quakes.push_back(q);
+        }
+    }
+    std::mt19937 rng = m_rng;
+    if (ok && !random.empty()) {
+        std::istringstream in(random);
+        in >> rng;
+        ok = !in.fail();
+    }
+    if (!ok) {
+        error = "the scene's flashes, flares or starquakes are damaged";
+        return false;
+    }
+    if (checkOnly) return true;
+    m_flashTime = flashTime;
+    m_flashStrength = flashStrength;
+    m_flashFade = flashFade;
+    m_burstFuel = burstFuel;
+    m_lastAccreted = lastAccreted;
+    m_screenFlash = screenFlash;
+    m_flares = std::move(flares);
+    m_quakes = std::move(quakes);
+    m_rng = rng;
+    return true;
+}
+
+bool App::saveScene(const std::filesystem::path& path) {
+    const std::string name = utf8Of(path.filename());
+    if (m_merger.active()) {
+        m_ui.sceneStatus = "The neutron star merger runs a simulation of its own and cannot be saved; leave it first.";
+        return false;
+    }
+    // Debris added since the last step goes to the gas now, so the file holds all of it.
+    for (const auto& batch : m_bodies.pendingDebris) m_particles.spawn(batch.particles, m_bodies.time, batch.existedBefore);
+    m_bodies.pendingDebris.clear();
+
+    scene::Blob blob;
+    json::Value root = scene::save(m_settings, m_camera, m_bodies, blob);
+    root.set("gas", m_particles.save(blob));
+    root.set("app", saveAppState());
+    root.set("keyframes", keyframes::toJson(m_track.keys));
+    std::string error;
+    if (!scene::writeFiles(path, std::move(root), blob, error)) {
+        m_ui.sceneStatus = "Could not save the scene: " + error;
+        std::fprintf(stderr, "%s\n", m_ui.sceneStatus.c_str());
+        return false;
+    }
+    m_scenePath = path;
+    m_ui.sceneName = name;
+    m_ui.sceneStatus = "Saved " + name + " (with " + name + ".bin beside it: the bodies' past and the gas).";
+    std::printf("Saved scene %s\n", utf8Of(path).c_str());
+    return true;
+}
+
+bool App::loadScene(const std::filesystem::path& path) {
+    const std::string name = utf8Of(path.filename());
+    json::Value root;
+    scene::Blob blob;
+    std::string error;
+    auto fail = [&]() {
+        m_ui.sceneStatus = "Could not open " + name + ": " + error;
+        std::fprintf(stderr, "%s\n", m_ui.sceneStatus.c_str());
+        return false;
+    };
+    if (!scene::readFiles(path, root, blob, error)) return fail();
+    // Everything is checked before anything changes; the bodies, settings and camera
+    // are only replaced if they all read correctly.
+    const json::Value* gas = root.find("gas");
+    const json::Value* app = root.find("app");
+    if (gas && !m_particles.load(*gas, blob, error, true)) return fail();
+    if (app && !loadAppState(*app, true, error)) return fail();
+    if (!scene::load(root, blob, m_settings, m_camera, m_bodies, error)) return fail();
+
+    if (m_merger.active()) m_merger.stop();
+    clearTimeline();
+    if (gas) m_particles.load(*gas, blob, error);
+    else m_particles.clear();
+    if (app) loadAppState(*app, false, error);
+    std::vector<keyframes::Keyframe> keys;
+    if (const json::Value* list = root.find("keyframes"); list && keyframes::fromJson(*list, keys)) {
+        m_track.keys = std::move(keys);
+        m_track.playing = false;
+        m_track.rebuild();
+    }
+    // The loaded spin and scale are the ones everything is already in.
+    m_lastSpin = m_settings.spin;
+    m_lastScale = sceneScale();
+    // Predictions are for the bodies that were here before.
+    if (m_jointJob.valid()) m_jointJob.wait();
+    m_jointJob = {};
+    m_jointSlots.clear();
+    m_jointPlannerKey.clear();
+    m_predictions.assign(History::kSlots, trajectory::Path{});
+    m_predictNext = 0;
+    m_streamQ = m_streamRim = -1.0;
+    m_ui.compactnessOrigin = -1;
+    m_ui.inspectValid = false;
+    m_scenePath = path;
+    m_ui.sceneName = name;
+    char text[160];
+    std::snprintf(text, sizeof(text), "Opened %s: %zu bodies, t = %.6g M.", name.c_str(), m_bodies.bodies.size(),
+                  m_bodies.time);
+    m_ui.sceneStatus = text;
+    m_ui.cameraStatus.clear();
+    m_ui.centralStatus.clear();
+    std::printf("%s\n", text);
+    return true;
+}
+
+void App::saveSceneInteractive(bool choose) {
+    if (!choose && !m_scenePath.empty()) {
+        saveScene(m_scenePath);
+        return;
+    }
+    const std::filesystem::path folder = m_scenePath.empty() ? std::filesystem::path("scenes") : m_scenePath.parent_path();
+    const std::filesystem::path name = m_scenePath.empty()
+        ? std::filesystem::path(timestampedPath("scenes", scene::kExtension)).filename()
+        : m_scenePath.filename();
+    if (auto path = dialog::saveScene(m_window, folder, name)) saveScene(*path);
+}
+
+void App::openSceneInteractive() {
+    const std::filesystem::path folder = m_scenePath.empty() ? std::filesystem::path("scenes") : m_scenePath.parent_path();
+    if (auto path = dialog::openScene(m_window, folder)) loadScene(*path);
+}
+
+void App::simulateFrame(double simDt, float realDt) {
+    syncCentral(simDt, realDt);
+    m_bodies.setFrameTime(simDt, m_settings.spin);
+    advanceSimulation(simDt);
+    syncRide(simDt);
+    if (m_settings.flareCamera && m_camera.motion == CameraMotion::Hover) {
+        const double target = flareCameraDistance();
+        m_camera.r += (target - m_camera.r) * (1.0 - std::exp(-realDt / 1.5));
+    }
+    if (m_camera.lookAhead && m_camera.motion != CameraMotion::Hover) m_camera.faceVelocity(m_settings.spin);
+}
+
+std::uint64_t App::simulationFingerprint() const {
+    std::uint64_t hash = 14695981039346656037ull;  // FNV-1a
+    auto mix = [&](const auto& value) {
+        const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&value);
+        for (size_t i = 0; i < sizeof(value); ++i) {
+            hash ^= bytes[i];
+            hash *= 1099511628211ull;
+        }
+    };
+    mix(m_bodies.time);
+    mix(m_bodies.bodies.size());
+    for (const Body& b : m_bodies.bodies) {
+        mix(b.slot);
+        mix(b.kind);
+        mix(b.mass);
+        mix(b.radius);
+        mix(b.temperature);
+        mix(b.brightness);
+        mix(b.spinRate);
+        mix(b.tidalRadius);
+        mix(b.constants);
+        mix(b.state);
+        mix(b.shape);
+    }
+    mix(m_bodies.departed.size());
+    mix(m_bodies.tidalEvents.size());
+    mix(m_bodies.pendingDebris.size());
+    mix(m_bodies.impacts.size());
+    mix(m_particles.edits());
+    mix(m_flashTime);
+    mix(m_burstFuel);
+    mix(m_quakes.size());
+    mix(m_flares.size());
+    mix(m_camera.motion);
+    if (m_camera.motion != CameraMotion::Hover) {
+        mix(m_camera.path);
+        mix(m_camera.geodesic);
+        mix(m_camera.rideSlot);
+    }
+    return hash;
+}
+
+void App::addCheckpoint(bool pinned) {
+    // Debris waiting for the gas goes to it now, so the checkpoint holds all of it.
+    for (const auto& batch : m_bodies.pendingDebris) m_particles.spawn(batch.particles, m_bodies.time, batch.existedBefore);
+    m_bodies.pendingDebris.clear();
+    Timeline::Checkpoint c;
+    c.pinned = pinned;
+    json::Value root = scene::save(m_settings, m_camera, m_bodies, c.blob);
+    root.set("app", saveAppState());
+    c.scene = json::dump(root);
+    ParticleSystem::GpuCopy copy = m_particles.copyOnGpu();
+    if (copy.allocated) {
+        c.gpuBytes = copy.bytes;
+        size_t slot = 0;
+        while (slot < m_gasCopies.size() && m_gasCopies[slot].allocated) ++slot;
+        if (slot == m_gasCopies.size()) m_gasCopies.emplace_back();
+        m_gasCopies[slot] = copy;
+        c.gpu = static_cast<int>(slot);
+    }
+    if (m_timeline.empty()) m_timeline.setSettings(scene::simulationSettings(m_settings));
+    const int replaced = m_timeline.addCheckpoint(std::move(c), m_bodies.time);
+    if (replaced >= 0) releaseGasCopies({replaced});
+}
+
+void App::releaseGasCopies(const std::vector<int>& slots) {
+    for (int slot : slots) {
+        if (slot < 0 || slot >= static_cast<int>(m_gasCopies.size())) continue;
+        ParticleSystem::GpuCopy& copy = m_gasCopies[static_cast<size_t>(slot)];
+        if (copy.buffer) glDeleteBuffers(1, &copy.buffer);
+        copy = ParticleSystem::GpuCopy{};
+    }
+}
+
+void App::clearTimeline() {
+    for (ParticleSystem::GpuCopy& copy : m_gasCopies) {
+        if (copy.buffer) glDeleteBuffers(1, &copy.buffer);
+    }
+    m_gasCopies.clear();
+    m_timeline.clear();
+    m_seekTarget = -1;
+    m_reverse = false;
+}
+
+bool App::restoreCheckpoint(const Timeline::Checkpoint& c) {
+    json::Value root;
+    std::string error;
+    Settings settings = m_settings;
+    Camera camera = m_camera;
+    if (!json::parse(c.scene, root, error) || !scene::load(root, c.blob, settings, camera, m_bodies, error)) {
+        m_ui.cameraStatus = "The timeline could not go back: " + error;
+        return false;
+    }
+    // What moves comes back as it was; how it looks stays as you have it now. A camera on
+    // a path (falling, orbiting, riding) is part of what moves.
+    scene::applySimulationSettings(scene::simulationSettings(settings), m_settings);
+    m_settings.spin = settings.spin;
+    if (camera.motion != CameraMotion::Hover || m_camera.motion != CameraMotion::Hover) m_camera = camera;
+    if (c.gpu >= 0) m_particles.restoreFromGpu(m_gasCopies[static_cast<size_t>(c.gpu)]);
+    else m_particles.restoreFromGpu(ParticleSystem::GpuCopy{});
+    if (const json::Value* app = root.find("app")) loadAppState(*app, false, error);
+    m_lastSpin = m_settings.spin;
+    m_lastScale = sceneScale();
+    if (m_jointJob.valid()) m_jointJob.wait();
+    m_jointJob = {};
+    m_jointSlots.clear();
+    m_jointPlannerKey.clear();
+    m_predictions.assign(History::kSlots, trajectory::Path{});
+    m_predictNext = 0;
+    m_timeline.setPosition(c.step);
+    return true;
+}
+
+bool App::seekTowards(size_t target, double seconds) {
+    target = std::min(target, m_timeline.length());
+    size_t position = m_timeline.position();
+    const Timeline::Checkpoint& c = m_timeline.checkpointFor(target);
+    // Going back, or a checkpoint nearer than where the scene is: start from it.
+    if (target < position || c.step > position) {
+        if (!restoreCheckpoint(c)) return true;
+        position = c.step;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    while (position < target) {
+        const Timeline::Step& step = m_timeline.step(position);
+        if (!step.settings.empty()) scene::applySimulationSettings(step.settings, m_settings);
+        simulateFrame(step.dt, step.realDt);
+        m_timeline.setPosition(++position);
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() > seconds) break;
+    }
+    m_timeline.setSettings(scene::simulationSettings(m_settings));
+    return position == target;
+}
+
+void App::timelineFrame(float realDt, double liveDt) {
+    // What did the user change since the last frame?
+    const std::string settings = scene::simulationSettings(m_settings);
+    const bool started = !m_timeline.empty();
+    const bool acted = started && simulationFingerprint() != m_fingerprint;
+    const bool retuned = started && settings != m_timeline.settings();
+    if ((acted || retuned) && !m_timeline.atEnd()) {
+        // Changed while looking at the past: a new future starts here.
+        releaseGasCopies(m_timeline.truncate());
+        m_seekTarget = -1;
+        m_reverse = false;
+        m_ui.cameraStatus = "Timeline: a new future starts here; what came after this moment was dropped.";
+    }
+    if (!started || acted) addCheckpoint(true);
+
+    bool stepped = false;
+    if (m_seekTarget >= 0) {
+        // Scrubbing: replay toward the moment asked for, a little each frame.
+        stepped = true;
+        if (seekTowards(static_cast<size_t>(m_seekTarget), kSeekBudget)) m_seekTarget = -1;
+    } else if (!m_timeline.atEnd() || (m_reverse && !m_settings.paused)) {
+        // In the past: play on, or back, one recorded frame per frame.
+        if (!m_settings.paused) {
+            const size_t position = m_timeline.position();
+            if (m_reverse) {
+                if (position == 0) {
+                    m_settings.paused = true;
+                    m_reverse = false;
+                } else {
+                    m_seekTarget = static_cast<long long>(position - 1);
+                    if (seekTowards(position - 1, kSeekBudget)) m_seekTarget = -1;
+                    stepped = true;
+                }
+            } else {
+                stepped = true;
+                seekTowards(position + 1, kSeekBudget);
+            }
+        }
+    } else {
+        // Live: step the scene and record the step.
+        m_reverse = false;
+        simulateFrame(liveDt, realDt);
+        stepped = true;
+        if (liveDt > 0.0) {
+            Timeline::Step step;
+            step.dt = liveDt;
+            step.realDt = realDt;
+            if (retuned) step.settings = settings;
+            m_timeline.addStep(std::move(step), m_bodies.time);
+            m_timeline.setSettings(scene::simulationSettings(m_settings));
+            const double tScale = sceneScale() * std::sqrt(sceneScale());
+            if (m_bodies.time - m_timeline.lastCheckpointTime() >= kCheckpointInterval * tScale) addCheckpoint(false);
+            releaseGasCopies(m_timeline.thin(kTimelineMemory, kTimelineGpuMemory));
+        }
+    }
+    // Paused, or holding still in the past: what each frame does anyway (the gas grids are
+    // rebuilt after a restore, flashes fade).
+    if (!stepped) simulateFrame(0.0, realDt);
+    m_fingerprint = simulationFingerprint();
+}
+
+UiContext::TimelineView App::timelineView() const {
+    UiContext::TimelineView v;
+    v.available = m_timelineOn && !m_timeline.empty() && !m_merger.active();
+    v.start = m_timeline.start();
+    v.end = m_timeline.end();
+    v.time = m_timeline.time();
+    v.live = m_timeline.atEnd() && m_seekTarget < 0 && !m_reverse;
+    v.playing = !m_settings.paused;
+    v.reverse = m_reverse;
+    v.seeking = m_seekTarget >= 0 && !m_reverse;
+    v.checkpoints = m_timeline.checkpointCount();
+    v.megabytes = static_cast<double>(m_timeline.bytes()) / (1 << 20);
+    v.gpuMegabytes = static_cast<double>(m_timeline.gpuBytes()) / (1 << 20);
+    return v;
+}
+
+void App::timelineCommand(int command) {
+    if (!m_timelineOn || m_timeline.empty()) return;
+    const size_t position = m_timeline.position();
+    switch (command) {
+        case 1:  // play or pause (forward)
+            if (m_reverse) {
+                m_reverse = false;
+                m_settings.paused = false;
+            } else {
+                m_settings.paused = !m_settings.paused;
+            }
+            break;
+        case 2:  // play backwards (or stop doing so)
+            m_reverse = !m_reverse || m_settings.paused;
+            m_settings.paused = !m_reverse;
+            m_seekTarget = -1;
+            break;
+        case 3:  // back to the present
+            m_reverse = false;
+            m_seekTarget = static_cast<long long>(m_timeline.length());
+            break;
+        case 4:  // to the start
+            m_reverse = false;
+            m_settings.paused = true;
+            m_seekTarget = 0;
+            break;
+        case 5:  // one frame back
+            m_reverse = false;
+            m_settings.paused = true;
+            m_seekTarget = static_cast<long long>(position > 0 ? position - 1 : 0);
+            break;
+        case 6:  // one frame on
+            m_reverse = false;
+            m_settings.paused = true;
+            m_seekTarget = static_cast<long long>(std::min(position + 1, m_timeline.length()));
+            break;
+        default:
+            break;
+    }
+}
+
+std::vector<SceneSound::Voice> App::soundVoices(double timeRate, double& rumble, double& waveHz) const {
+    std::vector<SceneSound::Voice> voices;
+    rumble = 0.0;
+    waveHz = 0.0;
+    const double a = m_settings.spin, scale = sceneScale();
+    if (m_camera.insideHorizon(a)) return voices;
+    // The camera: where it is, which way is right, and its clock's rate (a hovering
+    // camera's ZAMO lapse).
+    const auto pc = kerr::toCartesian(a, m_camera.r, m_camera.theta, m_camera.phi);
+    const glm::dvec3 camera(pc[0], pc[1], pc[2]);
+    const glm::dmat3 view = glm::mat3_cast(keyframes::fromCamera(m_camera, a).orientation);
+    const glm::dvec3 right = view[0];
+    const kerr::Metric mc = kerr::metricAt(a, m_camera.r, m_camera.theta);
+    const double lapseCamera = std::sqrt(std::max(mc.sigma * mc.delta / mc.A, 1e-12));
+    double loudestWave = 0.0;
+    for (const Body& b : m_bodies.bodies) {
+        if (b.inside) continue;
+        const auto pb = kerr::toCartesian(a, b.state.r, b.state.theta, b.state.phi);
+        const glm::dvec3 body(pb[0], pb[1], pb[2]);
+        const glm::dvec3 toCamera = camera - body;
+        const double distance = std::max(glm::length(toCamera), 1e-6);
+        const glm::dvec3 n = toCamera / distance;
+        // g: the body's clock against the camera's (lapses), times the Doppler shift of its
+        // velocity relative to its ZAMO along the line of sight (light bending left out).
+        double v[3] = {0.0, 0.0, 0.0};
+        if (b.state.r > kerr::horizonRadius(a) + 0.05) kerr::zamoVelocity(a, b.constants, b.state, v);
+        const kerr::LocalAxes axes = kerr::localAxes(a, b.state.r, b.state.theta, b.state.phi);
+        glm::dvec3 vel(0.0);
+        for (int i = 0; i < 3; ++i) vel[i] = v[0] * axes.r[i] + v[1] * axes.theta[i] + v[2] * axes.phi[i];
+        const double speed2 = std::min(glm::dot(vel, vel), 0.999999);
+        const double doppler = std::sqrt(1.0 - speed2) / (1.0 - glm::dot(vel, n));
+        const kerr::Metric mb = kerr::metricAt(a, b.state.r, b.state.theta);
+        const double lapseBody = std::sqrt(std::max(mb.sigma * mb.delta / mb.A, 0.0));
+        const double g = std::clamp(lapseBody / lapseCamera * doppler, 0.05, 20.0);
+        const double near = 1.0 / (1.0 + (distance / (25.0 * scale)) * (distance / (25.0 * scale)));
+        const double pan = std::clamp(glm::dot(-n, right), -1.0, 1.0);
+        const int id = 16 * b.slot;
+        if (b.kind == BodyKind::Pulsar && m_settings.soundPulsars) {
+            // Two beams: two ticks a turn, at the shifted rate, louder by g^3.
+            const double rate = std::abs(b.spinRate) * timeRate / kerr::kPi * g;
+            voices.push_back({id, SceneSound::Clicks, std::min(2600.0 * g, 9000.0),
+                              std::min(0.5 * near * g * g * g, 1.0), pan, std::min(rate, 400.0)});
+        } else if (m_settings.soundBodies && b.kind != BodyKind::MiniBlackHole) {
+            double pitch = 220.0;  // Hz, before the shift
+            switch (b.kind) {
+                case BodyKind::Star:
+                case BodyKind::TidalStar: pitch = 220.0 * std::pow(std::max(b.temperature, 1000.0f) / 5800.0, 0.35); break;
+                case BodyKind::RockyPlanet: pitch = 131.0; break;
+                case BodyKind::GasGiant: pitch = 98.0; break;
+                case BodyKind::Moon: pitch = 392.0; break;
+                case BodyKind::WhiteDwarf: pitch = 523.0; break;
+                case BodyKind::NeutronStar: pitch = 659.0; break;
+                default: break;
+            }
+            voices.push_back({id, SceneSound::Tone, std::clamp(pitch * g, 25.0, 8000.0),
+                              std::min(0.25 * near * g * g, 0.7), pan, 0.0});
+        }
+        // Gravitational waves at twice the orbital frequency, from bodies heavy enough to
+        // send out any worth hearing; raised in pitch into hearing.
+        if (m_settings.soundWaves && b.mass >= 1e-3 && m_settings.central.hasHorizon()) {
+            const kerr::Derivatives d = kerr::derivatives(a, b.constants, b.state);
+            const double omega = std::abs(d.dphi / d.dt);  // radians per M
+            const double heard = omega / kerr::kPi * timeRate;  // cycles per real second
+            const double amplitude = std::min(1.0, 30.0 * b.mass) * std::pow(std::min(omega * 14.7, 1.0), 2.0 / 3.0);
+            voices.push_back({id + 1, SceneSound::Wave, std::clamp(heard * 400.0, 30.0, 1500.0),
+                              0.25 * amplitude * near, pan, 0.0});
+            if (amplitude > loudestWave) {
+                loudestWave = amplitude;
+                waveHz = omega / kerr::kPi / central::timeSeconds(1.0, m_settings.central.massSolar);
+            }
+        }
+    }
+    // The tide at the camera grows as 1/r^3: a roar, heard from about the ISCO in.
+    if (m_settings.soundRumble && m_settings.central.hasHorizon()) {
+        const double x = 6.0 / std::max(m_camera.r, 1e-3);
+        rumble = std::clamp(0.35 * x * x * x, 0.0, 1.0);
+    }
+    return voices;
+}
+
+EhtView::Options App::ehtOptions() const {
+    EhtView::Options o;
+    const UiState& ui = m_ui;
+    o.target = std::clamp(ui.ehtTarget, 0, 2);
+    if (o.target == EhtView::ThisHole) {
+        o.spin = m_settings.central.hasHorizon() ? m_settings.spin : 0.0;
+        o.inclinationDeg = std::clamp(m_camera.theta * 180.0 / kerr::kPi, 1.0, 179.0);
+        o.massSolar = m_settings.central.massSolar;
+    } else {
+        o.spin = ui.ehtSpin;
+        o.inclinationDeg = ui.ehtInclination[o.target];
+    }
+    const double frequencies[3] = {86.0, 230.0, 345.0};
+    o.frequencyGHz = frequencies[std::clamp(ui.ehtFrequency, 0, 2)];
+    o.temperature = ui.ehtTemperature[o.target];
+    o.beta = ui.ehtBeta;
+    o.height = ui.ehtHeight[o.target];
+    const int sizes[3] = {96, 160, 256};
+    o.size = m_ehtSizeOverride > 0 ? m_ehtSizeOverride : sizes[std::clamp(ui.ehtResolution, 0, 2)];
+    o.beamUas = ui.ehtBeam;
+    o.curve = ui.ehtCurve;
+    return o;
+}
+
+void App::addKeyframe() {
+    if (m_merger.active()) return;
+    if (m_camera.insideHorizon(m_settings.spin)) {
+        m_track.status = "Keyframes are places a camera can hover: not inside the horizon.";
+        return;
+    }
+    keyframes::Keyframe k = keyframes::fromCamera(m_camera, m_settings.spin);
+    // A first guess at the time to get here: about 3 s, longer for a long way.
+    if (!m_track.keys.empty()) {
+        const double far = glm::length(k.position - m_track.keys.back().position) / (10.0 * sceneScale());
+        m_track.keys.back().duration = std::clamp(3.0 * std::sqrt(std::max(far, 0.1)), 2.0, 12.0);
+    }
+    m_track.keys.push_back(k);
+    m_track.rebuild();
+    char text[96];
+    std::snprintf(text, sizeof(text), "Keyframe %zu added.", m_track.keys.size());
+    m_track.status = text;
+}
+
+void App::playKeyframes(float dt, double timeRate) {
+    const bool filming = m_recording.active && m_recording.cameraPath == RecordKeyframes;
+    if ((!m_track.playing && !filming) || m_track.path.empty() || m_merger.active()) {
+        m_track.playing = m_track.playing && !m_track.path.empty();
+        m_camera.drift = {};
+        return;
+    }
+    if (filming) {
+        m_track.time = static_cast<double>(m_recording.frame) / m_recording.fps;
+    } else {
+        m_track.time += dt;
+        if (m_track.time > m_track.path.duration()) {
+            m_track.playing = false;
+            m_camera.drift = {};
+            m_track.status = "The path is over.";
+            return;
+        }
+    }
+    const keyframes::Pose pose = m_track.path.at(std::min(m_track.time, m_track.path.duration()));
+    if (m_camera.motion != CameraMotion::Hover) setCameraMotion(CameraMotion::Hover);
+    m_settings.flareCamera = false;  // the path sets the distance
+    keyframes::applyPose(pose, m_settings.spin, m_camera.minDistance(m_settings.spin), m_camera);
+    if (m_track.aim) m_camera.yaw = m_camera.pitch = 0.0f;  // facing the center, as yaw = pitch = 0 does
+    m_camera.drift = {};
+    if (m_track.physical) {
+        if (timeRate <= 0.0) {
+            m_track.status = "Time is paused: nothing can move for real. The camera hovers at each point.";
+        } else {
+            // The path's speed in the simulation's time (M per M: in c).
+            bool capped = false;
+            const glm::dvec3 v = keyframes::zamoVelocity(pose.position, pose.velocity / timeRate, m_settings.spin,
+                                                         0.99, capped);
+            m_camera.drift = {v.x, v.y, v.z};
+            char text[160];
+            std::snprintf(text, sizeof(text), "Moving at %.3f c%s.", glm::length(v),
+                          capped ? " (capped: the path is faster than light at this pace of time)" : "");
+            m_track.status = text;
+        }
+    }
+}
+
 void App::advanceSimulation(double dt) {
     const double spin = m_settings.spin;
     m_bodies.update(spin, dt, m_settings.bodyGravity);
+    // The Penrose process: once a negative-energy fragment has fallen in, the hole has lost
+    // mass m1 E1 and angular momentum m1 L1, and turns more slowly (src/penrose.h).
+    for (penrose::Split& split : m_bodies.penroseSplits) {
+        if (!split.absorbed || split.applied) continue;
+        split.applied = true;
+        if (!m_settings.penroseSpinDown || !m_settings.central.hasHorizon()) continue;
+        const double after = std::clamp(penrose::spinAfter(spin, split), 0.0, 0.999);
+        m_settings.central.chi = after;
+        char text[300];
+        std::snprintf(text, sizeof(text),
+                      "The negative-energy fragment fell in: the hole lost %.2g of its mass and %.2g of its angular "
+                      "momentum. Its spin fell from %.4f to %.4f.",
+                      -split.m1 * split.E1, -split.m1 * split.L1 / std::max(spin, 1e-9), spin, after);
+        m_bodies.logEvent(text);
+    }
     for (const auto& batch : m_bodies.pendingDebris) m_particles.spawn(batch.particles, m_bodies.time, batch.existedBefore);
     m_bodies.pendingDebris.clear();
     {
@@ -1678,7 +2573,10 @@ void App::advanceSimulation(double dt) {
                             "back: from here every path, even light's, leads inward.";
     }
     if (m_camera.ended && !wasEnded) {
-        m_ui.cameraStatus = spin > 0.01
+        m_ui.cameraStatus = spin > 1.0
+            ? "The fall ends beside the ring singularity, where the curvature grows without limit. Press R to start "
+              "over."
+            : spin > 0.01
             ? "The fall ends just above the inner horizon. There the Kerr interior stops being trustworthy "
               "(infalling light piles up without limit), so the simulation stops. Press R to start over."
             : "The fall ends just above the singularity, where tides crush everything. Press R to start over.";
@@ -1688,9 +2586,20 @@ void App::advanceSimulation(double dt) {
 
 bool App::startRecording(const std::string& path, int width, int height, int fps, float quality, int cameraPath,
                          double seconds) {
+    if (cameraPath == RecordKeyframes) {
+        if (m_track.keys.size() < 2) {
+            m_ui.videoStatus = "Add at least two camera keyframes (K) to film along them.";
+            std::fprintf(stderr, "%s\n", m_ui.videoStatus.c_str());
+            return false;
+        }
+        seconds = m_track.path.duration();
+        m_track.playing = false;
+    }
     ensureParent(path);
     std::string error;
-    if (!m_recording.encoder.open(path, width, height, fps, error)) {
+    const int audioRate = m_merger.active() ? (m_merger.sound ? MergerScene::kSampleRate : 0)
+                                            : (m_settings.sound ? SceneSound::kSampleRate : 0);
+    if (!m_recording.encoder.open(path, width, height, fps, error, audioRate)) {
         m_ui.videoStatus = "Could not start: " + error;
         std::fprintf(stderr, "Recording failed: %s\n", error.c_str());
         return false;
@@ -1703,6 +2612,8 @@ bool App::startRecording(const std::string& path, int width, int height, int fps
     m_recording.quality = quality;
     m_recording.cameraPath = cameraPath;
     m_recording.frame = 0;
+    m_recording.soundSquares = 0.0;
+    m_recording.soundSamples = 0;
     m_recording.total = std::max(1, static_cast<int>(std::lround(seconds * fps)));
     m_recording.startPhi = m_camera.phi;
     m_recording.startR = m_camera.r;
@@ -1716,6 +2627,12 @@ void App::recordFrame() {
     int w = 0, h = 0;
     m_renderer.readOutput(m_recording.pixels, w, h);
     std::string error;
+    if (m_merger.active() || m_settings.sound) {
+        const std::vector<int16_t>& sound = m_merger.active() ? m_merger.lastAudio() : m_sound.lastMono();
+        for (int16_t x : sound) m_recording.soundSquares += static_cast<double>(x) * x;
+        m_recording.soundSamples += static_cast<long long>(sound.size());
+        if (!m_recording.encoder.writeAudio(sound.data(), sound.size(), error)) std::fprintf(stderr, "%s\n", error.c_str());
+    }
     if (!m_recording.encoder.write(m_recording.pixels.data(), error)) {
         m_ui.videoStatus = "Recording failed: " + error;
         std::fprintf(stderr, "%s\n", m_ui.videoStatus.c_str());
@@ -1731,8 +2648,14 @@ void App::stopRecording() {
     std::string error;
     if (m_recording.encoder.close(error)) {
         char text[512];
-        std::snprintf(text, sizeof(text), "Saved %s (%d frames, %.1f s)", m_recording.path.c_str(),
-                      m_recording.frame, static_cast<double>(m_recording.frame) / m_recording.fps);
+        int n = std::snprintf(text, sizeof(text), "Saved %s (%d frames, %.1f s)", m_recording.path.c_str(),
+                              m_recording.frame, static_cast<double>(m_recording.frame) / m_recording.fps);
+        if (m_recording.soundSamples > 0 && n > 0) {
+            // How loud the sound track is (rms, as a fraction of full scale).
+            std::snprintf(text + n, sizeof(text) - n, ", with sound (%.1f s, rms %.3f)",
+                          static_cast<double>(m_recording.soundSamples) / SceneSound::kSampleRate,
+                          std::sqrt(m_recording.soundSquares / m_recording.soundSamples) / 32768.0);
+        }
         m_ui.videoStatus = text;
     } else {
         m_ui.videoStatus = "Failed to finish the video: " + error;
@@ -1781,27 +2704,51 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
         last = now;
         m_fps = m_fps <= 0.0f ? 1.0f / std::max(dt, 1e-4f) : 0.95f * m_fps + 0.05f / std::max(dt, 1e-4f);
 
+        // A scene dropped onto the window (or its .bin sidecar) is opened.
+        if (!m_inbox.dropped.empty()) {
+            std::filesystem::path path = pathFromUtf8(m_inbox.dropped.front());
+            m_inbox.dropped.clear();
+            if (path.extension() == ".bin") path.replace_extension();
+            if (path.extension() == scene::kExtension) {
+                loadScene(path);
+            } else {
+                m_ui.sceneStatus = "Only scene files (.bhscene) can be dropped here.";
+            }
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+        if (m_merger.active()) m_camera.scale = 1e15;  // zoom out as far as the kilonova
         if (!headless) handleInput(dt);
 
         // Simulation. Time runs in scene units: the dynamical time grows as scale^1.5.
-        const bool advance = !m_settings.paused && !screenshotMode;
+        // The neutron star merger runs a scene of its own (src/merger_scene.h).
+        const bool merging = m_merger.active();
+        if (merging) {
+            m_camera.scale = 1e15;
+            const int budget = headless || m_recording.active ? 600 : 14;
+            m_merger.update(dt, m_settings.paused || screenshotMode, m_camera, budget, !headless && !m_recording.active);
+        }
+        const bool advance = !merging && !m_settings.paused && !screenshotMode;
         const double tScale = sceneScale() * std::sqrt(sceneScale());
         const double simDt = advance ? dt * m_settings.timeScale * tScale * approachSlowdown() * flarePace() : 0.0;
-        syncCentral(simDt, dt);
-        m_bodies.setFrameTime(simDt, m_settings.spin);
-        advanceSimulation(simDt);
-        syncRide(simDt);
-        if (m_settings.flareCamera && m_camera.motion == CameraMotion::Hover) {
-            const double target = flareCameraDistance();
-            m_camera.r += (target - m_camera.r) * (1.0 - std::exp(-dt / 1.5));
+        if (!merging) playKeyframes(dt, dt > 0.0f ? simDt / dt : 0.0);
+        if (m_timelineOn && !merging && !screenshotMode) timelineFrame(dt, simDt);
+        else simulateFrame(simDt, dt);
+        {
+            // The scene's sound, carried by light (the merger makes its own).
+            const bool on = m_settings.sound && !merging;
+            double rumble = 0.0;
+            std::vector<SceneSound::Voice> voices;
+            if (on) voices = soundVoices(dt > 0.0f ? simDt / dt : 0.0, rumble, m_waveHz);
+            m_sound.update(voices, rumble, dt, !headless && !m_recording.active, on, m_settings.soundVolume);
         }
-        if (m_camera.lookAhead && m_camera.motion != CameraMotion::Hover) m_camera.faceVelocity(m_settings.spin);
         updatePredictions();
 
-        if (m_recording.active && m_camera.motion == CameraMotion::Hover) {
+        if (merging) {
+            // The merger's camera follows the action by itself.
+        } else if (m_recording.active && m_camera.motion == CameraMotion::Hover) {
             const double progress = static_cast<double>(m_recording.frame) / m_recording.total;
             if (m_recording.cameraPath == RecordOrbit) {
                 m_camera.phi = m_recording.startPhi + 2.0 * kerr::kPi * progress;
@@ -1809,7 +2756,7 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
                 m_camera.r = std::max(m_recording.startR * std::pow(0.3, progress),
                                       m_camera.minDistance(m_settings.spin) + 0.7 * sceneScale());
             }
-        } else if (m_settings.autoOrbit && !headless && m_camera.motion == CameraMotion::Hover) {
+        } else if (m_settings.autoOrbit && !headless && m_camera.motion == CameraMotion::Hover && !m_track.playing) {
             m_camera.orbit(m_settings.autoOrbitSpeed * dt, 0.0);
         }
         if (m_settings.vsync != m_vsync && !headless && !m_recording.active) {
@@ -1819,42 +2766,67 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
         if (now - lastReloadCheck > 0.5) {
             m_renderer.hotReload();
             m_particles.hotReload();
+            m_merger.hotReload();
             lastReloadCheck = now;
         }
 
-        // Render
-        m_renderer.uploadHistory(m_bodies.history);
-        buildPaths();
-        FrameInputs in;
-        in.width = m_recording.active ? m_recording.width : fbw;
-        in.height = m_recording.active ? m_recording.height : fbh;
-        if (m_recording.active) in.renderScale = m_recording.quality;
-        GpuBodies gpuBodies;
-        {
-            // A traced pixel's angle, for drawing bodies too small to resolve as points.
-            const double traceHeight =
-                std::max(1.0, in.height * static_cast<double>(in.renderScale > 0.0f ? in.renderScale
-                                                                                    : m_settings.renderScale));
-            const double pixelAngle = 2.0 * std::tan(0.5 * m_camera.fovDeg * kerr::kPi / 180.0) / traceHeight;
-            const auto cam = kerr::toCartesian(m_settings.spin, m_camera.r, m_camera.theta, m_camera.phi);
-            m_bodies.fillGpu(m_settings.spin, m_settings.lightDelay, m_camera.r, glm::dvec3(cam[0], cam[1], cam[2]),
-                             pixelAngle, gpuBodies);
+        // Dynamic resolution: the traced resolution follows a frame-time target,
+        // scale *= (target / measured)^(1/2) (the cost goes as the pixel count), smoothed and
+        // stepped by 1/40 so the targets are not reallocated every frame.
+        if (m_settings.dynamicResolution && !headless && !m_recording.active) {
+            if (m_dynamicScale <= 0.0f) m_dynamicScale = m_settings.renderScale;
+            const float measured = m_renderer.gpuMilliseconds();
+            if (measured > 0.5f) {
+                const float wanted =
+                    std::clamp(m_settings.renderScale * std::sqrt(m_settings.targetMs / measured), 0.4f, 1.0f);
+                m_dynamicScale += (wanted - m_dynamicScale) * 0.1f;
+                const float stepped = std::round(m_dynamicScale * 40.0f) / 40.0f;
+                if (std::abs(stepped - m_settings.renderScale) >= 0.025f) m_settings.renderScale = stepped;
+            }
+        } else {
+            m_dynamicScale = 0.0f;
         }
-        const CentralView view = centralView();
-        const FlareView flare = flareView();
-        in.flare = &flare;
-        in.settings = &m_settings;
-        in.camera = &m_camera;
-        in.bodies = &gpuBodies;
-        in.particles = &m_particles;
-        in.central = &view;
-        in.skipBody = ridingIndex();
-        in.spin = m_settings.spin;
-        in.scale = sceneScale();
-        in.reach = m_bodies.reach();
-        in.exposureBoost = 1.0f + 6.0f * m_screenFlash;
-        in.time = m_bodies.time;
-        m_renderer.render(in);
+
+        // Render
+        const int outW = m_recording.active ? m_recording.width : fbw;
+        const int outH = m_recording.active ? m_recording.height : fbh;
+        if (merging) {
+            m_merger.render(m_renderer, m_settings, m_camera, outW, outH,
+                            m_recording.active ? m_recording.quality : m_settings.renderScale);
+        } else {
+            m_renderer.uploadHistory(m_bodies.history);
+            buildPaths();
+            FrameInputs in;
+            in.width = m_recording.active ? m_recording.width : fbw;
+            in.height = m_recording.active ? m_recording.height : fbh;
+            if (m_recording.active) in.renderScale = m_recording.quality;
+            GpuBodies gpuBodies;
+            {
+                // A traced pixel's angle, for drawing bodies too small to resolve as points.
+                const double traceHeight =
+                    std::max(1.0, in.height * static_cast<double>(in.renderScale > 0.0f ? in.renderScale
+                                                                                        : m_settings.renderScale));
+                const double pixelAngle = 2.0 * std::tan(0.5 * m_camera.fovDeg * kerr::kPi / 180.0) / traceHeight;
+                const auto cam = kerr::toCartesian(m_settings.spin, m_camera.r, m_camera.theta, m_camera.phi);
+                m_bodies.fillGpu(m_settings.spin, m_settings.lightDelay, m_camera.r, glm::dvec3(cam[0], cam[1], cam[2]),
+                                 pixelAngle, gpuBodies);
+            }
+            const CentralView view = centralView();
+            const FlareView flare = flareView();
+            in.flare = &flare;
+            in.settings = &m_settings;
+            in.camera = &m_camera;
+            in.bodies = &gpuBodies;
+            in.particles = &m_particles;
+            in.central = &view;
+            in.skipBody = ridingIndex();
+            in.spin = m_settings.spin;
+            in.scale = sceneScale();
+            in.reach = m_bodies.reach();
+            in.exposureBoost = 1.0f + 6.0f * m_screenFlash;
+            in.time = m_bodies.time;
+            m_renderer.render(in);
+        }
         if (m_recording.active) recordFrame();
         if (!headless) m_renderer.present(fbw, fbh);
 
@@ -1866,6 +2838,20 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
         ui.slowdown = approachSlowdown();
         ui.pace = flarePace();
         ui.scale = sceneScale();
+        ui.merger = &m_merger;
+        ui.timeline = timelineView();
+        ui.track = &m_track;
+        ui.waveHz = m_waveHz;
+        if (m_ui.ehtOpen && !merging) {
+            m_eht.update(ehtOptions());
+            if (screenshotMode) m_eht.finish();  // the picture must hold the finished image
+            const bool panel = !headless || options.screenshotUi;
+            const float em = ImGui::GetFontSize();
+            const bool bar = panel && m_ui.showPanel && m_ui.showTimeline && ui.timeline.available;
+            m_eht.draw(panel && m_ui.showPanel ? m_ui.panelRight + 0.5f * em : 0.0f, bar ? 5.6f * em : 0.0f);
+        } else if (m_eht.busy()) {
+            m_eht.shutdown();
+        }
         if (!headless || options.screenshotUi) drawUi(ui);
         ImGui::Render();
         if (headless) {
@@ -1878,12 +2864,40 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
         }
 
         if (ui.screenshotRequested) saveScreenshot(timestampedPath("screenshots", ".png"));
+        if (ui.sceneFileRequest == 1 || ui.sceneFileRequest == 2) saveSceneInteractive(ui.sceneFileRequest == 2);
+        if (ui.sceneFileRequest == 3) openSceneInteractive();
         if (ui.cameraMotionRequested >= 0) setCameraMotion(static_cast<CameraMotion>(ui.cameraMotionRequested));
         if (ui.rideRequested >= 0) rideWith(ui.rideRequested);
         if (ui.sceneRequested >= 0) applyScene(ui.sceneRequested);
         if (ui.einsteinRingRequested) addEinsteinRing();
         if (ui.centralRequested >= 0) applyCentral(ui.centralRequested);
         if (ui.quakeRequested) starquake();
+        if (ui.timelineSeekRequested && m_timelineOn && !m_timeline.empty()) {
+            m_reverse = false;
+            m_settings.paused = true;
+            m_seekTarget = static_cast<long long>(m_timeline.positionAt(ui.timelineSeekTime));
+        }
+        if (ui.timelineCommand) timelineCommand(ui.timelineCommand);
+        if (ui.keyframeRequest == 1) addKeyframe();
+        if (ui.keyframeRequest == 2) {
+            m_track.playing = !m_track.playing && m_track.keys.size() >= 2;
+            m_track.time = 0.0;
+            m_track.status.clear();
+            if (!m_track.playing) m_camera.drift = {};
+        }
+        if (ui.keyframeGo >= 0 && ui.keyframeGo < static_cast<int>(m_track.keys.size())) {
+            m_track.playing = false;
+            m_camera.drift = {};
+            if (m_camera.motion != CameraMotion::Hover) setCameraMotion(CameraMotion::Hover);
+            m_settings.flareCamera = false;
+            keyframes::applyPose(m_track.path.at(m_track.path.arrival(static_cast<size_t>(ui.keyframeGo))),
+                                 m_settings.spin, m_camera.minDistance(m_settings.spin), m_camera);
+        }
+        if (ui.mergerRequest == 1) m_merger.start(m_camera);
+        if (ui.mergerRequest == 2) {
+            m_merger.stop();
+            m_camera.reset();
+        }
         if (ui.burstRequested) {
             const bool dwarf = m_settings.central.kind == central::Kind::WhiteDwarf;
             triggerFlash(dwarf ? 10.0 : 4.0, dwarf ? 300.0 : 30.0, dwarf ? "Nova." : "Type I X-ray burst.");
@@ -1900,8 +2914,9 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
         if (recordMode && !m_recording.active) break;  // video finished
         if (screenshotMode && ++frame >= options.frames) {
             glFinish();
-            if (!m_renderer.shaderErrors().empty() || !m_particles.errors().empty()) {
-                std::fprintf(stderr, "%s%s\n", m_renderer.shaderErrors().c_str(), m_particles.errors().c_str());
+            if (!m_renderer.shaderErrors().empty() || !m_particles.errors().empty() || !m_merger.errors().empty()) {
+                std::fprintf(stderr, "%s%s%s\n", m_renderer.shaderErrors().c_str(), m_particles.errors().c_str(),
+                             m_merger.errors().c_str());
                 exitCode = 2;
             }
             saveScreenshot(options.screenshotPath);
@@ -1923,6 +2938,7 @@ int App::run(const LaunchOptions& options, const std::filesystem::path& shaderDi
                             b.constants.L, b.constants.Q, x[0], x[1], x[2]);
             }
             if (m_particles.active()) std::printf("  debris: %s\n", m_particles.describe().c_str());
+            if (m_merger.active()) std::printf("  %s\n", m_merger.describe().c_str());
             if (m_camera.motion != CameraMotion::Hover) {
                 glm::vec3 v = m_camera.velocity(m_settings.spin);
                 std::printf("  camera: r = %.3f, speed %.3f c, clock rate %.3f, proper time %.2f M%s\n", m_camera.r,

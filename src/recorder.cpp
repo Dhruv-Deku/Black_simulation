@@ -21,6 +21,10 @@ using Microsoft::WRL::ComPtr;
 struct VideoRecorder::Impl {
     ComPtr<IMFSinkWriter> writer;
     DWORD stream = 0;
+    DWORD audioStream = 0;
+    bool audio = false;
+    int audioRate = 0;
+    long long audioSamples = 0;
     int width = 0, height = 0, fps = 30;
     long long frame = 0;
     bool comInitialized = false;
@@ -65,7 +69,7 @@ bool VideoRecorder::isOpen() const {
     return m->writer != nullptr;
 }
 
-bool VideoRecorder::open(const std::string& path, int width, int height, int fps, std::string& error) {
+bool VideoRecorder::open(const std::string& path, int width, int height, int fps, std::string& error, int audioRate) {
     if (isOpen()) close(error);
     if (width % 2 || height % 2 || width <= 0 || height <= 0) {
         error = "video width and height must be positive and even";
@@ -116,6 +120,39 @@ bool VideoRecorder::open(const std::string& path, int width, int height, int fps
     if (SUCCEEDED(hr)) hr = in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
     if (SUCCEEDED(hr)) hr = in->SetUINT32(MF_MT_DEFAULT_STRIDE, static_cast<UINT32>(width * 4));
     if (SUCCEEDED(hr)) hr = m->writer->SetInputMediaType(m->stream, in.Get(), nullptr);
+
+    // Sound (optional): mono 16-bit PCM in, AAC at 128 kbit/s out. Without an AAC encoder
+    // the video is still written, silent.
+    m->audio = false;
+    m->audioSamples = 0;
+    if (SUCCEEDED(hr) && audioRate > 0) {
+        ComPtr<IMFMediaType> aout, ain;
+        MFCreateMediaType(&aout);
+        HRESULT ha = aout->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        if (SUCCEEDED(ha)) ha = aout->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+        if (SUCCEEDED(ha)) ha = aout->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        if (SUCCEEDED(ha)) ha = aout->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, static_cast<UINT32>(audioRate));
+        if (SUCCEEDED(ha)) ha = aout->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 1);
+        if (SUCCEEDED(ha)) ha = aout->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16000);
+        DWORD index = 0;
+        if (SUCCEEDED(ha)) ha = m->writer->AddStream(aout.Get(), &index);
+        MFCreateMediaType(&ain);
+        if (SUCCEEDED(ha)) ha = ain->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        if (SUCCEEDED(ha)) ha = ain->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        if (SUCCEEDED(ha)) ha = ain->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        if (SUCCEEDED(ha)) ha = ain->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, static_cast<UINT32>(audioRate));
+        if (SUCCEEDED(ha)) ha = ain->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 1);
+        if (SUCCEEDED(ha)) ha = ain->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 2);
+        if (SUCCEEDED(ha)) ha = ain->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, static_cast<UINT32>(audioRate * 2));
+        if (SUCCEEDED(ha)) ha = m->writer->SetInputMediaType(index, ain.Get(), nullptr);
+        if (SUCCEEDED(ha)) {
+            m->audio = true;
+            m->audioStream = index;
+            m->audioRate = audioRate;
+        } else {
+            std::fprintf(stderr, "No sound in the video: %s\n", failure("Setting up the AAC encoder", ha).c_str());
+        }
+    }
     if (SUCCEEDED(hr)) hr = m->writer->BeginWriting();
     if (FAILED(hr)) {
         error = failure("Configuring the video input", hr);
@@ -160,6 +197,33 @@ bool VideoRecorder::write(const unsigned char* bgra, std::string& error) {
     return true;
 }
 
+bool VideoRecorder::writeAudio(const int16_t* samples, size_t count, std::string& error) {
+    if (!isOpen() || !m->audio || count == 0) return true;
+    const DWORD size = static_cast<DWORD>(count * sizeof(int16_t));
+    ComPtr<IMFMediaBuffer> buffer;
+    HRESULT hr = MFCreateMemoryBuffer(size, &buffer);
+    BYTE* dst = nullptr;
+    if (SUCCEEDED(hr)) hr = buffer->Lock(&dst, nullptr, nullptr);
+    if (SUCCEEDED(hr)) {
+        std::memcpy(dst, samples, size);
+        buffer->Unlock();
+        hr = buffer->SetCurrentLength(size);
+    }
+    ComPtr<IMFSample> sample;
+    if (SUCCEEDED(hr)) hr = MFCreateSample(&sample);
+    if (SUCCEEDED(hr)) hr = sample->AddBuffer(buffer.Get());
+    const LONGLONG ticks = 10'000'000LL;
+    if (SUCCEEDED(hr)) hr = sample->SetSampleTime(m->audioSamples * ticks / m->audioRate);
+    if (SUCCEEDED(hr)) hr = sample->SetSampleDuration(static_cast<LONGLONG>(count) * ticks / m->audioRate);
+    if (SUCCEEDED(hr)) hr = m->writer->WriteSample(m->audioStream, sample.Get());
+    if (FAILED(hr)) {
+        error = failure("Encoding sound", hr);
+        return false;
+    }
+    m->audioSamples += static_cast<long long>(count);
+    return true;
+}
+
 bool VideoRecorder::close(std::string& error) {
     bool ok = true;
     if (m->writer) {
@@ -187,7 +251,7 @@ struct VideoRecorder::Impl {};
 VideoRecorder::VideoRecorder() : m(std::make_unique<Impl>()) {}
 VideoRecorder::~VideoRecorder() = default;
 bool VideoRecorder::isOpen() const { return false; }
-bool VideoRecorder::open(const std::string&, int, int, int, std::string& error) {
+bool VideoRecorder::open(const std::string&, int, int, int, std::string& error, int) {
     error = "video recording needs Windows Media Foundation";
     return false;
 }
@@ -195,6 +259,7 @@ bool VideoRecorder::write(const unsigned char*, std::string& error) {
     error = "no video is being recorded";
     return false;
 }
+bool VideoRecorder::writeAudio(const int16_t*, size_t, std::string&) { return true; }
 bool VideoRecorder::close(std::string&) { return true; }
 
 #endif
