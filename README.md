@@ -24,6 +24,24 @@ whole event: [docs/tidal-disruption-flare.mp4](docs/tidal-disruption-flare.mp4) 
   mass, radius, temperature and field, and the spin its real rotation period gives. For the
   same mass, **orbits and light bending outside the surface are identical** for all of them
   (Birkhoff's theorem): only how close you can get changes.
+- **Watch two neutron stars merge, as GW170817 did:** `--merger`, or *Neutron star merger →
+  Start the merger*. Two stars of 1.35 Suns and 12 km are simulated on the GPU with
+  smoothed-particle hydrodynamics (12,000 particles each: self-gravity, a hot nuclear
+  equation of state, shocks). Gravitational waves drain their orbit at Peters' rate and
+  they spiral together. Tides draw them out into spiral arms, they collide in a flash and a
+  cloud of hot debris billows out around what they merge into, a hypermassive neutron star
+  at ~10^11 K, which collapses into a black hole of ~2.6 Suns
+  inside a torus, ringing down at its quasi-normal frequency. A jet then breaks out of the
+  debris 1.7 s after the merger (the gamma-ray burst, as GRB 170817A) and its cocoon spills
+  X-ray-hot gas sideways. The r-process ejecta glow for days as a kilonova, blue then red,
+  following the light curves fitted to AT2017gfo. Time runs from the last orbits
+  (milliseconds) to the kilonova (days), slowing for the merger and the burst. **Two
+  views**, as in the films and in the papers: a *cinematic* one (the default), ray traced
+  at the screen's full resolution while the camera circles the scene, with the stars
+  bending the light behind them and the spiral of gravitational waves; and a *simulation*
+  one, the matter's column density seen from above with the wave and the clock; or both
+  side by side. The wave is also **heard**: it is in the audible band, and it plays at its
+  true pitch, live and in the videos' sound track.
 - **Real sizes, real neighbours:** everything around a star or planet is at its true size
   and distance. The Moon (a quarter of the Earth's size, 60 Earth radii out, eclipsed by the
   Earth's shadow), the space station and a geostationary satellite; Io, Europa, Ganymede and
@@ -82,12 +100,16 @@ whole event: [docs/tidal-disruption-flare.mp4](docs/tidal-disruption-flare.mp4) 
     glitch) and rings in its torsional modes at 22 and 35 Hz, shaking the magnetic poles:
     the beams quiver and the star shimmers. Raise its *Magnetic tilt* and the beams sweep
     round like a lighthouse's.
-  - **White dwarfs:** a cataclysmic variable: a red dwarf filling its Roche lobe (Eggleton's
-    radius, 57 white-dwarf radii away, turning every 1.9 hours), its gas falling from the L1
-    point along the ballistic path of the Roche potential onto a disk truncated by its tide;
-    the disk smooth and hot (blue-white inside, golden, red at its rim), with the two tidal
-    spiral shocks of Doppler tomography and the bright spot where the stream strikes. Sirius
-    B, alone, blazes in electric blue inside wisps of glowing gas.
+  - **White dwarfs:** a cataclysmic variable: a red dwarf filling its Roche lobe, drawn as
+    the exact equipotential, a teardrop drawn out to a point at L1 (57 white-dwarf radii
+    away, turning every 1.9 hours), gravity-darkened down its nose, its gas falling from L1
+    along the ballistic path of the Roche potential onto a disk truncated by its tide; the
+    disk opaque and hot, in the colors artists paint these disks (white-blue at the white
+    dwarf, blue, gold, orange, red at its rim, in fine rings), with the two tidal spiral
+    shocks of Doppler tomography and the bright spot where the stream strikes. The white
+    dwarf itself, as in artists' pictures: white-hot, marbled with deep-blue clouds of
+    plasma, ringed by a blue-white rim and crackling with threads of blue plasma in a blue
+    haze. Sirius B, alone, blazes the same way inside wisps of glowing gas.
   - **Accreting neutron stars:** a small, blazing star inside a thick, turbulent torus of
     plasma (the puffed-up inner disk of a bright X-ray binary), its eddies wound into spiral
     flames, launching jets wound with helical magnetic field; the millisecond pulsar's beams
@@ -173,15 +195,69 @@ whole event: [docs/tidal-disruption-flare.mp4](docs/tidal-disruption-flare.mp4) 
 - **Relativistic jets** with knots that appear to move faster than light: the jet coming
   toward you blazes and the counter-jet all but vanishes.
 - **Record videos** (MP4, up to 4K, 60 fps) with Windows' built-in encoder.
+- **Hear it** (*Sound*, off by default): every body hums a tone of its own, pitched by its
+  kind and temperature and panned by where it is in the view; pulsars tick each time a beam
+  sweeps past; the tide roars as the camera nears the hole; heavy bodies send out
+  gravitational waves at twice their orbital frequency, raised in pitch to be heard (the
+  true frequency is shown, millihertz around a supermassive hole). Every sound is carried
+  by light: its pitch and rate are multiplied by g, the frequency ratio the light is
+  coloured by, so an approaching star sings sharp and one near the horizon sinks low.
+  Videos record it too.
+- **Faster:** below full resolution the traced image is enlarged with FSR 1 (an
+  edge-adaptive upscale after AMD's FidelityFX Super Resolution, then contrast-adaptive
+  sharpening), keeping the photon ring crisp at half resolution for a third of the cost;
+  *Dynamic resolution* follows a frame-time target; the GPU's time per pass is shown.
+- **Spin it past the limit (a naked singularity):** tick *Naked singularity* and push the
+  spin above 1. There is no horizon any more: the shadow opens up into a lensed whirl of
+  sky with a bright arc on one side (the part of the photon ring that survives; Hioki and
+  Maeda 2009), light that passes through the ring singularity's disk comes from a second
+  region where gravity repels (its sky drawn mirrored and violet), light that strikes the
+  ring is drawn white-hot, and the disk reaches in to r ≈ 0.7 M, where gas can be bound by
+  more than its rest mass. (Hypothetical: cosmic censorship holds that nature forbids it.)
+- **Mine a black hole's spin (the Penrose process):** a body falls in on a parabolic orbit
+  that turns round deep inside the ergosphere, and splits there. One piece is thrown
+  against the rotation so fast that its energy, as seen from far away, is negative; it
+  falls in, and the other piece flies out with more energy than the whole body brought
+  (7.5% more at spin 0.99). The hole loses that energy from its rotation and visibly spins
+  down. A panel gives the energies, angular momenta and masses of all three, the gain
+  (never above the 20.7% limit), and the hole's mass, spin, irreducible mass and area
+  before and after, with the area theorem's check.
+- **See it as the Event Horizon Telescope does:** press T for M87* or Sagittarius A* at
+  230 GHz, at their real angular size in microarcseconds: the light of a hot accretion flow
+  (thermal synchrotron), ray traced through the hole's spacetime with full radiative
+  transfer, its density set so the total flux matches what is observed (0.5 Jy, 2.4 Jy),
+  next to the same image blurred to the array's 20-microarcsecond resolution. The exact
+  edge of the shadow (the critical curve), the ring the EHT measured and the beam are drawn
+  on, with M87* turned to its real orientation on the sky (its jet at position angle 288
+  degrees; the bright side falls in the south, as in the 2019 image). Its ring comes out
+  42 microarcseconds across, as measured. Or image the black hole in the scene, from the
+  camera's angle.
+- **Fly a film camera:** press K wherever you want a shot, then at the next place, and
+  so on. *Play* flies the camera through them on a smooth path at an even pace, easing to
+  a stop where it starts, holds and ends, turning smoothly through every shot; *Record
+  video → Along the keyframes* films it. *Move for real* makes the camera actually travel
+  at the speed the path demands in the simulation's time, and see the sky crowd forward
+  and blueshift (relativistic aberration). Keyframes are saved with the scene.
+- **Go back in time:** a timeline bar along the bottom reaches back to the start. Drag it to
+  any earlier moment, step frame by frame (`[` and `]`), play the past forward or
+  **backwards** (Shift+Space), or jump back to the present. What you see is the scene
+  exactly as it was, gas and all, not a recording: the simulation is deterministic, so the
+  timeline keeps checkpoints and the length of every frame, and replays from the nearest
+  checkpoint. Change anything while looking at the past and a new future starts from there.
+- **Save and open scenes:** Ctrl+S saves everything that decides what happens next (the
+  central object, every setting, the camera on its path, every body with its orbit, shape
+  and past, the gas, the flashes and the random numbers); Ctrl+O, or dropping the file on
+  the window, opens it again, and it carries on **bit for bit** as it would have. The
+  scene is readable JSON, `NAME.bhscene`, with its bulky parts in `NAME.bhscene.bin` beside it.
 
 ## Download and run
 
-Prebuilt Windows executables are in `bin\`: download the repository (*Code → Download ZIP*,
+A prebuilt Windows executable is in `bin\`: download the repository (*Code → Download ZIP*,
 or clone it), keep its folders together, and run `bin\blackhole.exe`. It finds `shaders\`
 and `assets\` in the folder above it. It needs Windows 10 or 11 and a graphics card with
 OpenGL 4.6 (any NVIDIA or AMD card of the last ten years, recent Intel graphics); the C++
-runtime is built in, so nothing else has to be installed. `bin\kerr_tests.exe` runs the
-physics tests.
+runtime is built in, so nothing else has to be installed. The physics tests are built
+with the simulator (see *Building*).
 
 ## Building
 
@@ -196,8 +272,8 @@ workload (it includes CMake), and a GPU with OpenGL 4.6.
 `build.ps1` uses Visual Studio 2026, or Visual Studio 2022 when 2026 is not installed. The
 first configure downloads GLFW, GLM, Dear ImGui and stb (pinned versions), which
 takes a couple of minutes. The executable is `build\Release\blackhole.exe`. Edits to
-`shaders\` reload while it runs. To refresh the prebuilt ones, copy `blackhole.exe` and
-`kerr_tests.exe` from `build\Release\` into `bin\`.
+`shaders\` reload while it runs. To refresh the prebuilt one, copy `blackhole.exe` from
+`build\Release\` into `bin\`.
 
 ## Controls
 
@@ -216,11 +292,27 @@ takes a couple of minutes. The executable is `build\Release\blackhole.exe`. Edit
 | G | Toggle the lensing grid |
 | Tab | Hide or show the interface |
 | F12 | Save a screenshot to `screenshots\` |
+| K | Add a camera keyframe where the camera is |
+| T | What the Event Horizon Telescope sees (M87*, Sgr A* or this black hole) |
+| Shift+Space | Play the past backwards (Space plays it forward or pauses) |
+| [ / ] | One frame back / on along the timeline |
+| Ctrl+S | Save the scene (to the file last saved or opened; the first time, asks where) |
+| Ctrl+Shift+S | Save the scene somewhere else |
+| Ctrl+O | Open a scene (or drop a `.bhscene` file onto the window) |
 | Esc | Stop recording |
 | H | Show the controls |
 
 ### Things to try
 
+- **Neutron star merger → Start the merger**, *Side by side*, sound on: two neutron stars
+  spiral in, chirping up from a hum to a whistle, are pulled into spiral arms and merge in a
+  flash; a cloud of debris billows out, glowing white, then gold, orange and red as it
+  cools, with the merged star shining through its gaps; on the right the simulation draws
+  the same matter from above and the wave runs down the side. The remnant collapses, the
+  camera pulls back as the ejecta billow out, the jet
+  bursts from both poles 1.7 s after the merger, and the kilonova fades from blue to red
+  over twelve days while the edge-on slice shows why: blue at the poles, red in the plane.
+  Zoom or drag at any moment to look around (*Follow the action* gives the camera back).
 - **Camera → Free fall** from the default view: watch the shadow swell, then cross the
   horizon. Or add **Plunge**, ride it (*Ride along*), and turn on *Look where you're going*.
 - **Objects → Tidal disruption**, time scale ~40: the star stretches, tears apart near
@@ -270,7 +362,8 @@ takes a couple of minutes. The executable is `build\Release\blackhole.exe`. Edit
 
 ```text
 blackhole [options]
-  center   --central earth|jupiter|brown-dwarf|red-dwarf|sun|red-giant|white-dwarf|sirius-b|
+  center   --naked (a black hole may spin past 1: --spin up to 1.5)
+           --central earth|jupiter|brown-dwarf|red-dwarf|sun|red-giant|white-dwarf|sirius-b|
                      neutron-star|pulsar|millisecond-pulsar|magnetar|stellar-black-hole|sgr-a|m87
            --mass MSUN  --radius-km KM  --compactness R/M  --temperature K  --field GAUSS
            --physical-units
@@ -280,7 +373,7 @@ blackhole [options]
   objects  --preset NAME (repeatable):
              isco circular retrograde precessing zoom-whirl polar plunge flyby cluster
              planet gas-giant pulsar tde tde-flare grazing binary moon cloud ring
-             einstein-ring mini-hole white-dwarf
+             einstein-ring mini-hole white-dwarf penrose
              real companions: the-moon space-station geostationary asteroid-impact
              galilean-moons comet-impact inner-planets hot-jupiter sungrazer
              proxima-planets giant-planets wd-planet wd-asteroid cv-companion clump
@@ -290,8 +383,21 @@ blackhole [options]
   camera   --distance R  --inclination DEG  --azimuth DEG  --fov DEG
            --camera hover|orbit|fall   --ride N   --look-ahead
   output   --screenshot PATH [--frames N] [--ui] [--size WxH] [--scale S]
-           --record PATH [--duration S] [--fps N] [--camera-path flown|orbit|push-in]
+           --upscale bilinear|fsr   --dynamic-resolution   --sound
+           --record PATH [--duration S] [--fps N] [--camera-path flown|orbit|push-in|keyframes]
   probes   --inspect X,Y   --heatmap   --debug-directions
+  merger   --merger   --merger-view cinematic|simulation|split   --merger-particles N
+           --merger-masses M1,M2   --merger-collapse MS   --merger-advance S
+           --no-sound   --no-captions   (--distance is in km around the merger)
+  scenes   --scene-file PATH   open a saved scene first (other options apply on top)
+           --save-scene PATH   save the scene once set up (after --advance)
+           --seek T            after --advance, go back to time T on the timeline (replayed)
+           --no-timeline       record no timeline
+  eht      --eht m87|sgra|here   --eht-inclination DEG   --eht-spin A   --eht-temperature K
+           --eht-thickness H/R   --eht-size N
+  keys     --keyframe R,INCL,AZ[,S]   a camera keyframe facing the center (repeatable), S s after the last
+           --keyframes-physical       the camera moves along them for real
+           --camera-path keyframes    a video's camera follows them (the video lasts as long)
 ```
 
 Around a star or planet, distances (`--distance`) and times (`--advance`) are in scene units:
@@ -311,6 +417,20 @@ and the whole of AT2019qiz, from the star's approach to the outflow, as a 75-sec
 
 ```powershell
 .\build\Release\blackhole.exe --scene tde --size 1920x1080 --record at2019qiz.mp4 --duration 75 --fps 60
+```
+
+and a 13-second fly-by through four keyframes, from far away to skimming the disk and up
+over the pole:
+
+```powershell
+.\build\Release\blackhole.exe --keyframe 45,80,0 --keyframe 16,62,70,4 --keyframe 9,86,160,4 --keyframe 30,25,250,5 --camera-path keyframes --record flyby.mp4 --fps 60
+```
+
+and the neutron star merger, filmed both ways (each about 85 s, with the wave's sound):
+
+```powershell
+.\build\Release\blackhole.exe --merger --merger-view cinematic --size 1920x1080 --record merger-cinematic.mp4 --duration 78
+.\build\Release\blackhole.exe --merger --merger-view simulation --size 1920x1080 --record merger-simulation.mp4 --duration 78
 ```
 
 ## How it works
@@ -607,7 +727,10 @@ otherwise, and film colors (on by default) follow them while keeping the physics
   radii and then slowly) with plumes of gas thrown off at a few spots.
 - **Electric blues** for neutron stars, magnetars and white dwarfs (their light is mostly
   ultraviolet and X-rays): a white-hot core fading to blue at the limb, the surface seething
-  (fixed to the star, so it shows the spin), the physics' hot poles and spots riding on it;
+  (fixed to the star, so it shows the spin), the physics' hot poles and spots riding on it
+  (a white dwarf's marbled with deep-blue clouds: domain-warped noise, its limb rimmed
+  blue-white; around it threads of plasma, the crests of ridged noise on shells out to
+  2.2 R twisted with height, in a blue haze falling off over 0.2 R);
   denser shells of field lines (12, or a magnetar's 16, per shell), each with a soft halo,
   white-hot near the star; beams white along the axis, blue at the edge. A white dwarf
   blazes inside the streamers of a corona, in blue.
@@ -627,8 +750,13 @@ dimmed to 4% and their glare blooms; around neutron stars a little less.
 **A cataclysmic variable.** A white dwarf fed by a disk has a companion: a red dwarf of
 0.15 solar masses and 0.19 solar radii filling its Roche lobe. Eggleton's (1983)
 r_L / a = 0.49 q^(2/3) / (0.6 q^(2/3) + ln(1 + q^(1/3))) (q = 0.25) puts it a = 494,000 km
-(57 white-dwarf radii) away, a 1.9 hour orbit, drawn as an ellipsoid stretched to the
-inner Lagrange point. L1 is the root of the Roche potential's gradient between the stars,
+(57 white-dwarf radii) away, a 1.9 hour orbit. It takes the shape of the Roche
+equipotential through L1 (Kopal 1959): in the frame turning with the binary, separation 1
+and G (M1 + M2) = 1, Phi = -mu1 / r1 - mu2 / r2 - ((x - mu2)^2 + y^2) / 2, a teardrop whose
+tip is a cusp at L1. Each ray chord through the sphere that bounds the lobe samples Phi 40
+times and bisects the first crossing; the surface normal is grad Phi, and the effective
+gravity |grad Phi| darkens it (flux ~ g^(4 x 0.08), Lucy 1967's exponent for convective
+envelopes; zero at L1). L1 is the root of the Roche potential's gradient between the stars,
 -1/x^2 + q/(1 - x)^2 + (1 + q) x - q = 0 (0.637 a from the white dwarf). The stream is the
 ballistic path from rest at L1 in the rotating Roche potential, integrated by RK4 (Lubow
 and Shu 1975): Coriolis bends it ahead of the companion; it would swing within
@@ -637,10 +765,12 @@ truncates at 0.6 a / (1 + q) = 0.48 a (Paczynski 1977). Its gas heats from ~3,50
 ~14,000 K as it falls, widening. The disk is optically thick and smooth; the companion's
 tide raises two open spiral shocks in its outer half (Doppler tomography of IP Peg,
 Steeghs, Harlaftis and Horne 1997), and where the stream strikes, its bright spot; both
-turn with the binary. In film colors the disk's brightness is compressed (square root), as
-an exposure for the whole disk would show it, and its annuli drawn as rings: blue-white
-inside, golden, red at the rim. The companion takes the Sun's ultraviolet colors made
-redder, its face toward the white dwarf heated, brightest where its gas pours out at L1.
+turn with the binary. In film colors the disk's brightness is compressed (fourth root,
+capped below white so its hottest part stays blue), as an exposure for the whole disk would
+show it, in the colors artists give these disks by temperature (white-blue above ~35,000 K,
+blue, pale gold at 10,000 K, gold, orange, red below ~5,000 K), and its annuli drawn as fine
+rings. The companion takes the Sun's ultraviolet colors made redder, its face toward the
+white dwarf heated, darker down its nose, glowing again where its gas pours out at L1.
 
 **Helical jets.** The disk's rotation winds the field it launches into helices around
 each jet: three strands per jet on its surface, a turn every ~6 M at the base, loosening
@@ -794,9 +924,344 @@ on a parabolic orbit) comes back within ~900 M instead of the weeks a real star 
 scaled up to be seen. Its gas is as hot inside as its own gravity makes it, (3/7) G m / R* per
 unit mass; it glows blue-white (display only), lit by its leftover heat and the flare.
 
+### Neutron star mergers (`src/merger*`, `shaders/merger_*`)
+
+Units are G = c = 1 with the Sun's mass as 1: lengths of 1.4766 km, times of 4.9255 µs.
+
+**The stars.** Each is an n = 1 polytrope, P = K ρ², whose radius does not depend on its
+mass: R = √(πK/2), so K = 2R²/π gives 12 km for both stars and a central density of
+1.2×10^15 g/cm³ for 1.35 Suns. Its particles start on a face-centred cubic lattice,
+each moved outward so that the share of particles inside it equals the share of the
+polytrope's mass, m(r) ∝ sin ξ − ξ cos ξ with ξ = πr/R (a "stretched lattice": far quieter
+than random positions). A few hundred damped steps then settle the stars into SPH
+equilibrium. Each particle keeps where it started in its star as a label, which travels
+with the matter.
+
+**The inspiral.** While the stars are farther apart than 40 km they are carried whole along
+Peters' circular inspiral, a(t) = a₀(1 − t/T)^(1/4), T = 5a₀⁴/(256 m₁m₂M), with the
+orbital phase integrated from Kepler's ω = √(M/a³). From 40 km every particle is followed.
+
+**The hydrodynamics** (`merger_density.comp`, `merger_force.comp`, `merger_integrate.comp`,
+`merger_reduce.comp`): standard SPH with the M4 cubic spline and ~58 neighbours
+(h = 1.2 (m/ρ)^(1/3)), found through a hashed grid whose cells are as wide as the cores'
+kernels, with the particles put in Morton order every 16 steps so that neighbours sit
+together in memory. The equation of state is the hybrid one of merger simulations,
+P = Kρ² + (Γ_th − 1)ρu_th with Γ_th = 1.75: the cold part is barotropic, so only the thermal
+energy is evolved, heated by Monaghan's artificial viscosity (α = 1, β = 2, with Balsara's
+switch so that the remnant's shear is not damped). Gravity is every particle on every
+other, Plummer-softened, summed in tiles in shared memory. The orbit loses energy through
+the 2.5PN radiation-reaction force (Iyer & Will 1993),
+a = (8/5) η M²/r³ [(3v² + 17/3 M/r) ṙ n − (v² + 3M/r) v],
+applied to the two stars' centres and shared by mass, until their cores touch; on a
+circular orbit it drains energy at exactly the quadrupole rate. Time steps follow the
+Courant and force limits; kick-drift-kick leapfrog.
+
+**The waves.** Each step the GPU sums d²I/dt² = Σ m (2vv + xa + ax), the second derivative
+of the mass quadrupole, and the strain seen from direction n at distance D is the
+transverse-traceless part of h = (2/D) d²I/dt². Before the hydrodynamics starts it is the
+point-mass formula with Peters' phase.
+
+**The collapse.** At the chosen moment (15 ms after the merger by default; a 2.7-Sun
+remnant of a soft equation of state lasts milliseconds to a second) the remnant collapses.
+Walking outward from its densest point, a bound parcel falls in unless its specific angular
+momentum exceeds the ISCO's, 2√3 M(<r) (Schwarzschild); the hole's mass and spin come from
+what falls in, and the rest stays as a torus. From then on the hole pulls with the
+Paczyński–Wiita potential −M/(r − 2M), swallowing what comes within 2.5M, and the wave
+continues with its l = m = 2 ringdown (Berti, Cardoso & Will 2006): Mω = 1.5251 −
+1.1568(1 − χ)^0.1292, Q = 0.7 + 1.4187(1 − χ)^−0.499 (6.6 kHz for 2.6 Suns at χ = 0.7).
+Eight milliseconds later the hydrodynamics stops and unbound matter coasts on in straight
+lines.
+
+**The debris cloud.** The collision itself throws out a few thousandths of a Sun, the
+dynamical ejecta (Hotokezaka et al. 2013; Sekiguchi et al. 2016; Radice et al. 2018): tidal
+tails flung from the stars' far sides into the orbital plane, and gas squeezed out of the
+shocked interface between the cores, faster (up to ~0.3 c) and more toward the poles. In
+the picture (`DebrisCloud` in `src/merger.h`) 0.005 Suns leave the stars' surface (15 km) as
+they touch, the edge coasting at 0.3 c, 90 km further each millisecond. Shocked to
+~5×10^10 K, they cool adiabatically as radiation-dominated gas does, T ∝ 1/R. The two tails
+trail from the line the stars touched along, wound back by the turning binary, thin in the
+plane and fanning out; the shocked gas puffs out all round. Both break into billows
+(Kelvin-Helmholtz and Rayleigh-Taylor turbulence frozen into the coasting gas, from noise
+baked into a 128³ texture, `merger_noise.comp`), lit from within by the remnant, each billow
+shaded by the one inside it. The true cloud's optical depth, 3κM/(4πR²) with electron
+scattering, is ~10^15 at first and still hundreds after an hour: it would hide the remnant
+at once. It is drawn thinning as the true one does, as 1/R², but from 3 optical depths (at
+115 km) instead, and handed over to the kilonova's components once it is thinner than a
+few tenths, about 5 ms after the merger. Its colour is its temperature, shown compressed
+(2,500 K at 10^9 K, rising as the square root): white as it leaves, then gold, orange and
+red as it expands, the unshocked tails cooler and redder than the shocked gas. The cores'
+collision is a flash rising within 40 µs and fading over 0.4 ms.
+
+**The kilonova.** The three components fitted to AT2017gfo (Villar et al. 2017): blue
+(0.020 Suns at 0.256 c, κ = 0.5 cm²/g), purple (0.047 at 0.152 c, κ = 3) and red (0.011 at
+0.137 c, κ = 10, lanthanide-rich). They are heated by r-process decay (Korobkin et al. 2012:
+4×10^18 (½ − arctan((t − 1.3 s)/0.11 s)/π)^1.3 erg/g/s, ~2×10^10 at a day), of which the
+share Barnes et al. (2016) fit is kept. Each component's light curve is Arnett's,
+L(t) = e^(−(t/t_d)²) ∫ 2Mε(t′)(t′/t_d)e^((t′/t_d)²) dt′/t_d with
+t_d = √(2κM/(βvc)), β = 13.7, and its photosphere glows at (L/4πσ(vt)²)^(1/4) until it
+cools to the fitted floor. The blue component peaks within a day, the red later; together
+they give ~5×10^41 erg/s a day after the merger. In the picture each component expands
+homologously (r = vt, so its clumps are frozen in velocity space) out to 1.25 times its mean
+speed, its optical depth from 3κM/(4πr²) and its surface brightness from its photosphere's
+temperature: the blue in lobes toward the poles, the purple slightly flattened, the red in a
+disk in the orbital plane (as the tidal tails left), along the directions the simulation's
+own unbound matter took. Once the hydrodynamics stops, the simulation view turns edge-on
+and shows this structure as a slice through the spin axis, colored by composition, with the
+jet's funnel and cocoon, beside the light curve.
+
+**The jet.** A jet launched along the hole's spin axis 0.8 s after the merger drills
+through the ejecta with its head at 0.7 c; their edge along the axis (the blue component's)
+coasts at 0.37 c, so it breaks out at t = 0.7 × 0.8/(0.7 − 0.37) = 1.7 s, the delay between
+GW170817 and GRB 170817A. Its core
+(~5°, Γ ≈ 100) is Doppler-boosted ~2Γ along the axis and de-boosted below 1 a few tens of
+degrees off it, which is why the burst seen ~25° off-axis was so faint. After breakout the
+hot cocoon spills sideways at 0.3 c.
+
+**The clock.** The event spans milliseconds to weeks, so time is shown at a rate that grows
+with the time to or from the merger: 0.32 e-folds of the time to the merger per second
+of viewing before it, 2,500 times slow motion at the merger, then 0.18 and, once the
+hole has formed, 0.55 e-folds per second, held back around the burst.
+
+**The cinematic view** (`merger_view.frag`) marches each pixel's ray through the scene,
+bending it with x″ = −3M h² x/r⁵ (h = |x × x′|) for each star, which is exact outside one
+spherical mass (u″ + u = 3Mu²: the photon sphere and the √27 M shadow follow), and capturing
+it inside 2M of the hole. The simulation's matter is spread onto a 128³ grid and absorbs and
+glows by density and temperature, Doppler-boosted by its motion and textured by its labels
+(veins of hotter plasma that stretch with the tides); the gravitational wave is drawn where
+the ray crosses the orbital plane, as Re[H(t − r) e^(−2iφ)]: the two-armed spiral the
+quadrupole sends out at the speed of light. It is traced at the screen's full resolution
+(about 22 ms a frame at 1920 × 1080 on a laptop RTX 5050 while the debris cloud billows),
+and the camera circles the scene by itself, a full turn every 45 s, rising and dipping
+every 50 s. **The simulation view** (`merger_map.frag`)
+is the column density through the orbital plane on a 1024² map, on a log scale through the
+"inferno" color map, with the strain of the wave seen face-on and the clock.
+
+**The sound** is the wave itself at its true frequency (a few hundred Hz rising to kHz, then
+the remnant's ~3 kHz ring and the hole's 6.6 kHz ringdown), its amplitude relative to the
+loudest, following the picture's slow motion; the burst adds a rumble (space carries no
+sound: this is a film's convention). Videos of the merger carry it as an AAC track.
+
+### Scene files (`src/scene_file.*`, `src/json.*`)
+
+A scene is everything that decides what happens next, so that a loaded scene runs on
+exactly as the saved one would have. `NAME.bhscene` is JSON: the central object; every
+setting (but VSync, which belongs to the screen); the camera, with its geodesic, its proper
+time and the body it rides; every body with its constants of motion (E, L, Q), its state,
+mass, size, temperature, its tidal shape F and Ḟ, its trail; the bodies that are gone but
+whose light is still on its way; impacts; the tidal disruptions so far, each with its
+fallback table; the events; the coordinate time; the history's step; and the full states
+of the random number generators (Mersenne twisters, 624 words each). Doubles and floats
+are written in their shortest form that reads back to the same bits (`std::to_chars`);
+infinities travel as strings. Numbers are kept as the text they were written with until a
+field reads them, as a double or as a float, so nothing is rounded twice.
+
+`NAME.bhscene.bin` holds the bulky parts as tagged chunks: every body's light-delay history
+(512 KB a body: 8,192 samples of position, 4-velocity and shape), the 96-byte parcels of
+gas exactly as they sit on the GPU (their light-delayed copies included), and the
+surface's hot spots. The JSON records the sidecar's size and FNV-1a checksum, so a sidecar
+from another save is refused. Both are written to temporary files first, then renamed.
+
+Loading checks everything before anything changes. The gas physics reads the gas grid of
+the frame before, which the file does not hold: the first step after loading rebuilds it
+from the restored parcels in a pass that only deposits them (as the saved run had done
+after its last step), then steps. The grids are sums of fixed-point integers, which do not
+depend on the order the GPU adds them in, so the run continues bit for bit: saving,
+loading and saving again gives the same files, and a scene loaded and run on for 60 M
+saves to the same bytes and renders to the same pixels as the original run for 120 M
+(checked with a gas cloud, a binary and a star on its way to disruption; a neutron star
+with gas striking it, starquakes and a falling camera; and AT2019qiz after the disruption).
+
+
+### The timeline (`src/timeline.*`)
+
+The simulation is deterministic: from the same state, the same frame steps do exactly the
+same thing, bit for bit (the scene files show it). So the timeline keeps checkpoints,
+whole scenes as a scene file would hold them, every 25 M of scene time, and the length of
+every frame between them. The gas goes into a buffer of its own on the GPU (copied there
+without being read back). To show an earlier moment, the scene is restored from the last
+checkpoint before it and the logged frames are replayed up to it without being drawn, at
+most 30 ms of them a frame; played on, the replay retraces exactly what happened. Played
+backwards, each frame is a restore and a short replay.
+
+Settings that change what happens (the central object, gravity between bodies, the gas
+physics, what sets off flashes) are logged with the frame they first apply to and replayed;
+settings that only change the look are not, so scrubbing never undoes your exposure. What
+you do to the scene itself (add a body, set off a burst, start the camera falling) is
+noticed by a fingerprint of the bodies, the gas and the flashes taken at the end of every
+frame: if it changed by the next, a checkpoint is taken at once and kept, so no replay runs
+across it from before. Done while looking at the past, either one starts a new future, and
+the old one is dropped. When the memory fills up (256 MB of checkpoints, 512 MB of gas on
+the GPU), every other checkpoint goes, so the whole run stays reachable, with longer
+replays.
+
+### Naked singularities (spin above 1)
+
+For a > 1, Δ = r² − 2r + a² = (r − 1)² + b² > 0 everywhere (b = √(a² − 1)): no horizon. The
+ring singularity sits at r = 0 in the equator, where Σ = r² + a²cos²θ vanishes. Mino-time
+R(r) and Θ(θ) are polynomials, regular at r = 0, so a ray through the ring's disk (r = 0
+with θ ≠ π/2) is simply integrated on into r < 0, a second asymptotic region in which the
+hole's gravity repels; near the ring, step sizes are set by √Σ rather than r (otherwise
+steps shrink without end as r → 0). Rays that leave to r → −∞ show that region's sky,
+mirrored and tinted violet; rays that reach Σ < (0.02 M)² end on the singularity, drawn
+white; without a horizon to end them, rays near the photon orbits wind round many times,
+and get four times the step budget. Matter, jets and orbit paths live only in our region
+(r > 0), and the disk only crosses there.
+
+The Kerr-Schild shifts take their closed forms, ∫(r² + a²)/Δ dr − r = ln Δ + (2/b)
+arctan((r − 1)/b) and ∫a/Δ dr = (a/b) arctan((r − 1)/b). The equatorial photon orbits solve
+r(r − 3)² = 4a²: past a = 1 the prograde one (between M and 3M) is gone, which is why the
+shadow opens on that side, and the retrograde one lies beyond 3M. The ISCO is where the
+circular orbits' energy is least (dE/dr = 0), found numerically: 0.67 M at a = 1.1, 0.75 M
+at a = 1.3, where E is 0.03 and 0.33: a disk there would release 97% and 67% of the rest
+mass (just above a = 1, more than all of it). The outer edge of the ergoregion exists only
+where a²cos²θ < 1.
+
+### The Penrose process (`src/penrose.*`)
+
+Measured by the local zero-angular-momentum observer (ZAMO), with lapse α = √(ΣΔ/A),
+frame-dragging rate ω = 2ar/A and circumferential radius ϖ = √(A/Σ) sin θ, a particle of
+velocity v has energy E = γ(α + ωϖ v_φ) and angular momentum L = γϖ v_φ per unit mass.
+E < 0 needs v_φ < −α/(ωϖ), possible below c only where α < ωϖ: in the ergosphere.
+
+The body comes in on the prograde parabolic orbit (E = 1, Q = 0) whose closest approach r
+satisfies R(r) = 0, i.e. (2 − r)L² − 4aL + 2(r² + a²) = 0 (the smaller root), with r 70%
+of the way from the ergosphere's edge to the horizon (but outside the marginally bound
+radius, which no infalling body passes and returns). There, its fall halted, it splits:
+its 4-momentum in the ZAMO's frame is shared, m₀γ₀(1, v₀) = m₁γ₁(1, v₁) + m₂γ₂(1, v₂), so
+m₀E₀ = m₁E₁ + m₂E₂ and likewise for L. Fragment 1 is thrown at 0.95 c; its direction (in
+the r-φ plane) and mass are searched for the largest gain −m₁E₁/(m₀E₀) among splits where
+fragment 1 must fall in and fragment 2 must escape (from the zeros of R(r), as in the launch
+planner). Fragment 1 shares the body's past (its light-delay history). When it crosses the
+horizon the hole's mass changes by δM = m₁E₁ and its angular momentum by δJ = m₁L₁, and its
+spin becomes a′ = (a + δJ)/(1 + δM)². The area never shrinks: δM − Ω_H δJ = m₁(E₁ − Ω_H L₁)
+≥ 0 with Ω_H = a/(2r₊), the condition P(r₊) ≥ 0 that any body crossing the horizon meets.
+What rotation can give at all is M − M_irr, M_irr = √(A/16π) (Christodoulou:
+M² = M_irr² + J²/(4M_irr²)), 29.3% of M at a = 1; a single split at the horizon of a
+maximally spinning hole gains at most (√2 − 1)/2 = 20.7%.
+
+### What the Event Horizon Telescope sees (`src/eht.*`, `src/eht_view.*`)
+
+**The image plane.** A distant observer at inclination i sees the light that arrives with
+impact parameters (α, β) in M (Bardeen 1973): L/E = −α sin i, Q/E² = β² + (α² − a²) cos² i,
+the sign of p_θ from the sign of β. Each pixel's ray starts 1,000 M out and is traced back
+with the same Mino-time integrator as everything else; rays that reach the horizon are the
+shadow. Its exact edge is the critical curve, from the spherical photon orbits of radius r
+between the prograde and retrograde ones:
+ξ = [r²(3 − r) − a²(r + 1)]/[a(r − 1)], η = r³[4a² − r(r − 3)²]/[a²(r − 1)²],
+α = −ξ/sin i, β = ±√(η + a²cos²i − ξ²cot²i); a circle of radius √27 M without spin.
+M subtends θ_g = GM/(c²D): 3.82 µas for M87* (6.5e9 Suns at 16.8 Mpc), 5.13 µas for Sgr A*
+(4.3e6 Suns at 8.28 kpc), so the shadow of a hole without spin would be 39.7 and 53.3 µas.
+
+**The flow** (after Broderick and Loeb 2006): electrons of density
+n_e = n₀ r^−1.1 exp(−z²/2(hρ)²) and temperature T_e = T₀ r^−0.84 in a field
+B = √(8π n_e m_p c²/(6βr)) (plasma β ≈ 10), rotating at 0.9 of the Keplerian rate outside
+the ISCO and plunging along the ISCO's geodesic inside it, where it thins as it speeds up
+(r² n u^r constant). Its 4-velocity gives each point's frequency shift
+g = 1/(−p·u) = 1/(u^t − L u^φ − p_r u^r) for the photon's covariant momentum.
+
+**Radiative transfer.** Along each ray, front to back from the camera, with the affine
+length dλ = Σ dτ_Mino (× GM/c² in cm) and the fluid frame's path dλ/g:
+I_obs = Σ_k e^(−τ_k) g_k³ S_k (1 − e^(−Δτ_k)), Δτ_k = α_k Δλ_k / g_k, the exact solution
+of a step with constant source function S = j/α. The emissivity is thermal synchrotron
+(Leung, Gammie and Noble 2011): ν_c = eB/(2πm_ec), θ_e = kT_e/(m_ec²),
+ν_s = (2/9)ν_c θ_e² sin θ_B, X = ν/ν_s,
+j_ν = n_e √2 π e² ν_s /(3K₂(1/θ_e)c) (X^½ + 2^(11/12) X^(1/6))² exp(−X^(1/3)), at the emitted
+frequency ν/g, for a tangled field (sin θ_B = √(2/3)); K₂ from Abramowitz and Stegun's
+approximations, with exp(1/θ_e) folded into the exponent so cool gas does not underflow.
+Absorption follows Kirchhoff, α_ν = j_ν/B_ν(T_e). n₀ is found by a secant iteration on
+small images until the total flux F = 10²³ Σ I Δα Δβ θ_g² Jy matches the observed one.
+
+**What is shown.** The model image (linear brightness to its 99.5th percentile, matplotlib's
+"afmhot" color map as in the EHT's figures), and the same image convolved with a Gaussian of
+the array's resolution (20 µas FWHM). The ring's diameter is measured on the blurred image
+as twice the mean radius of peak brightness from the shadow's center over 72 directions:
+42.1 µas for M87* (spin 0.5, T₀ = 1.5e12 K, H/R = 0.5) against the EHT's 42 ± 3. Images are
+made on worker threads, a quick 64-pixel look first.
+
+### Sound (`src/scene_sound.*`)
+
+Space carries no sound, so this is a film's convention, but each sound rides on light. For
+every body the frequency ratio g is estimated from the light it sends the camera: its clock
+against the camera's (the ZAMO lapses √(ΣΔ/A)) times the Doppler factor
+√(1 − v²)/(1 − v·n) of its velocity relative to its ZAMO along the line of sight n (light
+bending is left out here, unlike in the picture). A tone's pitch is its own times g,
+louder by g² and for nearer bodies, panned by the body's direction against the camera's
+right. A pulsar ticks twice a turn (two beams) at its turning rate in the simulation's time
+times g, louder by g³ (beaming). The rumble's level grows as (6M/r)³, as the tide. A body
+over 0.1% of the hole's mass radiates gravitational waves at twice its orbital frequency
+(Ω/π per M), heard 400 times higher; the panel gives the true frequency, (Ω/π)/(GM/c³).
+Voices are mixed in stereo with equal-power panning, their pitch, loudness and panning
+ramped across each buffer so nothing clicks, and limited softly (tanh); videos get a mono
+mix as an AAC track.
+
+### Speed
+
+**FSR 1.** Traced below the window's size, the image is tone mapped at the traced size
+(16-bit), then enlarged by an edge-adaptive upscale after AMD's FidelityFX Super Resolution
+(EASU): 12 nearby pixels weighted by a polynomial Lanczos-2 kernel rotated to the local edge
+(found from luma differences around the 4 nearest, bilinearly weighted), stretched along it
+up to √2, narrowed across it and with a weaker negative lobe where there is no edge, then
+clamped to the 4 nearest pixels' range so it cannot ring. Robust contrast-adaptive
+sharpening (RCAS) follows: each pixel against its 4 neighbours with the strongest negative
+lobe that keeps it within their range (at most −3/16), scaled by 2^(−sharpness); the dither
+that hides banding comes last. At 1920×1080 traced at half resolution: 14.9 ms against
+48.5 ms at full, with the photon ring nearly as crisp.
+
+**Dynamic resolution** scales the traced resolution by √(target/measured) each frame
+(the cost follows the pixel count), smoothed and stepped by 1/40 so the targets are not
+reallocated every frame, between 0.4 and 1. **Timers:** GL timestamp queries around the
+ray trace, the bloom and the tone map with the upscale, read back three frames later so
+the GPU never stalls.
+
+### Camera keyframes (`src/keyframes.*`)
+
+A keyframe is the camera's place (Kerr-Schild Cartesian), its orientation (a quaternion
+turning its right, up and backward axes onto Cartesian ones), its field of view, the
+seconds to the next keyframe and a hold. The path through the places is a **centripetal
+Catmull-Rom spline**: knots t_(i+1) = t_i + |P_(i+1) − P_i|^(1/2), evaluated with Barry and
+Goldman's pyramid of linear interpolations; it passes through every keyframe and never
+loops or forms a cusp within a segment (Yuksel et al. 2011), as the uniform kind can when
+keyframes are unevenly spaced. Each end is extended by reflecting its neighbour.
+
+Each segment is **reparametrized by arc length**: its length is tabulated at 32 steps
+(five-point Gauss-Legendre quadrature of |dP/du|), and a distance is turned back into the
+spline's parameter by Newton's method from the table, so equal distances take equal time.
+The distance along the path follows a monotone cubic through the times the camera is due at
+each keyframe (Fritsch and Carlson: the speed at each keyframe is the mean of the two
+segments' speeds, limited so that (m_i/d)² + (m_(i+1)/d)² ≤ 9, and zero where it starts,
+holds and ends): the camera keeps to the schedule, never backs up, and eases in and out.
+
+The orientation follows **squad** (Shoemake 1987): slerp(slerp(q_i, q_(i+1), h),
+slerp(s_i, s_(i+1), h), 2h(1 − h)), with h the fraction of the segment's length covered.
+Shoemake's inner points s_i = q_i exp(−(log(q_i⁻¹q_(i+1)) + log(q_i⁻¹q_(i−1)))/4) turn
+smoothly only when every segment is crossed at the same rate; here segments differ in
+length, so the turning rate per unit length is matched instead (the non-uniform
+Catmull-Rom tangent in the quaternions' log space, scaled by each side's length, giving an
+inner point for each side). The field of view is a Catmull-Rom of the keyframes' values.
+
+The camera hovers at each point (a *cinema* camera: at rest relative to the local ZAMO,
+no aberration). With **move for real**, it is given the path's velocity: dP/dt divided by
+the coordinate time passing per second, less the ZAMO's frame-dragged motion ω ẑ × P, on
+the local axes and over the lapse, boosted onto the ZAMO's frame as u = γ(e₀ + vⁱeᵢ), and
+capped at 0.99 c. The ray tracer then sees the sky aberrated and Doppler shifted as from
+any moving camera.
+
 ### Tests (`tests/test_kerr.cpp`)
 
-356 checks against exact results:
+480 checks against exact results:
+
+- neutron star mergers: GW170817's chirp mass (1.188 Suns) and its 24 Hz, ~100 s before
+  the merger; the chirp frequency equals twice Kepler's at Peters' separation; a(t) =
+  a₀(1 − t/T)^(1/4); the 2.5PN reaction loses energy at the quadrupole rate (1e-12), and
+  integrating it from 40 M to 12 M takes Peters' time (1%); a circular binary's strain is
+  4μM/(aD) face-on, half that and no × polarization edge-on; the polytrope's central
+  density (1.2e15 g/cm³), mass and hydrostatic equilibrium (1e-6); a stretched-lattice star
+  of exactly n particles following the mass profile; temperatures from thermal energy; a
+  cold ball collapses whole while a Keplerian ring at 40 M stays out, with no spin; the
+  Schwarzschild ringdown (Mω = 0.3737, τ ≈ 11 M) and 6.6 kHz for 2.6 Suns at χ = 0.7;
+  r-process heating 2e10 erg/g/s at a day falling as t^−1.3; the blue kilonova peaking
+  within a day before the red, ~5e41 erg/s in all at a day, the red photosphere at its
+  floor late on; the jet breaking out at 1.7 s; on- and off-axis Doppler factors; the clock;
 
 - tidal disruption flares: a Sun torn apart by a million-Sun hole starts coming back after
   41 days and falls back at up to 3 Suns a year; t_min ∝ M^(1/2); Kepler's 2π a^1.5; the
@@ -823,7 +1288,10 @@ unit mass; it glows blue-white (display only), lit by its leftover heat and the 
 - close binaries: Eggleton's Roche lobe (0.379 a for equal masses); L1 against Plavec and
   Kratochvil's fit (1.5%, q = 0.1 to 1) and halfway for equal masses; the ballistic stream's
   closest approach against Lubow and Shu's r_min = 0.0488 q^-0.464 a (6%, q = 0.1 to 0.5);
-  the stream bending ahead of the companion and ending at the tidally truncated rim;
+  the stream bending ahead of the companion and ending at the tidally truncated rim; the
+  Roche potential's gradient against finite differences, no net force at L1, the volume of
+  the lobe (integrated over directions) against Eggleton's radius (1%, q = 0.1 to 3), the
+  lobe reaching L1, and its teardrop shape (pole < side < back < point);
   from 1.02 to 6 R, and its calibration; which look each object gets;
 
 - units and the catalogue (1 M of M87* is 64 AU; the Sun is 471,000 M);
@@ -869,7 +1337,46 @@ unit mass; it glows blue-white (display only), lit by its leftover heat and the 
 - the tidal energy spread and ring inclinations of the debris;
 - the fate classifier against brute-force integration;
 - the radial light-travel time [r + 4 ln(r − 2) in Kerr-Schild time];
-- the ray inspector's classification of shadow, sky and disk.
+- the ray inspector's classification of shadow, sky and disk;
+- scene files: doubles and floats (the smallest denormal, the largest double, −0) come
+  back bit for bit, infinities and NaN too, escapes and UTF-8 survive, a malformed file is
+  refused with its line; a scene with a disrupted star, a binary, a precessing orbit and a
+  falling camera saves, loads and saves to identical files, and the loaded copy evolves
+  bit for bit like the original (random numbers included, a preset added afterwards lands
+  in the same place); a changed sidecar, an impossible value (reported with where it is,
+  nothing changed) and a newer version are refused;
+- the timeline: bodies pulling on each other, stepped by frames of uneven length, with
+  bodies added along the way: any moment restored from a checkpoint and replayed is the
+  scene as it was, bit for bit; no replay runs across what the user did; thinning keeps
+  the first, the latest and the pinned checkpoints and stays exact; a new future drops
+  the old one and records on;
+- naked singularities: Δ > 0 everywhere, least b² at r = M; no horizons; the closed-form
+  shifts' derivatives are 2r/Δ and a/Δ, for r < 0 too (1e-8); the retrograde photon orbit
+  solves r(r − 3)² = 4a² (1e-10) and the prograde one is gone; dE/dr = 0 at the ISCO, a
+  minimum inside r = M; a ray through the ring's disk comes out at r < 0, keeping
+  vr² = R and vθ² = Θ (1e-6);
+- the Penrose process: the ZAMO-frame energy and angular momentum match the geodesic's
+  (1e-12); outside the ergosphere no split gives negative energy; a parabolic orbit turns
+  round at the split radius; there the best split conserves energy and angular momentum
+  (1e-12), gains −m₁E₁, and stays below (√2 − 1)/2; of 4,000 random throws from the
+  ergosphere, everything that falls in has E − Ω_H L ≥ 0 (the area theorem); Christodoulou's
+  identity (1e-12), 29.3% extractable at a = 1, the area 16πM² without spin; the hole spins
+  down, loses mass and gains area; the preset run through: the body splits, one piece
+  falls in, the other escapes with more energy;
+- the Event Horizon Telescope: M of M87* subtends 3.82 µas and of Sgr A* 5.13 µas; their
+  shadows without spin are 39.7 and 53.3 µas; the shadow traced from the image plane follows
+  the critical curve to 0.2% (a = 0.9 at 17° and 60°, a = 0 as a circle of √27 M); K₂ at
+  0.5, 1 and 10, and K₂(1/θ) → 2θ²; a blackbody's brightness temperature is its
+  temperature; synchrotron emissivity scales with density and cuts off above ν_s; an image
+  calibrated to M87*'s 0.5 Jy, its approaching side the brighter, its shadow of the
+  critical curve's area (5%);
+- camera keyframes: a camera's place and view as a keyframe and back (1e-9); the spline
+  passes through every keyframe (1e-9), facing each one's way at its field of view when
+  due; arc-length speed varies by under 1%; the camera rests at the start, through holds
+  and at the end, and never turns back; the turning rate just before and after a
+  keyframe agrees (squad weighted by length; Shoemake's alone was 41% out); a path moving
+  with the frame dragging is at rest for the ZAMO; faster than light is capped; keyframes
+  saved and read back bit for bit.
 
 ## Project layout
 
@@ -884,17 +1391,32 @@ src/tidal.*        the affine model of a tidally deformed star
 src/gravity.*      gravity between bodies, joint path prediction
 src/debris.*       initial conditions for disrupted stars, clouds and rings (with labels)
 src/tde.*          tidal disruption flares: return times, fallback, flare, outflow
+src/merger.*       neutron star mergers: inspiral, waves, polytropes, collapse, ringdown,
+                   the debris cloud, kilonova light curves, the jet, the clock
+src/merger_sim.*   the merger's GPU hydrodynamics (shaders/merger_*.comp)
+src/merger_scene.* the merger as a scene: time, camera, both views, captions, sound
+src/audio.*        sound through Windows' waveOut (mono or stereo)
+src/scene_sound.*  the scene's sound: tones, pulsar ticks, the tide's rumble, waves
 src/bodies.*       orbiting bodies, presets, tidal disruption, light-delay history
 src/particles.*    GPU gas: buffers, physics, grids, light-delayed copies
 src/renderer.*     ray-trace, bloom and tone-map passes; path-line binning
 src/camera.*       hovering, orbiting, falling and riding cameras
 src/recorder.*     MP4 encoding with Media Foundation
 src/ui.*           control panel, launch planner, orbit map, ray inspector
+src/scene_file.*   saving and loading scenes (.bhscene and its binary sidecar)
+src/timeline.*     the timeline: checkpoints, the frames between them, replays
+src/keyframes.*    camera keyframes: the spline, even speed, squad, real motion
+src/penrose.*      the Penrose process: ZAMO energies, the split, the hole's spin-down
+src/eht.*          the Event Horizon Telescope's view: image plane, critical curve, flow,
+                   synchrotron radiative transfer, flux calibration, blur
+src/eht_view.*     the telescope view: worker threads, the two images and their labels
+src/json.*         a small exact JSON reader and writer
+src/file_dialog.*  Windows' Open and Save As dialogs
 src/app.*          window, input, main loop, scenes, command line
 shaders/           GLSL; reloads while running (sdo.glsl and sdo_bake.frag: the Sun's
                    baked ultraviolet surface)
 assets/planets/    NASA maps of the Earth and Jupiter (public domain; CREDITS.md)
-bin/               prebuilt Windows executables (the simulator and the physics tests)
+bin/               the prebuilt Windows executable (the simulator)
 docs/              screenshots, the AT2019qiz film, and design notes
 refrence photos/   reference images the looks were matched against
 tests/             physics tests
@@ -902,6 +1424,33 @@ tests/             physics tests
 
 ## Approximations
 
+- Naked singularities: the gas is not followed through the ring (parcels inside r = M are
+  dropped), the ray inspector and the launch planner's fates assume a horizon, and bodies
+  that reach r = 0.05 M are removed (at the ring, or into the r < 0 region).
+- The Penrose process changes the hole's spin but keeps lengths in units of its original
+  mass (the body is 2% of it, so the hole's mass changes by ~0.15%); the split is
+  instantaneous, and the fragments are test particles on geodesics.
+- The sound's frequency shifts ignore light bending and frame dragging (the picture's do
+  not); its gravitational waves have the pitch, not the amplitude, of the quadrupole's.
+- No static-camera cache: every pixel is traced every frame, even with the camera still.
+- The telescope view's flow is a smooth, semi-analytic model, not a turbulent, magnetized
+  simulation; its electrons are thermal and the field tangled. Seen face-on, gas inside
+  ~5 M projects onto the shadow: with a fast spin (ISCO at 2 M) it fills the shadow in this
+  model, so M87* is shown at spin 0.5 by default (the image alone hardly constrains it).
+  Sgr A*'s ring comes out ~58 µas against the 52 measured. No interstellar scattering (it
+  blurs Sgr A* further) and no polarization.
+- A camera moving for real along keyframes takes its velocity from the path's coordinate
+  velocity, measured on the local axes and corrected for frame dragging and the lapse, but
+  not for the curvature of space near the hole (exact far out). The ZAMO frame's axes are
+  taken as the local r, θ, φ directions, which they match up to O(a/r²).
+- The timeline replays what moves exactly, but the gas's light-delayed copies (what the
+  camera sees of it) are recomputed for the camera you have now, so moving the camera while
+  scrubbing changes them as it should; the camera that follows a tidal disruption eases
+  with the frame's real time, which is logged.
+- A saved scene continues bit for bit on the same GPU and driver; another GPU may round the
+  gas's single-precision arithmetic differently, so its gas drifts apart from the original
+  (the bodies, on the CPU, do not). The neutron star merger cannot be saved: it runs a
+  simulation of its own.
 - Bodies feel the hole exactly and each other through Newtonian gravity (in their own rest
   frames); there are no gravitational waves and the hole is not moved. A body's past, used
   for light delay, is integrated without the others' pull.
@@ -975,9 +1524,10 @@ tests/             physics tests
   bending near a black hole or neutron star.
 - A neutron star's disk is drawn only out to tens of the star's radii (a real one reaches
   1e5 km or more), and its turbulence is the black hole disk's pattern. A white dwarf's
-  spiral shocks and bright spot are patterns turning with the binary. Its companion is an
-  ellipsoid, not the exact Roche equipotential (whose tip is a cusp at L1); the white dwarf
-  sits at the origin, not orbiting the binary's center of mass; the stream is a thin
+  spiral shocks and bright spot are patterns turning with the binary. Its companion's surface
+  is the exact Roche equipotential, but its shading (the irradiated face, the ultraviolet
+  palette) is not a stellar atmosphere model, and its convection pattern does not evolve;
+  the white dwarf sits at the origin, not orbiting the binary's center of mass; the stream is a thin
   ballistic tube of fixed widening, without the stream's own pressure or the disk's
   overflow past the spot.
 - Field lines, pair coronae and pulsar beams are drawn in false color: their plasma shines
@@ -1012,6 +1562,19 @@ tests/             physics tests
   real neutron star's crust is smooth and its beams invisible except as flashes.
 - Neutron stars' jets are the black hole's analytic jets at 0.5 c, with smoother knots;
   their helical field is a fixed winding, not a simulated one.
+- The neutron star merger runs on Newtonian gravity with the 2.5PN radiation reaction added
+  to the stars' orbit, not general relativity: the remnant does not collapse by itself, so
+  the collapse comes at a chosen time, and the stronger gravity of GR (which flings out
+  more mass and makes the merger hotter and quicker) is missing; with equal masses little
+  matter becomes unbound in the simulation, and the kilonova's mass is taken from GW170817's
+  fits instead. The equation of state is a polytrope plus an ideal thermal part; there are
+  no neutrinos, magnetic fields or nuclear reactions, and temperatures assume an ideal
+  nucleon gas. Light bends around each star as if it were alone (the lenses are added),
+  the black hole's spin is left out of the bending, and the waves and the cocoon are drawn
+  in false color. The kilonova's shape (polar blue, equatorial red, clumps) is drawn, not
+  simulated; its light curves are the one-zone fits. The jet's launch time and speed are
+  chosen to break out at 1.7 s. The sound is the wave at its true pitch, slowed with the
+  picture.
 
 ## License
 

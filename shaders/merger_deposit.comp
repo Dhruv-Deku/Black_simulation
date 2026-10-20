@@ -1,0 +1,144 @@
+#version 460 core
+
+// Spreads the merger's particles onto grids for drawing:
+//   stage 2  counts the particles in a coarse grid, to know how far apart they are where
+//            the gas is thin (run first);
+//   stage 0  a 3D grid around the action (the cinematic view ray marches it): mass,
+//            temperature, velocity and where in its star each parcel started;
+//   stage 1  a 2D map of the column density seen from above (the simulation view).
+// Each particle is spread as a Gaussian as wide as the matter it stands for, with weights
+// that sum to one, and summed in fixed point (integer atomics).
+
+layout(local_size_x = 128) in;
+
+#include "merger_common.glsl"
+
+layout(std430, binding = 6) buffer Cells {
+    int cells[];
+};
+layout(std430, binding = 7) buffer Counts {
+    int counts[];
+};
+
+uniform int uStage;
+uniform vec3 uBoxMin;     // stage 0: lower corner of the box
+uniform float uBoxCell;   // its cell size
+uniform int uBoxDims;
+uniform vec2 uMapMin;     // stage 1: lower corner of the map (x, y)
+uniform float uMapCell;
+uniform int uMapDims;
+uniform vec3 uCountMin;   // the coarse counting grid: lower corner, cell size, cells a side
+uniform float uCountCell;
+uniform int uCountDims;
+uniform float uMassRef;   // the weights are in units of this mass
+uniform float uCoast;     // once the hydrodynamics has stopped: how long unbound matter has coasted since
+
+const float kFixed = 16384.0;
+const int kVolumeChannels = 8;
+const int kMapChannels = 2;
+
+float logTemperature(float uth) {
+    return log(max(2.0 / 3.0 * 1.090327e13 * uth, 1e6)) / log(10.0);
+}
+
+int countCell(vec3 x) {
+    ivec3 c = ivec3(floor((x - uCountMin) / uCountCell));
+    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(uCountDims)))) return -1;
+    return (c.z * uCountDims + c.y) * uCountDims + c.x;
+}
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= uCount) return;
+    Particle p = particles[i];
+    if (p.thermo.w < 0.0) return;
+    float mass = p.pos.w / uMassRef;
+    float logT = logTemperature(p.thermo.x);
+    // The width of the matter a particle stands for: (m / rho)^(1/3) from its density (the
+    // simulation caps its smoothing length in thin gas, to bound the neighbour search).
+    float h = p.thermo.y > 0.0 ? max(p.vel.w, 1.2 * pow(p.pos.w / p.thermo.y, 1.0 / 3.0)) : p.vel.w;
+    // Unbound matter coasts on in straight lines (its own gravity and the remnant's no
+    // longer matter much): drawn where it has got to by now.
+    if (uCoast > 0.0 && 0.5 * dot(p.vel.xyz, p.vel.xyz) + p.extra.w > 0.0) {
+        // Homologous expansion: its kernel widens as it gets farther out.
+        float r0 = max(length(p.pos.xyz), 1.0);
+        p.pos.xyz += p.vel.xyz * uCoast;
+        h *= length(p.pos.xyz) / r0;
+    }
+
+    if (uStage == 2) {
+        int c = countCell(p.pos.xyz);
+        if (c >= 0) atomicAdd(counts[c], 1);
+        return;
+    }
+    // Where particles are few (a thin torus, the halo), they stand for the gas between them:
+    // at least as wide as the mean spacing in their coarse cell.
+    int cc = countCell(p.pos.xyz);
+    float n = cc >= 0 ? float(max(counts[cc], 1)) : 1.0;
+    h = max(h, 0.8 * uCountCell / pow(n, 1.0 / 3.0));
+
+    if (uStage == 0) {
+        // Out to three sigma, inside a sphere, so no square edges show on a log scale.
+        vec3 g = (p.pos.xyz - uBoxMin) / uBoxCell - 0.5;
+        float sigma = clamp(0.55 * h / uBoxCell, 0.6, 2.0);
+        int k = int(ceil(3.0 * sigma));
+        float reach2 = 9.0 * sigma * sigma;
+        ivec3 c = ivec3(floor(g + 0.5));
+        if (any(lessThan(c, ivec3(-k))) || any(greaterThanEqual(c, ivec3(uBoxDims + k)))) return;
+        float total = 0.0;
+        for (int z = -k; z <= k; ++z)
+            for (int y = -k; y <= k; ++y)
+                for (int x = -k; x <= k; ++x) {
+                    vec3 d = vec3(c + ivec3(x, y, z)) - g;
+                    float d2 = dot(d, d);
+                    if (d2 <= reach2) total += exp(-d2 / (2.0 * sigma * sigma));
+                }
+        vec3 label = p.extra.xyz;
+        label.z += 3.0 * p.thermo.w;  // the second star's matter on its own stretch of noise
+        for (int z = -k; z <= k; ++z)
+            for (int y = -k; y <= k; ++y)
+                for (int x = -k; x <= k; ++x) {
+                    ivec3 q = c + ivec3(x, y, z);
+                    if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, ivec3(uBoxDims)))) continue;
+                    vec3 d = vec3(q) - g;
+                    float d2 = dot(d, d);
+                    if (d2 > reach2) continue;
+                    float w = mass * exp(-d2 / (2.0 * sigma * sigma)) / total;
+                    int base = kVolumeChannels * ((q.z * uBoxDims + q.y) * uBoxDims + q.x);
+                    atomicAdd(cells[base + 0], int(round(w * kFixed)));
+                    atomicAdd(cells[base + 1], int(round(w * logT * kFixed)));
+                    atomicAdd(cells[base + 2], int(round(w * p.vel.x * kFixed)));
+                    atomicAdd(cells[base + 3], int(round(w * p.vel.y * kFixed)));
+                    atomicAdd(cells[base + 4], int(round(w * p.vel.z * kFixed)));
+                    atomicAdd(cells[base + 5], int(round(w * label.x * kFixed)));
+                    atomicAdd(cells[base + 6], int(round(w * label.y * kFixed)));
+                    atomicAdd(cells[base + 7], int(round(w * label.z * kFixed)));
+                }
+    } else {
+        vec2 g = (p.pos.xy - uMapMin) / uMapCell - 0.5;
+        float sigma = clamp(0.6 * h / uMapCell, 0.7, 9.0);
+        int k = int(ceil(3.0 * sigma));
+        float reach2 = 9.0 * sigma * sigma;
+        ivec2 c = ivec2(floor(g + 0.5));
+        if (any(lessThan(c, ivec2(-k))) || any(greaterThanEqual(c, ivec2(uMapDims + k)))) return;
+        float total = 0.0;
+        for (int y = -k; y <= k; ++y)
+            for (int x = -k; x <= k; ++x) {
+                vec2 d = vec2(c + ivec2(x, y)) - g;
+                float d2 = dot(d, d);
+                if (d2 <= reach2) total += exp(-d2 / (2.0 * sigma * sigma));
+            }
+        for (int y = -k; y <= k; ++y)
+            for (int x = -k; x <= k; ++x) {
+                ivec2 q = c + ivec2(x, y);
+                if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(uMapDims)))) continue;
+                vec2 d = vec2(q) - g;
+                float d2 = dot(d, d);
+                if (d2 > reach2) continue;
+                float w = mass * exp(-d2 / (2.0 * sigma * sigma)) / total;
+                int base = kMapChannels * (q.y * uMapDims + q.x);
+                atomicAdd(cells[base + 0], int(round(w * kFixed)));
+                atomicAdd(cells[base + 1], int(round(w * logT * kFixed)));
+            }
+    }
+}

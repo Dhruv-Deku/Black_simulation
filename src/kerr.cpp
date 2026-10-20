@@ -112,11 +112,55 @@ bool solveEquatorialOrbit(double a, double rp, double ra, bool prograde, double&
 
 // --- Characteristic radii --------------------------------------------------
 
+namespace {
+
+bool naked(double a) {
+    return std::abs(a) > 1.0;
+}
+
+// Energy of the circular equatorial orbit at r (Bardeen, Press and Teukolsky 1972), or a
+// large number where there is none.
+double circularEnergy(double a, double r, bool prograde) {
+    const double s = prograde ? 1.0 : -1.0, x = std::sqrt(r);
+    const double d = r * x - 3.0 * x + 2.0 * s * a;
+    if (d <= 0.0) return 1e30;
+    return (r * x - 2.0 * x + s * a) / (std::pow(r, 0.75) * std::sqrt(d));
+}
+
+// The radius of least circular-orbit energy (the ISCO) between lo and hi: a scan on a
+// logarithmic grid, then golden-section refinement.
+double leastEnergyRadius(double a, bool prograde, double lo, double hi) {
+    const int n = 4000;
+    int best = 0;
+    double bestE = 1e30;
+    for (int k = 0; k <= n; ++k) {
+        const double r = lo * std::pow(hi / lo, static_cast<double>(k) / n);
+        const double e = circularEnergy(a, r, prograde);
+        if (e < bestE) {
+            bestE = e;
+            best = k;
+        }
+    }
+    double x0 = lo * std::pow(hi / lo, std::max(best - 1, 0) / static_cast<double>(n));
+    double x1 = lo * std::pow(hi / lo, std::min(best + 1, n) / static_cast<double>(n));
+    const double g = 0.5 * (std::sqrt(5.0) - 1.0);
+    for (int k = 0; k < 80; ++k) {
+        const double c = x1 - g * (x1 - x0), d = x0 + g * (x1 - x0);
+        if (circularEnergy(a, c, prograde) < circularEnergy(a, d, prograde)) x1 = d;
+        else x0 = c;
+    }
+    return 0.5 * (x0 + x1);
+}
+
+}  // namespace
+
 double horizonRadius(double a) {
+    if (naked(a)) return 0.0;
     return 1.0 + std::sqrt(std::max(0.0, 1.0 - a * a));
 }
 
 double innerHorizonRadius(double a) {
+    if (naked(a)) return 0.0;
     return 1.0 - std::sqrt(std::max(0.0, 1.0 - a * a));
 }
 
@@ -126,10 +170,19 @@ double interiorLimit(double a) {
 
 double ergosphereRadius(double a, double theta) {
     double c = std::cos(theta);
-    return 1.0 + std::sqrt(std::max(0.0, 1.0 - a * a * c * c));
+    const double disc = 1.0 - a * a * c * c;
+    // A naked singularity's ergoregion reaches only so far from the equator.
+    if (naked(a) && disc < 0.0) return 0.0;
+    return 1.0 + std::sqrt(std::max(0.0, disc));
 }
 
 double iscoRadius(double a, bool prograde) {
+    if (naked(a)) {
+        // dE/dr = 0 for circular orbits, numerically: prograde ones exist down to r -> 0,
+        // retrograde ones outside the retrograde photon orbit.
+        return prograde ? leastEnergyRadius(a, true, 1e-3, 30.0)
+                        : leastEnergyRadius(a, false, photonOrbitRadius(a, false) * 1.0001, 60.0);
+    }
     double z1 = 1.0 + std::cbrt(1.0 - a * a) * (std::cbrt(1.0 + a) + std::cbrt(1.0 - a));
     double z2 = std::sqrt(3.0 * a * a + z1 * z1);
     double root = std::sqrt(std::max(0.0, (3.0 - z1) * (3.0 + z1 + 2.0 * z2)));
@@ -137,11 +190,34 @@ double iscoRadius(double a, bool prograde) {
 }
 
 double photonOrbitRadius(double a, bool prograde) {
+    if (naked(a)) {
+        // Equatorial photon orbits satisfy r (r - 3)^2 = 4 a^2. Past a = 1 the prograde one
+        // (between 1 and 3) is gone; the retrograde one lies beyond r = 3.
+        if (prograde) return 0.0;
+        double lo = 3.0, hi = 3.0 + 2.0 * std::abs(a);
+        for (int k = 0; k < 100; ++k) {
+            const double mid = 0.5 * (lo + hi);
+            (mid * (mid - 3.0) * (mid - 3.0) < 4.0 * a * a ? lo : hi) = mid;
+        }
+        return 0.5 * (lo + hi);
+    }
     double s = prograde ? -1.0 : 1.0;
     return 2.0 * (1.0 + std::cos(2.0 / 3.0 * std::acos(s * a)));
 }
 
 double marginallyBoundRadius(double a, bool prograde) {
+    if (naked(a)) {
+        // Where the circular orbit's energy is 1, inside the ISCO (0 if it never gets there).
+        const double isco = iscoRadius(a, prograde);
+        const double inner = prograde ? 1e-3 : photonOrbitRadius(a, false) * 1.0001;
+        if (circularEnergy(a, inner, prograde) < 1.0) return 0.0;
+        double lo = inner, hi = isco;
+        for (int k = 0; k < 100; ++k) {
+            const double mid = 0.5 * (lo + hi);
+            (circularEnergy(a, mid, prograde) > 1.0 ? lo : hi) = mid;
+        }
+        return 0.5 * (lo + hi);
+    }
     double s = prograde ? 1.0 : -1.0;
     return 2.0 - s * a + 2.0 * std::sqrt(1.0 - s * a);
 }
@@ -194,6 +270,11 @@ Vec4 lower(const MetricTensor& g, const Vec4& x) {
 }
 
 double timeShift(double a, double r) {
+    if (naked(a)) {
+        // With Delta = (r - 1)^2 + b^2: ln Delta + (2 / b) arctan((r - 1) / b) (derivative 2r / Delta).
+        const double b = std::sqrt(a * a - 1.0), delta = r * r - 2.0 * r + a * a;
+        return std::log(delta) + 2.0 / b * std::atan((r - 1.0) / b);
+    }
     // integral of (r^2 + a^2) / Delta - 1, using r+^2 + a^2 = 2 r+ (and the same for r-).
     const double rp = horizonRadius(a), rm = innerHorizonRadius(a);
     const double inner = rm > 0.0 ? 2.0 * rm * std::log(std::abs(r - rm)) : 0.0;
@@ -201,6 +282,11 @@ double timeShift(double a, double r) {
 }
 
 double azimuthShift(double a, double r) {
+    if (naked(a)) {
+        // (a / b) arctan((r - 1) / b) (derivative a / Delta).
+        const double b = std::sqrt(a * a - 1.0);
+        return a / b * std::atan((r - 1.0) / b);
+    }
     const double rp = horizonRadius(a), rm = innerHorizonRadius(a);
     return a / (rp - rm) * std::log(std::abs((r - rp) / (r - rm)));
 }
@@ -477,9 +563,13 @@ void stepCoordinateTime(double a, const Constants& c, State& s, double h) {
 double photonStepSize(double a, const Constants& c, const State& s, double tolerance) {
     const Derivatives d = derivatives(a, c, s);
     const double sn = std::abs(std::sin(s.theta));
-    const double tol = tolerance * std::clamp(s.r / 8.0, 1.0, 4.0);
-    double h = tol / (std::abs(d.dr) / s.r + std::abs(d.dtheta) / std::max(sn, 1e-4) + std::abs(d.dphi) + 1e-6);
-    h = std::min(h, std::sqrt(tol * s.r / (std::abs(d.dvr) + 1e-6)));
+    // Lengths are measured by r; near a naked ring, where r passes through 0, by sqrt(Sigma)
+    // (shaders/trace.frag does the same).
+    const double cs = std::cos(s.theta);
+    const double rs = naked(a) ? std::max(std::sqrt(s.r * s.r + a * a * cs * cs), 0.02) : s.r;
+    const double tol = tolerance * std::clamp(rs / 8.0, 1.0, 4.0);
+    double h = tol / (std::abs(d.dr) / rs + std::abs(d.dtheta) / std::max(sn, 1e-4) + std::abs(d.dphi) + 1e-6);
+    h = std::min(h, std::sqrt(tol * rs / (std::abs(d.dvr) + 1e-6)));
     h = std::min(h, std::sqrt(tol * std::max(sn, 1e-4) / (std::abs(d.dvtheta) + 1e-6)));
     return h;
 }

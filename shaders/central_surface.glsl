@@ -843,8 +843,14 @@ vec3 surfaceRadiance(float th, float ph, float delay, vec3 rayDir, vec3 hitX, fl
         float level = kElectricLevel;
         bool beacon = false;
 #if SURFACE_LOOK == 3
-        // A white dwarf: the turbulence shows across a bluer disk.
-        float t = 0.42 + 0.36 * sqrt(mu) * I + 0.3 * (I - 1.0);
+        // A white dwarf, as artists paint them: white-hot, marbled with deep-blue clouds of
+        // plasma (warped noise, fixed to the star), blue toward its limb and ringed by a
+        // bright blue-white rim where the line of sight grazes its glowing atmosphere.
+        float warp = fbmFiltered(n * 1.8 + 5.3, 4, fp * 1.8);
+        float marble = fbmFiltered(n * 2.8 + 2.2 * warp + 1.1, 5, fp * 2.8);
+        float patches = smoothstep(-0.12, 0.25, marble) * (0.8 + 0.2 * plasma);
+        float limbRim = pow(1.0 - mu, 4.0);
+        float t = 0.56 + 0.5 * mu * I - 0.5 * patches * (0.4 + 0.6 * mu) + 0.45 * limbRim + 0.3 * (I - 1.0);
 #else
         float t = 0.5 + 0.42 * sqrt(mu) * I + 0.12 * (I - 1.0);
         if (uBeacon == 1) {
@@ -1166,24 +1172,54 @@ void traceMagnetosphere(vec3 X0, vec3 X1, float delay0, float delay1, float path
 #endif
 
 #if SURFACE_LOOK == 3
+// --- Threads of plasma around a white dwarf (film colors) ----------------------------------
+//
+// Artists draw white dwarfs crackling with threads of blue plasma, like a plasma ball's: thin
+// bright filaments (the crests of ridged noise on shells around the star, twisted with
+// height) in a soft glow, thinning out with distance. Gathered along the line of sight from
+// t0 to t1 (inside 2.6 R) in a few jittered samples; fixed to the star.
+vec3 dwarfFilaments(vec3 o, vec3 d, float t0, float t1, float jitter) {
+    if (t1 <= t0) return vec3(0.0);
+    float R = uSurfaceR;
+    const int N = 24;
+    float dt = (t1 - t0) / float(N);
+    float sum = 0.0, haze = 0.0;
+    for (int i = 0; i < N; ++i) {
+        vec3 x = o + d * (t0 + (float(i) + jitter) * dt);
+        float r = length(x) / R;
+        if (r < 1.0) continue;
+        vec3 n = x / (r * R);
+        float h = r - 1.0;
+        // Twist with height, so the threads curl; only some regions have them.
+        float twist = 2.2 * h;
+        float c = cos(twist), sn = sin(twist);
+        vec3 q = vec3(c * n.x - sn * n.y, sn * n.x + c * n.y, n.z) * 2.6 + vec3(0.0, 0.0, h * 1.2);
+        float ridge = 1.0 - abs(gradientNoise(q));
+        float thread = pow(clamp(ridge, 0.0, 1.0), 40.0);
+        float where = smoothstep(0.1, 0.5, gradientNoise(n * 1.7 + 8.3));
+        float fade = exp(-h / 0.3);
+        sum += thread * where * fade * dt / R;
+        haze += exp(-h / 0.18) * dt / R;
+    }
+    return electricHue(0.8) * (1.6 * sum) + electricHue(0.55) * (0.1 * haze);
+}
+
 // --- A cataclysmic variable's companion and stream ----------------------------------------
 //
-// A red dwarf filling its Roche lobe (Eggleton's radius; drawn as an ellipsoid stretched
-// toward L1), and the stream of its gas falling from L1 to the disk's rim along the
-// ballistic path of the Roche potential (src/central.cpp, rocheStream), bent ahead of
-// the companion by the Coriolis force. Both turn with the binary. Light bends by ~1e-5
-// rad around a white dwarf: their shapes are met along the (straight) ray chords.
-uniform vec4 uCompanion;       // center (render units) and Roche-lobe radius (0: none)
+// A red dwarf filling its Roche lobe, and the stream of its gas falling from L1 to the disk's
+// rim along the ballistic path of the Roche potential (src/central.cpp, rocheStream), bent
+// ahead of the companion by the Coriolis force. Both turn with the binary. Light bends by
+// ~1e-5 rad around a white dwarf: their shapes are met along the (straight) ray chords.
+uniform vec4 uCompanion;       // center (render units) and Eggleton's Roche-lobe radius (0: none)
 uniform vec3 uCompanionAxis;   // from the white dwarf toward it
-uniform float uCompanionTemp;  // its surface temperature, K
+uniform float uCompanionTemp;  // its surface temperature at the lobe's pole, K
+uniform float uCompanionQ;     // its mass over the white dwarf's
+uniform float uRocheL1;        // L1's distance from the white dwarf, over the separation
+uniform float uRocheSurface;   // the Roche potential on the lobe (its value at L1)
+uniform float uRocheGravity;   // the effective gravity at the lobe's pole
 uniform int uStreamCount;
 uniform vec3 uStream[16];      // the stream from L1 to the rim (render units)
 uniform float uStreamWidth;    // its half-width at L1 (render units); it widens toward the disk
-
-// Semi-axes over the lobe radius (toward L1, along the orbit, up), centered 0.1 of it
-// toward L1: its tip reaches L1, 1.35 lobe radii out for q = 0.25.
-const vec3 kLobeShape = vec3(1.25, 0.95, 0.93);
-const float kLobeShift = 0.1;
 
 // The companion's frame: toward the white dwarf's far side (x), along the orbit, up.
 void companionFrame(out vec3 ax, out vec3 ay, out vec3 az) {
@@ -1192,45 +1228,97 @@ void companionFrame(out vec3 ax, out vec3 ay, out vec3 az) {
     ay = normalize(cross(az, ax));
 }
 
-// Where the chord X0 -> X1 enters the companion, as a fraction along it (2 if not).
-float companionCrossing(vec3 X0, vec3 X1) {
+// To the binary's frame: separation 1, the white dwarf at the origin, the companion at +x.
+vec3 toBinary(vec3 X) {
     vec3 ax, ay, az;
     companionFrame(ax, ay, az);
-    vec3 c = uCompanion.xyz - kLobeShift * uCompanion.w * ax;  // the lobe bulges toward L1
-    vec3 k = 1.0 / (kLobeShape * uCompanion.w);
-    vec3 p = X0 - c, dd = X1 - X0;
-    vec3 a = vec3(dot(p, ax), dot(p, ay), dot(p, az)) * k;
-    vec3 b = vec3(dot(dd, ax), dot(dd, ay), dot(dd, az)) * k;
-    float bb = dot(b, b), ab = dot(a, b), cc = dot(a, a) - 1.0;
-    float disc = ab * ab - bb * cc;
-    if (bb <= 0.0 || disc < 0.0) return 2.0;
-    float t = (-ab - sqrt(disc)) / bb;
-    return t >= 0.0 && t <= 1.0 ? t : 2.0;
+    return vec3(dot(X, ax), dot(X, ay), dot(X, az)) / length(uCompanion.xyz);
 }
 
-// The companion's light at its surface point p, seen along rayDir. A red dwarf, darker
-// at its limb, its convection mottling it, and the hemisphere facing the white dwarf and
+// The Roche potential there (src/central.h, rochePotential: G (M1 + M2) = 1, Omega = 1) and
+// its gradient, minus the effective gravity.
+float rochePhi(vec3 b) {
+    float mu2 = uCompanionQ / (1.0 + uCompanionQ), mu1 = 1.0 - mu2;
+    return -mu1 / length(b) - mu2 / length(b - vec3(1.0, 0.0, 0.0)) - 0.5 * ((b.x - mu2) * (b.x - mu2) + b.y * b.y);
+}
+
+vec3 rocheGrad(vec3 b) {
+    float mu2 = uCompanionQ / (1.0 + uCompanionQ), mu1 = 1.0 - mu2;
+    float r1 = length(b);
+    vec3 d2 = b - vec3(1.0, 0.0, 0.0);
+    float r2 = length(d2);
+    return b * (mu1 / (r1 * r1 * r1)) + d2 * (mu2 / (r2 * r2 * r2)) - vec3(b.x - mu2, b.y, 0.0);
+}
+
+// Inside the companion's lobe: below the potential at L1, on its side of L1.
+bool insideLobe(vec3 b) {
+    return b.x > uRocheL1 && rochePhi(b) < uRocheSurface;
+}
+
+// Where the chord X0 -> X1 enters the companion, as a fraction along it (2 if not): the
+// potential is sampled through the sphere that bounds the lobe (around the companion,
+// reaching L1), and the first point inside refined by bisection.
+float companionCrossing(vec3 X0, vec3 X1) {
+    vec3 b0 = toBinary(X0), b1 = toBinary(X1);
+    vec3 d = b1 - b0;
+    float dd = dot(d, d);
+    float reach = 1.02 * (1.0 - uRocheL1);
+    vec3 m = b0 - vec3(1.0, 0.0, 0.0);
+    float bq = dot(m, d), cq = dot(m, m) - reach * reach;
+    float disc = bq * bq - dd * cq;
+    if (dd <= 0.0 || disc < 0.0) return 2.0;
+    float root = sqrt(disc);
+    float s0 = max((-bq - root) / dd, 0.0), s1 = min((-bq + root) / dd, 1.0);
+    if (s0 >= s1) return 2.0;
+    if (insideLobe(b0 + s0 * d)) return s0;
+    const int N = 40;
+    float prev = s0;
+    for (int i = 1; i <= N; ++i) {
+        float s = mix(s0, s1, float(i) / float(N));
+        if (insideLobe(b0 + s * d)) {
+            float lo = prev, hi = s;
+            for (int k = 0; k < 10; ++k) {
+                float mid = 0.5 * (lo + hi);
+                if (insideLobe(b0 + mid * d)) hi = mid;
+                else lo = mid;
+            }
+            return hi;
+        }
+        prev = s;
+    }
+    return 2.0;
+}
+
+// The companion's light at its surface point p, seen along rayDir. A red dwarf, darker at its
+// limb, its convection mottling it; gravity-darkened where the tide and its spin pull its
+// surface out (toward L1 most: its flux goes as the effective gravity to 4 x 0.08, Lucy
+// 1967's exponent for convective envelopes); and the hemisphere facing the white dwarf and
 // its disk heated by their light (irradiation: ~20% hotter there).
 vec3 companionRadiance(vec3 p, vec3 rayDir, float dist) {
     vec3 ax, ay, az;
     companionFrame(ax, ay, az);
-    vec3 c = uCompanion.xyz - kLobeShift * uCompanion.w * ax;
-    vec3 q = p - c;
-    vec3 local = vec3(dot(q, ax), dot(q, ay), dot(q, az)) / (kLobeShape * uCompanion.w);
-    vec3 normal = normalize(ax * (local.x / kLobeShape.x) + ay * (local.y / kLobeShape.y) + az * (local.z / kLobeShape.z));
+    vec3 b = toBinary(p);
+    vec3 grad = rocheGrad(b);
+    vec3 nb = normalize(grad);
+    vec3 normal = normalize(ax * nb.x + ay * nb.y + az * nb.z);
+    float gravity = length(grad) / uRocheGravity;
+    float darkening = pow(max(gravity, 1e-4), 0.32);
     float mu = clamp(dot(normal, -rayDir), 0.0, 1.0);
     float facing = max(dot(normal, -ax), 0.0);  // toward the white dwarf
     float fp = dist * uPixelAngle / uCompanion.w;
-    vec3 nl = normalize(local);  // tidally locked: the pattern is fixed in its frame
+    vec3 nl = normalize(b - vec3(1.0, 0.0, 0.0));  // tidally locked: the pattern is fixed in its frame
     float cells = fbmFiltered(nl * 9.0 + 4.0, 5, fp * 9.0) + 0.6 * ridgedFiltered(nl * 18.0, 4, fp * 18.0);
-    float T = uCompanionTemp * (1.0 + 0.2 * facing * facing) * (0.97 + 0.04 * cells) * limbTemperature(mu);
+    float T = uCompanionTemp * pow(max(gravity, 1e-4), 0.08) * (1.0 + 0.2 * facing * facing) * (0.97 + 0.04 * cells) *
+              limbTemperature(mu);
     if (uFilmColor == 1) {
         // Films' red dwarf, in the Sun's ultraviolet colors made redder: boiling, bright
-        // toward its limb, its face toward the white dwarf heated orange-yellow, and
-        // brightest where its gas pours out at L1.
+        // toward its limb, its face toward the white dwarf heated orange-yellow, darkened
+        // down its drawn-out nose, where the gas spills over at L1 glowing again.
         float flames = ridgedFiltered(nl * 6.0 + 9.0, 5, fp * 6.0);
-        float t = 0.3 + 0.16 * cells + 0.3 * flames * flames + 0.18 * pow(1.0 - mu, 3.0) + 0.22 * facing * facing +
-                  0.35 * pow(max(dot(nl, -vec3(1.0, 0.0, 0.0)), 0.0), 12.0);
+        float spill = pow(max(dot(nl, vec3(-1.0, 0.0, 0.0)), 0.0), 24.0);
+        float t = (0.32 + 0.16 * cells + 0.3 * flames * flames + 0.18 * pow(1.0 - mu, 3.0) + 0.2 * facing * facing) *
+                      mix(1.0, darkening, 0.7) +
+                  0.3 * spill;
         return aia304(t) * (1.25 * uSurfaceBrightness);
     }
     return shiftedBlackbody(T, 1.0, uSurfaceTemp * kCenterTemperature) * (kPhotosphereLevel * uSurfaceBrightness);

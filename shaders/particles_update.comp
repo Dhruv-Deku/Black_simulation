@@ -30,6 +30,9 @@
 // Everything is in render units (see particle_common.glsl): mass uMass, spin uSpin.
 // Around a star or planet parcels stop at its surface, and leave their energy in a
 // map of impacts that glows as hot spots.
+//
+// With uDepositOnly set nothing moves: the parcels are only deposited, rebuilding the
+// grid as it was when a saved scene was saved (its next step reads it as last frame's).
 
 layout(local_size_x = 256) in;
 
@@ -58,6 +61,7 @@ uniform float uSpin;
 uniform float uMass;      // the central mass in render units (1 / scene scale)
 uniform float uSurfaceR;  // surface radius of a star or planet (render units); 0 for a black hole
 uniform float uDt;
+uniform int uDepositOnly;
 uniform ivec3 uGridDims;  // r, theta, phi
 uniform vec2 uGridLogR;   // log of the grid's inner and outer radius
 
@@ -298,7 +302,7 @@ void main() {
     // --- The parcel itself -------------------------------------------------------
     float r = p.state.x, th = p.state.y, ph = p.state.z;
     float vr = p.velocity.x, vth = p.velocity.y;
-    if (life >= 1.0) {
+    if (life >= 1.0 && uDepositOnly == 0) {
         interact(r, th, ph, vr, vth, T, entropy);
         float rBefore = r;
         // Followed through the horizon down to r = m, midway between the two horizons
@@ -315,7 +319,9 @@ void main() {
     }
 
     // --- The copy the camera sees ---------------------------------------------------
-    if (uLightDelay == 1) {
+    if (uDepositOnly == 1) {
+        // Left as it is.
+    } else if (uLightDelay == 1) {
         float created = seenVelocity.z, lost = seenVelocity.w;
         float target = max(min(uTime - lightDelay(seen.x, seen.y, seen.z), lost), created);
         if (target != seen.w) {

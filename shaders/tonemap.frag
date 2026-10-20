@@ -12,6 +12,7 @@ uniform float uExposure;
 uniform float uBloomStrength;
 uniform float uBloomLevels;  // the bloom chain sums this many levels
 uniform int uTonemapper;     // 0 = ACES, 1 = Reinhard, 2 = clamp
+uniform int uDither;         // 0 when the image is upscaled afterwards (the last pass dithers)
 
 // Narkowicz's fit of the ACES filmic curve.
 vec3 aces(vec3 x) {
@@ -34,5 +35,5 @@ void main() {
     c = linearToSrgb(c);
     // Interleaved gradient noise dither hides banding in the dark sky.
     float noise = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-    outColor = vec4(c + (noise - 0.5) / 255.0, 1.0);
+    outColor = vec4(c + float(uDither) * (noise - 0.5) / 255.0, 1.0);
 }

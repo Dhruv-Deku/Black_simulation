@@ -58,6 +58,9 @@ enum class Kind {
 };
 const char* kindName(Kind kind);
 
+// How fast a naked singularity may spin here.
+constexpr double kMaxNakedSpin = 1.5;
+
 struct Object {
     Kind kind = Kind::BlackHole;
     std::string name = "Black hole";
@@ -73,10 +76,13 @@ struct Object {
     // A young neutron star drawn as films show one: a blazing core in its glow, two
     // needle-thin beams sweeping round, and starquakes that set its crust ringing.
     bool beacon = false;
+    // A black hole spun past a = 1: a naked singularity, with no horizon (forbidden, by
+    // cosmic censorship, from forming; shown as what the Kerr solution would be).
+    bool naked = false;
 
     bool hasHorizon() const { return kind == Kind::BlackHole; }
     // The spin parameter a = J / M of the Kerr metric used outside: chi itself for a
-    // black hole (up to 0.999); for a body capped at 0.99, since a Kerr metric with
+    // black hole (up to 0.999, or kMaxNakedSpin for a naked singularity); for a body capped at 0.99, since a Kerr metric with
     // a > 1 is a naked singularity, not the exterior of a planet (whose frame
     // dragging, ~2J/r^3, is negligible anyway).
     double metricSpin() const;
@@ -237,6 +243,22 @@ double tidalTruncationFraction(double q);
 // its closest approach; `closest` returns that approach. At most `count` points, evenly
 // spaced in time.
 std::vector<std::array<double, 2>> rocheStream(double q, double stop, int count, double& closest);
+
+// The Roche potential of a circular binary in the frame turning with it (Kopal 1959), for
+// separation 1 and G (M1 + M2) = 1 (so the binary turns at Omega = 1), M1 at the origin and
+// M2 at (1, 0, 0), q = M2 / M1, mu1 = 1 / (1 + q), mu2 = q / (1 + q):
+//   Phi = -mu1 / r1 - mu2 / r2 - ((x - mu2)^2 + y^2) / 2.
+// A star filling its Roche lobe takes the shape of the equipotential through L1 on its side:
+// a teardrop drawn out toward L1, where its gas spills over.
+double rochePotential(double q, double x, double y, double z);
+// Its gradient: minus the effective gravity (gravity plus the centrifugal pull).
+std::array<double, 3> rocheGradient(double q, double x, double y, double z);
+// M2's Roche lobe measured from M2 (over the separation): how far it reaches along the
+// direction (dx, dy, dz), out to L1 straight toward M1.
+double rocheLobeReach(double q, double dx, double dy, double dz);
+// Its volume (over a^3), integrated over directions: (3 V / 4 pi)^(1/3) is the radius
+// Eggleton's formula fits.
+double rocheLobeVolume(double q);
 
 // --- Tidal disruption -----------------------------------------------------------------
 

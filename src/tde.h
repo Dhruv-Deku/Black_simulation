@@ -29,6 +29,10 @@
 #include <array>
 #include <vector>
 
+namespace scene {
+struct Access;  // saves and restores what is private here (src/scene_file.cpp)
+}
+
 namespace tde {
 
 // --- Order-of-magnitude scales (Newtonian, any units with G = 1) ------------------
@@ -89,6 +93,7 @@ public:
     double lateSlope = 0.0;    // d ln(rate) / d ln(t) well after the peak (-5/3 for a flat dM/dE)
 
 private:
+    friend struct scene::Access;
     // Tabulated on a uniform grid in ln t, smoothed over a few percent in time.
     double m_logT0 = 0.0, m_dLogT = 1.0;
     std::vector<double> m_rate, m_cumulative;

@@ -22,7 +22,17 @@ glm::mat3 Camera::basis() const {
 
 kerr::Frame Camera::frame(double spin) const {
     if (motion == CameraMotion::Hover) {
-        return kerr::observerFrame(spin, r, theta, kerr::zamoFourVelocity(spin, r, theta));
+        const kerr::Vec4 zamo = kerr::zamoFourVelocity(spin, r, theta);
+        const double v2 = drift[0] * drift[0] + drift[1] * drift[1] + drift[2] * drift[2];
+        if (v2 <= 0.0 || v2 >= 1.0 || insideHorizon(spin)) return kerr::observerFrame(spin, r, theta, zamo);
+        // Boosted from the ZAMO: u = gamma (e0 + v^i e_i).
+        const kerr::Frame z = kerr::observerFrame(spin, r, theta, zamo);
+        const double gamma = 1.0 / std::sqrt(1.0 - v2);
+        kerr::Vec4 u;
+        for (int i = 0; i < 4; ++i) {
+            u[i] = gamma * (z.e[0][i] + drift[0] * z.e[1][i] + drift[1] * z.e[2][i] + drift[2] * z.e[3][i]);
+        }
+        return kerr::observerFrame(spin, r, theta, u);
     }
     kerr::State s = path;
     s.theta = theta;  // clamped off the axis, like the position
@@ -189,9 +199,10 @@ void Camera::respin(double oldSpin, double newSpin) {
 }
 
 glm::vec3 Camera::velocity(double spin) const {
-    if (motion == CameraMotion::Hover || (surface <= 0.0 && r < kerr::horizonRadius(spin) + 0.05)) {
-        return glm::vec3(0.0f);
+    if (motion == CameraMotion::Hover) {
+        return glm::vec3(static_cast<float>(drift[0]), static_cast<float>(drift[1]), static_cast<float>(drift[2]));
     }
+    if (surface <= 0.0 && r < kerr::horizonRadius(spin) + 0.05) return glm::vec3(0.0f);
     double v[3];
     kerr::zamoVelocity(spin, geodesic, path, v);
     return glm::vec3(static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2]));
